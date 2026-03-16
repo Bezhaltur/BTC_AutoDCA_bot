@@ -99,6 +99,13 @@ RETRYABLE_ERROR_KEYWORDS = (
 )
 FINAL_FIXEDFLOAT_ORDER_STATUSES = {"expired", "cancelled", "failed"}
 SUCCESS_FIXEDFLOAT_ORDER_STATUSES = {"finished", "completed", "done"}
+try:
+    DCA_EXECUTION_WINDOW_SECONDS = int(os.getenv("DCA_EXECUTION_WINDOW_SECONDS", "300"))
+except ValueError:
+    DCA_EXECUTION_WINDOW_SECONDS = 300
+if DCA_EXECUTION_WINDOW_SECONDS < 0:
+    DCA_EXECUTION_WINDOW_SECONDS = 0
+LAST_SEEN_EXECUTION_FILE = os.getenv("LAST_SEEN_EXECUTION_FILE", "logs/last_seen_execution.txt")
 
 # ============================================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -248,6 +255,175 @@ def build_auto_send_failed_notification(
     )
 
 
+def format_scheduled_time(ts: int) -> str:
+    """Format Unix timestamp for user-facing notifications."""
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(int(ts)))
+
+
+def calculate_next_run_preserving_schedule(scheduled_time: int, interval_hours: int, now_ts: int) -> int:
+    """
+    Calculate next run without shifting strategy schedule.
+    Always advances from the original scheduled slot, not from current time.
+    """
+    try:
+        interval_seconds = max(1, int(interval_hours) * 3600)
+    except (TypeError, ValueError):
+        interval_seconds = 24 * 3600
+    next_run = int(scheduled_time) + interval_seconds
+    if next_run <= now_ts:
+        missed_intervals = ((now_ts - next_run) // interval_seconds) + 1
+        next_run += missed_intervals * interval_seconds
+    return next_run
+
+
+def is_order_expired(order_expires: Optional[int], now_ts: Optional[int] = None) -> bool:
+    """True if order expiry is missing or already passed."""
+    if now_ts is None:
+        now_ts = int(time.time())
+    if not order_expires:
+        return True
+    return int(now_ts) >= int(order_expires)
+
+
+async def get_execute_command_hint(user_id: int, plan_id: int) -> str:
+    """Return user-facing execute command for a specific plan."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id FROM dca_plans WHERE user_id = ? AND deleted = 0 ORDER BY id",
+            (user_id,)
+        ) as cur:
+            rows = await cur.fetchall()
+    for idx, row in enumerate(rows, start=1):
+        if row[0] == plan_id:
+            return f"/execute_{idx}"
+    return "/execute"
+
+
+def build_missed_dca_cycle_notification(scheduled_time: int, execute_command: str) -> str:
+    """Notification text for skipped missed cycle."""
+    return (
+        "⚠️ Платёж по DCA пропущен\n\n"
+        f"Запланированный платёж на {format_scheduled_time(scheduled_time)}\n"
+        "не был выполнен, потому что бот был выключен\n"
+        "или окно исполнения ордера истекло.\n\n"
+        "Чтобы выполнить платёж сейчас, используйте:\n"
+        f"{execute_command}\n\n"
+        "Следующий платёж по стратегии будет выполнен\n"
+        "по обычному расписанию."
+    )
+
+
+def build_order_expired_skip_notification(execute_command: str) -> str:
+    """Notification text when order expired before send attempt."""
+    return (
+        "❌ Ордер истёк\n\n"
+        "Время для отправки средств по ордеру\n"
+        "(10 минут) уже прошло.\n\n"
+        "Этот DCA цикл пропущен.\n\n"
+        "Вы можете выполнить его сейчас командой:\n"
+        f"{execute_command}"
+    )
+
+
+def build_order_expired_manual_blocked_notification() -> str:
+    """Notification text when manual send is no longer possible."""
+    return (
+        "❌ Ордер истёк\n\n"
+        "Окно для отправки средств уже закрыто.\n"
+        "Отправка вручную больше невозможна.\n\n"
+        "Этот DCA цикл был пропущен."
+    )
+
+
+async def skip_missed_dca_cycle(
+    *,
+    plan_id: int,
+    user_id: int,
+    scheduled_time: int,
+    interval_hours: int,
+) -> None:
+    """Mark overdue cycle as skipped and notify user."""
+    now_ts = int(time.time())
+    new_next_run = calculate_next_run_preserving_schedule(scheduled_time, interval_hours, now_ts)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE dca_plans SET next_run = ?, execution_state = 'skipped' WHERE id = ?",
+            (new_next_run, plan_id)
+        )
+        await db.commit()
+    logger.warning(
+        "DCA цикл пропущен из-за пропущенного времени исполнения: plan_id=%s, scheduled_time=%s, now=%s",
+        plan_id, scheduled_time, now_ts
+    )
+    execute_command = await get_execute_command_hint(user_id, plan_id)
+    await bot.send_message(
+        user_id,
+        build_missed_dca_cycle_notification(scheduled_time, execute_command)
+    )
+
+
+async def mark_order_expired_before_send(
+    *,
+    plan_id: int,
+    user_id: int,
+    order_id: str,
+    scheduled_time: Optional[int] = None,
+    interval_hours: Optional[int] = None,
+    manual_send_blocked: bool = False,
+) -> None:
+    """
+    Mark order/cycle as expired and notify user.
+    manual_send_blocked=True uses dedicated message without manual instructions.
+    """
+    now_ts = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT next_run, interval_hours FROM dca_plans WHERE id = ?",
+            (plan_id,)
+        ) as cur:
+            plan_row = await cur.fetchone()
+
+        base_scheduled_raw = scheduled_time if scheduled_time is not None else (plan_row[0] if plan_row else now_ts)
+        try:
+            base_scheduled = int(base_scheduled_raw)
+        except (TypeError, ValueError):
+            base_scheduled = now_ts
+
+        base_interval_raw = interval_hours if interval_hours is not None else (plan_row[1] if plan_row else 24)
+        try:
+            base_interval_hours = int(base_interval_raw)
+        except (TypeError, ValueError):
+            base_interval_hours = 24
+        if base_scheduled > now_ts:
+            # Manual execution flow should not shift future strategy schedule.
+            new_next_run = base_scheduled
+        else:
+            new_next_run = calculate_next_run_preserving_schedule(base_scheduled, base_interval_hours, now_ts)
+
+        await db.execute(
+            "UPDATE dca_plans SET active_order_id = NULL, active_order_address = NULL, "
+            "active_order_amount = NULL, active_order_expires = NULL, "
+            "execution_state = 'expired', next_run = ? WHERE id = ?",
+            (new_next_run, plan_id)
+        )
+        await db.execute(
+            "UPDATE sent_transactions SET state = 'expired', error_message = ? "
+            "WHERE plan_id = ? AND order_id = ? "
+            "AND state IN ('sending', 'tx_pending', 'pending', 'blocked', 'approve_confirmed', 'transfering', 'sent')",
+            ("Ордер истёк до отправки средств", plan_id, order_id)
+        )
+        await db.commit()
+
+    logger.warning("Ордер истёк до отправки средств: plan_id=%s, order_id=%s", plan_id, order_id)
+
+    if manual_send_blocked:
+        notification = build_order_expired_manual_blocked_notification()
+    else:
+        execute_command = await get_execute_command_hint(user_id, plan_id)
+        notification = build_order_expired_skip_notification(execute_command)
+    await bot.send_message(user_id, notification)
+
+
 async def claim_plan_execution(plan_id: int, user_id: Optional[int] = None) -> bool:
     """Atomically claim plan execution to avoid duplicate order creation."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -282,6 +458,60 @@ async def release_plan_claim(plan_id: int) -> None:
             (plan_id,)
         )
         await db.commit()
+
+
+async def claim_auto_send_execution(plan_id: int, order_id: str) -> bool:
+    """
+    Atomically claim right to run auto_send_usdt for a plan/order pair.
+    Uses sent_transactions state transition sending -> transfering as lock.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT active_order_id FROM dca_plans WHERE id = ?",
+            (plan_id,)
+        ) as cur:
+            plan_row = await cur.fetchone()
+        active_order_id = plan_row[0] if plan_row else None
+        if active_order_id != order_id:
+            logger.warning("Duplicate execution prevented for plan %s", plan_id)
+            return False
+
+        claim_cur = await db.execute(
+            "UPDATE sent_transactions SET state = 'transfering' "
+            "WHERE plan_id = ? AND order_id = ? AND state = 'sending'",
+            (plan_id, order_id)
+        )
+        await db.commit()
+        if claim_cur.rowcount != 1:
+            logger.warning("Duplicate execution prevented for plan %s", plan_id)
+            return False
+        return True
+
+
+async def can_resume_auto_send(plan_id: int, order_id: str) -> bool:
+    """Guard resume path from duplicate transfer attempts."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT active_order_id FROM dca_plans WHERE id = ?",
+            (plan_id,)
+        ) as cur:
+            plan_row = await cur.fetchone()
+        active_order_id = plan_row[0] if plan_row else None
+        if active_order_id != order_id:
+            logger.warning("Duplicate execution prevented for plan %s", plan_id)
+            return False
+
+        async with db.execute(
+            "SELECT state FROM sent_transactions "
+            "WHERE plan_id = ? AND order_id = ? ORDER BY sent_at DESC LIMIT 1",
+            (plan_id, order_id)
+        ) as cur:
+            tx_row = await cur.fetchone()
+        tx_state = (tx_row[0] if tx_row else "") or ""
+        if tx_state not in ("transfering", "approve_confirmed"):
+            logger.warning("Duplicate execution prevented for plan %s", plan_id)
+            return False
+        return True
 
 
 async def get_transfer_tx_status(network_key: str, tx_hash: str) -> str:
@@ -407,11 +637,32 @@ async def resume_transfer_after_approve(
     deposit_address: str,
     required_amount: float,
     existing_approve_tx: Optional[str],
+    plan_id: Optional[int] = None,
+    order_expires: Optional[int] = None,
+    scheduled_time: Optional[int] = None,
+    interval_hours: Optional[int] = None,
 ) -> tuple[str, Optional[str], Optional[str], str]:
     """
     Continue flow after approve confirmation by attempting transfer step immediately.
     Returns: (state, approve_tx_hash, transfer_tx_hash, error_message)
     """
+    if is_order_expired(order_expires):
+        if plan_id is not None:
+            await mark_order_expired_before_send(
+                plan_id=plan_id,
+                user_id=user_id,
+                order_id=order_id,
+                scheduled_time=scheduled_time,
+                interval_hours=interval_hours,
+            )
+        else:
+            logger.warning("Ордер истёк до отправки средств: order_id=%s", order_id)
+        return ("expired", existing_approve_tx, None, "ORDER_EXPIRED_BEFORE_SEND")
+
+    if plan_id is not None:
+        if not await can_resume_auto_send(plan_id, order_id):
+            return ("blocked", existing_approve_tx, None, "DUPLICATE_EXECUTION_PREVENTED")
+
     wallet_password = _wallet_passwords.get(user_id)
     if not wallet_password:
         return ("failed", existing_approve_tx, None, "Wallet password not available for transfer after approve")
@@ -470,13 +721,19 @@ async def recovery_scan_pending_transactions() -> None:
                     await db.commit()
 
                     btc_address = ""
+                    active_order_expires = None
+                    plan_next_run = None
+                    plan_interval_hours = None
                     if plan_id:
                         async with db.execute(
-                            "SELECT btc_address FROM dca_plans WHERE id = ?",
+                            "SELECT btc_address, active_order_expires, next_run, interval_hours FROM dca_plans WHERE id = ?",
                             (plan_id,)
                         ) as bcur:
                             b_row = await bcur.fetchone()
                         btc_address = (b_row[0] if b_row else "") or ""
+                        active_order_expires = b_row[1] if b_row else None
+                        plan_next_run = b_row[2] if b_row else None
+                        plan_interval_hours = b_row[3] if b_row else None
 
                     resume_state, resume_approve_tx, resume_transfer_tx, resume_error = await resume_transfer_after_approve(
                         network_key=network_key,
@@ -486,6 +743,10 @@ async def recovery_scan_pending_transactions() -> None:
                         deposit_address=tx_deposit_address or "",
                         required_amount=float(tx_amount or 0.0),
                         existing_approve_tx=approve_tx,
+                        plan_id=plan_id,
+                        order_expires=active_order_expires,
+                        scheduled_time=plan_next_run,
+                        interval_hours=plan_interval_hours,
                     )
 
                     if resume_state == "confirmed":
@@ -538,6 +799,158 @@ async def recovery_scan_pending_transactions() -> None:
                     (tx_id,)
                 )
             await db.commit()
+
+
+async def recover_stale_plan_claims() -> None:
+    """
+    Clear stale 'claiming' states left after unexpected restart/crash.
+    Safe because only rows without active_order_id are reset.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE dca_plans SET execution_state = 'scheduled' "
+            "WHERE execution_state = 'claiming' AND active_order_id IS NULL"
+        )
+        await db.commit()
+        recovered = cur.rowcount or 0
+    if recovered:
+        logger.warning("Recovered stale plan claims: %s", recovered)
+
+
+def load_last_seen_execution_time() -> Optional[int]:
+    """Load last bot execution timestamp from local file."""
+    try:
+        with open(LAST_SEEN_EXECUTION_FILE, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+        if not raw:
+            return None
+        return int(raw)
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+
+
+def save_last_seen_execution_time(ts: int) -> None:
+    """Persist current bot execution timestamp to local file."""
+    try:
+        os.makedirs("logs", exist_ok=True)
+        target_dir = os.path.dirname(LAST_SEEN_EXECUTION_FILE)
+        if target_dir:
+            os.makedirs(target_dir, exist_ok=True)
+        with open(LAST_SEEN_EXECUTION_FILE, "w", encoding="utf-8") as f:
+            f.write(str(int(ts)))
+    except OSError as e:
+        logger.warning("Failed to save last seen execution time: %s", e)
+
+
+async def notify_offline_startup_status() -> None:
+    """
+    Notify users at startup if bot was offline long enough.
+    Rules:
+    - If downtime <= execution window and no skipped plans: no notification.
+    - If downtime > execution window:
+      - with skipped plans -> notify about missed cycles;
+      - without skipped plans -> notify that no cycles were missed.
+    """
+    now_ts = int(time.time())
+    last_seen_ts = load_last_seen_execution_time()
+    downtime = (now_ts - last_seen_ts) if last_seen_ts else None
+    offline_detected = bool(last_seen_ts and downtime is not None and downtime > DCA_EXECUTION_WINDOW_SECONDS)
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT user_id, id FROM dca_plans "
+                "WHERE deleted = 0 AND execution_state = 'skipped' ORDER BY user_id, id"
+            ) as cur:
+                skipped_rows = await cur.fetchall()
+
+            async with db.execute(
+                "SELECT DISTINCT user_id FROM dca_plans WHERE deleted = 0 ORDER BY user_id"
+            ) as users_cur:
+                active_user_rows = await users_cur.fetchall()
+    except Exception as e:
+        logger.error("Failed to load startup offline status data: %s", e)
+        save_last_seen_execution_time(now_ts)
+        return
+
+    skipped_by_user: Dict[int, list[int]] = {}
+    for user_id, plan_id in skipped_rows:
+        skipped_by_user.setdefault(user_id, []).append(plan_id)
+
+    if not offline_detected and not skipped_by_user:
+        save_last_seen_execution_time(now_ts)
+        return
+
+    if skipped_by_user:
+        notified_users = set()
+        notified_plan_ids = set()
+        for user_id, plan_ids in skipped_by_user.items():
+            notified_users.add(user_id)
+            execute_commands = []
+            for plan_id in plan_ids:
+                cmd = await get_execute_command_hint(user_id, plan_id)
+                if cmd not in execute_commands:
+                    execute_commands.append(cmd)
+
+            commands_text = "\n".join(execute_commands) if execute_commands else "/execute"
+            message_text = (
+                "🤖 Бот был офлайн\n\n"
+                f"Обнаружено пропущенных циклов: {len(plan_ids)}\n\n"
+                "Некоторые DCA платежи не были выполнены,\n"
+                "поскольку бот был выключен.\n\n"
+                "Вы можете выполнить их вручную через:\n"
+                f"{commands_text}"
+            )
+            try:
+                await bot.send_message(user_id, message_text)
+                notified_plan_ids.update(plan_ids)
+            except Exception as e:
+                logger.warning("Failed to send offline/skipped notification to user %s: %s", user_id, e)
+
+        if notified_plan_ids:
+            try:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    placeholders = ",".join("?" for _ in notified_plan_ids)
+                    await db.execute(
+                        f"UPDATE dca_plans SET execution_state = 'scheduled' "
+                        f"WHERE execution_state = 'skipped' AND id IN ({placeholders})",
+                        tuple(notified_plan_ids)
+                    )
+                    await db.commit()
+            except Exception as e:
+                logger.warning("Failed to clear processed skipped states after startup notification: %s", e)
+
+        if not offline_detected:
+            save_last_seen_execution_time(now_ts)
+            return
+
+        for (user_id,) in active_user_rows:
+            if user_id in notified_users:
+                continue
+            message_text = (
+                "🤖 Бот был офлайн\n\n"
+                "Бот был временно выключен,\n"
+                "но ни один DCA цикл не был пропущен.\n\n"
+                "Сейчас бот работает в штатном режиме."
+            )
+            try:
+                await bot.send_message(user_id, message_text)
+            except Exception as e:
+                logger.warning("Failed to send offline/ok notification to user %s: %s", user_id, e)
+    elif offline_detected:
+        for (user_id,) in active_user_rows:
+            message_text = (
+                "🤖 Бот был офлайн\n\n"
+                "Бот был временно выключен,\n"
+                "но ни один DCA цикл не был пропущен.\n\n"
+                "Сейчас бот работает в штатном режиме."
+            )
+            try:
+                await bot.send_message(user_id, message_text)
+            except Exception as e:
+                logger.warning("Failed to send offline/ok notification to user %s: %s", user_id, e)
+
+    save_last_seen_execution_time(now_ts)
 
 
 def ff_sign(data_str: str) -> str:
@@ -993,15 +1406,13 @@ async def init_db():
 async def dca_scheduler():
     """
     Фоновая задача для автоматического выполнения DCA планов.
-    Проверяет каждую минуту, есть ли планы готовые к выполнению (next_run <= now).
-    Если план готов - создаёт ордер на FixedFloat и обновляет next_run.
+    Проверяет планы при старте и далее каждую минуту.
+    Пропущенные циклы за пределами execution window помечаются как skipped и не исполняются.
     """
     logger.info("DCA Scheduler запущен")
     
     while True:
         try:
-            await asyncio.sleep(60)  # проверка каждую минуту
-            
             now = int(time.time())
             
             async with aiosqlite.connect(DB_PATH) as db:
@@ -1017,6 +1428,19 @@ async def dca_scheduler():
                 for plan in plans:
                     plan_id, user_id, from_asset, amount, interval_hours, btc_address, next_run = plan
                     plan_claimed = False
+                    try:
+                        scheduled_time_for_cycle = int(next_run) if next_run is not None else now
+                    except (TypeError, ValueError):
+                        scheduled_time_for_cycle = now
+                    try:
+                        interval_seconds = max(1, int(interval_hours) * 3600)
+                    except (TypeError, ValueError):
+                        interval_seconds = 24 * 3600
+
+                    if next_run is not None and now > scheduled_time_for_cycle:
+                        elapsed_seconds = now - scheduled_time_for_cycle
+                        if elapsed_seconds >= interval_seconds:
+                            scheduled_time_for_cycle += (elapsed_seconds // interval_seconds) * interval_seconds
                     
                     try:
                         async with db.execute(
@@ -1115,6 +1539,10 @@ async def dca_scheduler():
                                             deposit_address=existing_deposit_address or "",
                                             required_amount=float(existing_amount or amount),
                                             existing_approve_tx=existing_approve_tx,
+                                            plan_id=plan_id,
+                                            order_expires=existing_order_expires,
+                                            scheduled_time=scheduled_time_for_cycle,
+                                            interval_hours=interval_hours,
                                         )
                                         if resume_state == "confirmed":
                                             await db.execute(
@@ -1173,6 +1601,10 @@ async def dca_scheduler():
                                                     deposit_address=existing_deposit_address or "",
                                                     required_amount=float(existing_amount or amount),
                                                     existing_approve_tx=existing_approve_tx,
+                                                    plan_id=plan_id,
+                                                    order_expires=existing_order_expires,
+                                                    scheduled_time=scheduled_time_for_cycle,
+                                                    interval_hours=interval_hours,
                                                 )
                                                 if resume_state == "confirmed":
                                                     await db.execute(
@@ -1277,7 +1709,17 @@ async def dca_scheduler():
                                         continue
                                     if fallback_result == "completed":
                                         continue
-                        
+                        if next_run is not None and now > scheduled_time_for_cycle:
+                            overdue_seconds = now - scheduled_time_for_cycle
+                            if overdue_seconds > DCA_EXECUTION_WINDOW_SECONDS:
+                                await skip_missed_dca_cycle(
+                                    plan_id=plan_id,
+                                    user_id=user_id,
+                                    scheduled_time=scheduled_time_for_cycle,
+                                    interval_hours=interval_hours,
+                                )
+                                continue
+
                         logger.info(f"Выполнение DCA для plan_id={plan_id}, user_id={user_id}: {amount} {from_asset}")
                         
                         # Проверяем лимиты перед созданием ордера
@@ -1397,6 +1839,19 @@ async def dca_scheduler():
                                 f"⏳ Auto-sending USDT..."
                             )
                             
+                            if not await claim_auto_send_execution(plan_id, order_id):
+                                continue
+
+                            if is_order_expired(order_expires):
+                                await mark_order_expired_before_send(
+                                    plan_id=plan_id,
+                                    user_id=user_id,
+                                    order_id=order_id,
+                                    scheduled_time=scheduled_time_for_cycle,
+                                    interval_hours=interval_hours,
+                                )
+                                continue
+
                             # Автоматическая отправка USDT
                             try:
                                 success, approve_tx, transfer_tx, error_msg = await auto_send_usdt(
@@ -1444,6 +1899,17 @@ async def dca_scheduler():
                                         (error_str[:500], order_id, plan_id)
                                     )
                                     await db.commit()
+
+                                    if is_order_expired(order_expires):
+                                        await mark_order_expired_before_send(
+                                            plan_id=plan_id,
+                                            user_id=user_id,
+                                            order_id=order_id,
+                                            scheduled_time=scheduled_time_for_cycle,
+                                            interval_hours=interval_hours,
+                                            manual_send_blocked=True,
+                                        )
+                                        continue
                                     
                                     await bot.send_message(
                                         user_id,
@@ -1570,6 +2036,17 @@ async def dca_scheduler():
                                         (error_msg[:500], order_id, plan_id)
                                     )
                                     await db.commit()
+
+                                    if is_order_expired(order_expires):
+                                        await mark_order_expired_before_send(
+                                            plan_id=plan_id,
+                                            user_id=user_id,
+                                            order_id=order_id,
+                                            scheduled_time=scheduled_time_for_cycle,
+                                            interval_hours=interval_hours,
+                                            manual_send_blocked=True,
+                                        )
+                                        continue
                                     
                                     error_notification = build_auto_send_failed_notification(
                                         order_id=order_id,
@@ -1592,6 +2069,16 @@ async def dca_scheduler():
                                     await db.commit()
                         else:
                             # Wallet not configured - ask to send manually
+                            if is_order_expired(order_expires):
+                                await mark_order_expired_before_send(
+                                    plan_id=plan_id,
+                                    user_id=user_id,
+                                    order_id=order_id,
+                                    scheduled_time=scheduled_time_for_cycle,
+                                    interval_hours=interval_hours,
+                                    manual_send_blocked=True,
+                                )
+                                continue
                             await bot.send_message(
                                 user_id,
                                 f"✅ DCA plan executed!\n\n"
@@ -1638,6 +2125,7 @@ async def dca_scheduler():
                         
         except Exception as e:
             logger.error(f"Ошибка в DCA scheduler: {e}")
+        await asyncio.sleep(60)  # проверка каждую минуту
 
 
 # ============================================================================
@@ -1984,8 +2472,8 @@ async def cmd_execute(message: Message):
     # Получаем конкретный план по ID (только не удаленные)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT from_asset, amount, btc_address, active_order_id, active_order_address, "
-            "active_order_amount, active_order_expires "
+            "SELECT from_asset, amount, interval_hours, btc_address, active_order_id, active_order_address, "
+            "active_order_amount, active_order_expires, next_run "
             "FROM dca_plans WHERE id = ? AND user_id = ? AND deleted = 0",
             (plan_id, user_id)
         ) as cur:
@@ -1995,7 +2483,7 @@ async def cmd_execute(message: Message):
         await message.answer("❌ План не найден или не принадлежит тебе")
         return
     
-    from_asset, amount, btc_address, active_order_id, active_order_address, active_order_amount, active_order_expires = row
+    from_asset, amount, interval_hours, btc_address, active_order_id, active_order_address, active_order_amount, active_order_expires, plan_next_run = row
     plan_claimed = False
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -2082,6 +2570,10 @@ async def cmd_execute(message: Message):
                     deposit_address=tx_deposit_address or "",
                     required_amount=float(tx_amount or amount),
                     existing_approve_tx=approve_tx_hash,
+                    plan_id=plan_id,
+                    order_expires=active_order_expires,
+                    scheduled_time=plan_next_run,
+                    interval_hours=interval_hours,
                 )
                 async with aiosqlite.connect(DB_PATH) as db:
                     if resume_state == "confirmed":
@@ -2099,6 +2591,8 @@ async def cmd_execute(message: Message):
                     await message.answer(f"✅ Transfer по ордеру {active_order_id} успешно подтверждён.")
                 elif resume_state == "tx_pending":
                     await message.answer(f"⚠️ Transfer по ордеру {active_order_id} отправлен, но ещё не подтверждён.")
+                elif resume_state == "expired":
+                    return
                 else:
                     await message.answer(f"❌ Transfer по ордеру {active_order_id} не выполнен: {resume_error}")
                 return
@@ -2152,6 +2646,10 @@ async def cmd_execute(message: Message):
                         deposit_address=tx_deposit_address or "",
                         required_amount=float(tx_amount or amount),
                         existing_approve_tx=approve_tx_hash,
+                        plan_id=plan_id,
+                        order_expires=active_order_expires,
+                        scheduled_time=plan_next_run,
+                        interval_hours=interval_hours,
                     )
                     async with aiosqlite.connect(DB_PATH) as db:
                         if resume_state == "confirmed":
@@ -2169,6 +2667,8 @@ async def cmd_execute(message: Message):
                         await message.answer(f"✅ Transfer по ордеру {active_order_id} успешно подтверждён.")
                     elif resume_state == "tx_pending":
                         await message.answer(f"⚠️ Transfer по ордеру {active_order_id} отправлен, но ещё не подтверждён.")
+                    elif resume_state == "expired":
+                        return
                     else:
                         await message.answer(f"❌ Transfer по ордеру {active_order_id} не выполнен: {resume_error}")
                     return
@@ -2353,6 +2853,19 @@ async def cmd_execute(message: Message):
                 f"⏳ Автоматически отправляю USDT..."
             )
             
+            if not await claim_auto_send_execution(plan_id, order_id):
+                return
+
+            if is_order_expired(order_expires):
+                await mark_order_expired_before_send(
+                    plan_id=plan_id,
+                    user_id=user_id,
+                    order_id=order_id,
+                    scheduled_time=plan_next_run,
+                    interval_hours=interval_hours,
+                )
+                return
+
             # Автоматическая отправка USDT
             success, approve_tx, transfer_tx, error_msg = await auto_send_usdt(
                 network_key=from_asset,
@@ -2449,6 +2962,16 @@ async def cmd_execute(message: Message):
                     return
 
                 # Ошибка автоматической отправки - уведомляем пользователя
+                if is_order_expired(order_expires):
+                    await mark_order_expired_before_send(
+                        plan_id=plan_id,
+                        user_id=user_id,
+                        order_id=order_id,
+                        scheduled_time=plan_next_run,
+                        interval_hours=interval_hours,
+                        manual_send_blocked=True,
+                    )
+                    return
                 error_notification = build_auto_send_failed_notification(
                     order_id=order_id,
                     order_url=order_url,
@@ -2462,6 +2985,16 @@ async def cmd_execute(message: Message):
                 logger.error(f"Auto-send failed for order {order_id}: {error_msg}")
         else:
             # Кошелёк не настроен - просим отправить вручную
+            if is_order_expired(order_expires):
+                await mark_order_expired_before_send(
+                    plan_id=plan_id,
+                    user_id=user_id,
+                    order_id=order_id,
+                    scheduled_time=plan_next_run,
+                    interval_hours=interval_hours,
+                    manual_send_blocked=True,
+                )
+                return
             await message.answer(
                 f"✅ Ордер создан!\n\n"
                 f"🆔 ID: {order_id}\n"
@@ -3505,12 +4038,14 @@ async def main():
 
     # Recovery scan for in-flight transactions after restart
     await recovery_scan_pending_transactions()
+    await recover_stale_plan_claims()
     
     logger.info("🚀 AutoDCA Bot успешно запущен!")
     logger.info("=" * 60)
     
     # Запуск фонового планировщика DCA
     asyncio.create_task(dca_scheduler())
+    await notify_offline_startup_status()
     
     # Запуск мониторинга завершения ордеров
     asyncio.create_task(order_monitor())
