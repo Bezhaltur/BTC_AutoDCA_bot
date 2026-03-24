@@ -14,7 +14,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Directory for keystore files
-KEYSTORE_DIR = "keystores"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+KEYSTORE_DIR = os.path.join(BASE_DIR, "keystores")
 os.makedirs(KEYSTORE_DIR, exist_ok=True)
 
 # Keyring service name
@@ -48,11 +49,15 @@ def save_keystore(keystore: dict, user_id: int) -> str:
     """
     filepath = generate_keystore_path(user_id)
     
-    with open(filepath, "w") as f:
+    with open(filepath, "w", encoding="utf-8") as f:
         json.dump(keystore, f, indent=2)
     
-    # Set restrictive permissions (owner read/write only)
-    os.chmod(filepath, 0o600)
+    # Set restrictive permissions (owner read/write only) on Unix-like systems.
+    if os.name != "nt":
+        try:
+            os.chmod(filepath, 0o600)
+        except OSError as e:
+            logger.warning(f"Failed to set chmod 600 for keystore {filepath}: {e}")
     
     logger.info(f"Keystore saved to {filepath}")
     return filepath
@@ -74,7 +79,7 @@ def load_keystore(user_id: int) -> Optional[dict]:
         return None
     
     try:
-        with open(filepath, "r") as f:
+        with open(filepath, "r", encoding="utf-8") as f:
             keystore = json.load(f)
         return keystore
     except Exception as e:
@@ -163,7 +168,13 @@ def save_password_to_keyring(user_id: int, password: str) -> None:
         password: Wallet password
     """
     username = f"user_{user_id}"
-    keyring.set_password(KEYRING_SERVICE, username, password)
+    try:
+        keyring.set_password(KEYRING_SERVICE, username, password)
+    except keyring.errors.KeyringError as e:
+        logger.error(f"Failed to save password to keyring for user {user_id}: {e}")
+        raise RuntimeError(
+            "OS keyring is unavailable. Configure a supported keyring backend and retry."
+        ) from e
     logger.info(f"Wallet password saved to keyring for user {user_id}")
 
 
@@ -202,3 +213,5 @@ def delete_password_from_keyring(user_id: int) -> None:
         logger.info(f"Wallet password deleted from keyring for user {user_id}")
     except keyring.errors.PasswordDeleteError:
         pass  # Password was not set
+    except keyring.errors.KeyringError as e:
+        logger.warning(f"Failed to delete password from keyring for user {user_id}: {e}")

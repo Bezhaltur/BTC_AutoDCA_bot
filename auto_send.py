@@ -22,7 +22,6 @@ from erc20 import (
     check_allowance,
 )
 from wallet import load_keystore, decrypt_private_key
-from test_config import mask_sensitive_data
 
 logger = logging.getLogger(__name__)
 

@@ -9,7 +9,6 @@ from web3 import Web3
 from web3.exceptions import ContractLogicError, TransactionNotFound
 from eth_account import Account
 from networks import get_network_config, get_usdt_contract_address
-from test_config import DRY_RUN, mask_sensitive_data
 
 logger = logging.getLogger(__name__)
 

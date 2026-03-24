@@ -1,30 +1,66 @@
 import asyncio
-import fcntl
+import atexit
 import logging
 import os
+import platform
+import sys
 import hmac
 import hashlib
 import json
 import time
 import re
 from typing import Any, Awaitable, Callable, Dict, Optional
-import requests
-from dotenv import load_dotenv
-import aiosqlite
-from aiogram import Bot, Dispatcher, BaseMiddleware
-from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
-from aiogram.fsm.storage.memory import MemoryStorage
-from web3.exceptions import TransactionNotFound
+
+MIN_PYTHON_VERSION = (3, 9)
+if sys.version_info < MIN_PYTHON_VERSION:
+    raise RuntimeError(
+        f"Unsupported Python version: {sys.version_info.major}.{sys.version_info.minor}. "
+        f"Use Python {MIN_PYTHON_VERSION[0]}.{MIN_PYTHON_VERSION[1]}+"
+    )
+
+try:
+    import requests
+except ModuleNotFoundError as exc:
+    raise RuntimeError("Missing dependency 'requests'. Install requirements: pip install -r requirements.txt") from exc
+
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError as exc:
+    raise RuntimeError("Missing dependency 'python-dotenv'. Install requirements: pip install -r requirements.txt") from exc
+
+try:
+    import aiosqlite
+except ModuleNotFoundError as exc:
+    raise RuntimeError("Missing dependency 'aiosqlite'. Install requirements: pip install -r requirements.txt") from exc
+
+try:
+    from aiogram import Bot, Dispatcher, BaseMiddleware
+    from aiogram.filters import Command
+    from aiogram.types import CallbackQuery, Message
+    from aiogram.fsm.storage.memory import MemoryStorage
+except ModuleNotFoundError as exc:
+    raise RuntimeError("Missing dependency 'aiogram'. Install requirements: pip install -r requirements.txt") from exc
+
+try:
+    from web3.exceptions import TransactionNotFound
+except ModuleNotFoundError as exc:
+    raise RuntimeError("Missing dependency 'web3'. Install requirements: pip install -r requirements.txt") from exc
 from networks import get_network_config, get_blockchair_url
 from wallet import (
     save_keystore, load_keystore,
     delete_keystore, get_wallet_address,
     save_password_to_keyring, load_password_from_keyring,
-    delete_password_from_keyring, keystore_exists
+    delete_password_from_keyring, keystore_exists, KEYSTORE_DIR
 )
 from auto_send import auto_send_usdt
 from erc20 import get_web3_instance, get_usdt_balance, get_native_balance
+
+try:
+    import fcntl  # Unix file lock support
+    HAS_FCNTL = True
+except ImportError:
+    fcntl = None
+    HAS_FCNTL = False
 
 # ============================================================================
 # НАСТРОЙКА И КОНФИГУРАЦИЯ
@@ -32,44 +68,106 @@ from erc20 import get_web3_instance, get_usdt_balance, get_native_balance
 
 # Настройка логирования - все операции бота логируются в файл и консоль
 # Создаём директорию для логов если её нет
-os.makedirs("logs", exist_ok=True)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
+DEFAULT_LOG_FILE = os.path.join(LOGS_DIR, "bot.log")
+DEFAULT_LAST_SEEN_EXECUTION_FILE = os.path.join(LOGS_DIR, "last_seen_execution.txt")
+DEFAULT_DB_PATH = os.path.join(BASE_DIR, "dca.db")
+LOCK_FILE = os.path.join(LOGS_DIR, "bot.lock")
+DEFAULT_LOCK_FILE = LOCK_FILE
+
+os.makedirs(LOGS_DIR, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("logs/bot.log"),
+        logging.FileHandler(DEFAULT_LOG_FILE, encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
 # Загрузка переменных окружения из .env файла
-load_dotenv()
+load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
+
+
+def resolve_project_path(path_value: str, default_path: str) -> str:
+    """Resolve env-provided path relative to project root when needed."""
+    selected = path_value or default_path
+    if not os.path.isabs(selected):
+        selected = os.path.join(BASE_DIR, selected)
+    return os.path.abspath(selected)
+
+
+def is_process_alive(pid: int) -> bool:
+    """Cross-platform process existence check."""
+    if pid <= 0:
+        return False
+    if platform.system() == "Windows":
+        import subprocess
+        try:
+            output = subprocess.check_output(
+                ["tasklist", "/FI", f"PID eq {pid}"],
+                stderr=subprocess.DEVNULL
+            ).decode(errors="ignore")
+            return re.search(rf"\b{pid}\b", output) is not None
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
 
 ADMIN_USER_ID_RAW = os.getenv("ADMIN_USER_ID")
 if not ADMIN_USER_ID_RAW:
-    raise ValueError("ADMIN_USER_ID отсутствует в .env. Бот остановлен (fail-close).")
+    raise RuntimeError("Missing ADMIN_USER_ID in .env")
 try:
     ADMIN_USER_ID = int(ADMIN_USER_ID_RAW)
     if ADMIN_USER_ID <= 0:
         raise ValueError
 except ValueError as exc:
-    raise ValueError("ADMIN_USER_ID невалиден в .env. Бот остановлен (fail-close).") from exc
+    raise RuntimeError("Invalid ADMIN_USER_ID in .env. Expected a positive integer") from exc
 
 _instance_lock_file = None
+_instance_lock_path = None
 
 # API ключи для FixedFloat (сервис обмена криптовалют)
 FF_API_KEY = os.getenv("FF_API_KEY")
 FF_API_SECRET = os.getenv("FF_API_SECRET")
 FF_API_URL = "https://ff.io/api/v2"  # базовый URL API FixedFloat
 
-# Import test configuration
-from test_config import (
-    DRY_RUN, MOCK_FIXEDFLOAT, USE_TESTNET, is_test_mode,
-    get_mock_fixedfloat_order, get_mock_fixedfloat_ccies, get_mock_fixedfloat_price,
-    mask_sensitive_data
-)
+# Import test configuration (optional)
+try:
+    from test_config import (
+        DRY_RUN, MOCK_FIXEDFLOAT, USE_TESTNET, is_test_mode,
+        get_mock_fixedfloat_order, get_mock_fixedfloat_ccies, get_mock_fixedfloat_price,
+        mask_sensitive_data
+    )
+except ImportError:
+    DRY_RUN = False
+    MOCK_FIXEDFLOAT = False
+    USE_TESTNET = False
+
+    def is_test_mode() -> bool:
+        return False
+
+    def get_mock_fixedfloat_order(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("MOCK_FIXEDFLOAT disabled: test_config.py not found")
+
+    def get_mock_fixedfloat_ccies(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("MOCK_FIXEDFLOAT disabled: test_config.py not found")
+
+    def get_mock_fixedfloat_price(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("MOCK_FIXEDFLOAT disabled: test_config.py not found")
+
+    def mask_sensitive_data(data):  # type: ignore[no-untyped-def]
+        return data
 
 # In-memory password cache (loaded from keyring at startup)
 # Keys: user_id -> password
@@ -106,7 +204,10 @@ except ValueError:
     DCA_EXECUTION_WINDOW_SECONDS = 300
 if DCA_EXECUTION_WINDOW_SECONDS < 0:
     DCA_EXECUTION_WINDOW_SECONDS = 0
-LAST_SEEN_EXECUTION_FILE = os.getenv("LAST_SEEN_EXECUTION_FILE", "logs/last_seen_execution.txt")
+LAST_SEEN_EXECUTION_FILE = resolve_project_path(
+    os.getenv("LAST_SEEN_EXECUTION_FILE", ""),
+    DEFAULT_LAST_SEEN_EXECUTION_FILE
+)
  
 
 
@@ -835,7 +936,7 @@ def load_last_seen_execution_time() -> Optional[int]:
 def save_last_seen_execution_time(ts: int) -> None:
     """Persist current bot execution timestamp to local file."""
     try:
-        os.makedirs("logs", exist_ok=True)
+        os.makedirs(LOGS_DIR, exist_ok=True)
         target_dir = os.path.dirname(LAST_SEEN_EXECUTION_FILE)
         if target_dir:
             os.makedirs(target_dir, exist_ok=True)
@@ -1223,12 +1324,32 @@ class AccessControlMiddleware(BaseMiddleware):
 # Токен Telegram бота из переменных окружения
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN не найден в .env!")
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN in .env")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 dp.update.middleware(AccessControlMiddleware())
-DB_PATH = os.getenv("DATABASE_PATH", "./dca.db")
+DB_PATH = resolve_project_path(os.getenv("DATABASE_PATH", ""), DEFAULT_DB_PATH)
+
+
+def run_startup_checks() -> None:
+    """Validate startup prerequisites before runtime initialization."""
+    if not BOT_TOKEN:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN in .env")
+    if ADMIN_USER_ID <= 0:
+        raise RuntimeError("Invalid ADMIN_USER_ID in .env. Expected a positive integer")
+
+
+def ensure_runtime_directories() -> None:
+    """Create required directories for logs/db/keystore before writes."""
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    os.makedirs(KEYSTORE_DIR, exist_ok=True)
+    last_seen_dir = os.path.dirname(LAST_SEEN_EXECUTION_FILE)
+    if last_seen_dir:
+        os.makedirs(last_seen_dir, exist_ok=True)
 
 
 async def init_db():
@@ -3419,7 +3540,7 @@ async def cmd_setwallet(message: Message):
         return
     
     # Read wallet.json from project root
-    wallet_json_path = "wallet.json"
+    wallet_json_path = os.path.join(BASE_DIR, "wallet.json")
     if not os.path.exists(wallet_json_path):
         await message.answer(
             "❌ wallet.json не найден\n\n"
@@ -3436,7 +3557,7 @@ async def cmd_setwallet(message: Message):
         return
     
     try:
-        with open(wallet_json_path, "r") as f:
+        with open(wallet_json_path, "r", encoding="utf-8") as f:
             wallet_data = json.load(f)
         
         private_key = wallet_data.get("private_key")
@@ -3477,7 +3598,7 @@ async def cmd_setwallet(message: Message):
         del private_key
         
         # Overwrite wallet.json to contain ONLY keystore
-        with open(wallet_json_path, "w") as f:
+        with open(wallet_json_path, "w", encoding="utf-8") as f:
             json.dump({"keystore": keystore}, f, indent=2)
         
         # Save wallet address to database
@@ -4001,6 +4122,101 @@ async def load_passwords_at_startup():
 
 
 
+def acquire_instance_lock(lock_path: str) -> bool:
+    """
+    Cross-platform single-instance lock.
+    - Unix/macOS: fcntl.flock on opened lock file.
+    - Windows: atomic file creation via O_EXCL.
+    """
+    global _instance_lock_file, _instance_lock_path
+
+    if _instance_lock_file is not None:
+        logger.error("Lock already acquired in current process")
+        return False
+
+    lock_dir = os.path.dirname(lock_path)
+    if lock_dir:
+        os.makedirs(lock_dir, exist_ok=True)
+
+    if HAS_FCNTL:
+        lock_fp = open(lock_path, "w", encoding="utf-8")
+        try:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _instance_lock_file = lock_fp
+            _instance_lock_path = lock_path
+            return True
+        except BlockingIOError:
+            logger.error(f"Another bot instance is already running (lock: {lock_path})")
+            lock_fp.close()
+            return False
+
+    # Windows fallback: stale lock detection via PID check.
+    if os.path.exists(lock_path):
+        stale_lock = False
+        try:
+            with open(lock_path, "r", encoding="utf-8") as f:
+                pid_raw = f.read().strip()
+            if pid_raw.isdigit():
+                if is_process_alive(int(pid_raw)):
+                    logger.error(f"Another bot instance is already running (lock: {lock_path})")
+                    return False
+                stale_lock = True
+            else:
+                stale_lock = True
+        except OSError:
+            stale_lock = True
+
+        if stale_lock:
+            try:
+                os.remove(lock_path)
+            except OSError as e:
+                logger.error(f"Failed to remove stale lock {lock_path}: {e}")
+                return False
+
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        lock_fp = os.fdopen(fd, "w", encoding="utf-8")
+        lock_fp.write(str(os.getpid()))
+        lock_fp.flush()
+        _instance_lock_file = lock_fp
+        _instance_lock_path = lock_path
+        return True
+    except FileExistsError:
+        logger.error(f"Another bot instance is already running (lock: {lock_path})")
+        return False
+    except OSError as e:
+        logger.error(f"Failed to acquire instance lock {lock_path}: {e}")
+        return False
+
+
+def release_instance_lock() -> None:
+    """Release cross-platform single-instance lock."""
+    global _instance_lock_file, _instance_lock_path
+    lock_path = _instance_lock_path
+
+    if _instance_lock_file:
+        try:
+            if HAS_FCNTL:
+                fcntl.flock(_instance_lock_file.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            _instance_lock_file.close()
+            _instance_lock_file = None
+
+    if lock_path:
+        try:
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+        except OSError as e:
+            logger.warning(f"Failed to remove lock file {lock_path}: {e}")
+
+    _instance_lock_path = None
+
+
+atexit.register(release_instance_lock)
+
+
 async def main():
     """
     Главная функция запуска бота.
@@ -4009,62 +4225,52 @@ async def main():
     logger.info("=" * 60)
     logger.info("Запуск AutoDCA Bot...")
 
-    global _instance_lock_file
-    lock_path = os.getenv("BOT_LOCK_PATH", "/tmp/autodca_bot.lock")
-    _instance_lock_file = open(lock_path, "w")
-    try:
-        fcntl.flock(_instance_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        logger.error(f"Another bot instance is already running (lock: {lock_path})")
-        _instance_lock_file.close()
-        _instance_lock_file = None
-        return
-    
-    if is_test_mode():
-        logger.warning("=" * 60)
-        logger.warning("⚠️ TEST MODE(S) ENABLED:")
-        if DRY_RUN:
-            logger.warning("  • DRY_RUN: No transactions will be broadcast")
-        if MOCK_FIXEDFLOAT:
-            logger.warning("  • MOCK_FIXEDFLOAT: Using mocked API responses")
-        if USE_TESTNET:
-            logger.warning("  • USE_TESTNET: Using testnet networks")
-        logger.warning("=" * 60)
-    
-    # Инициализация базы данных
-    await init_db()
-    
-    # Load passwords from keyring into memory cache
-    await load_passwords_at_startup()
-    
-    # Обновление актуальных кодов сетей из FixedFloat
-    await update_network_codes()
+    run_startup_checks()
+    ensure_runtime_directories()
 
-    # Recovery scan for in-flight transactions after restart
-    await recovery_scan_pending_transactions()
-    await recover_stale_plan_claims()
-    
-    logger.info("🚀 AutoDCA Bot успешно запущен!")
-    logger.info("=" * 60)
-    
-    # Запуск фонового планировщика DCA
-    asyncio.create_task(dca_scheduler())
-    await notify_offline_startup_status()
-    
-    # Запуск мониторинга завершения ордеров
-    asyncio.create_task(order_monitor())
-    
-    # Запуск обработки сообщений от Telegram
+    lock_path = resolve_project_path(os.getenv("BOT_LOCK_PATH", ""), DEFAULT_LOCK_FILE)
+    if not acquire_instance_lock(lock_path):
+        return
+
     try:
+        if is_test_mode():
+            logger.warning("=" * 60)
+            logger.warning("⚠️ TEST MODE(S) ENABLED:")
+            if DRY_RUN:
+                logger.warning("  • DRY_RUN: No transactions will be broadcast")
+            if MOCK_FIXEDFLOAT:
+                logger.warning("  • MOCK_FIXEDFLOAT: Using mocked API responses")
+            if USE_TESTNET:
+                logger.warning("  • USE_TESTNET: Using testnet networks")
+            logger.warning("=" * 60)
+        
+        # Инициализация базы данных
+        await init_db()
+        
+        # Load passwords from keyring into memory cache
+        await load_passwords_at_startup()
+        
+        # Обновление актуальных кодов сетей из FixedFloat
+        await update_network_codes()
+
+        # Recovery scan for in-flight transactions after restart
+        await recovery_scan_pending_transactions()
+        await recover_stale_plan_claims()
+        
+        logger.info("🚀 AutoDCA Bot успешно запущен!")
+        logger.info("=" * 60)
+        
+        # Запуск фонового планировщика DCA
+        asyncio.create_task(dca_scheduler())
+        await notify_offline_startup_status()
+        
+        # Запуск мониторинга завершения ордеров
+        asyncio.create_task(order_monitor())
+        
+        # Запуск обработки сообщений от Telegram
         await dp.start_polling(bot)
     finally:
-        if _instance_lock_file:
-            try:
-                fcntl.flock(_instance_lock_file.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-            _instance_lock_file.close()
-            _instance_lock_file = None
+        release_instance_lock()
 
 
 if __name__ == "__main__":

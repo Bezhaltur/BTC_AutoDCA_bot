@@ -10,4 +10,4 @@ eth-account==0.10.0
 eth-keyfile==0.6.0
 cryptography==42.0.5
 keyring==24.3.0
-
+pywin32>=306; platform_system == "Windows"
