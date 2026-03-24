@@ -79,7 +79,7 @@ pip install -r requirements.txt
 
 ```env
 # Telegram bot
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+DCA_TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 ADMIN_USER_ID=123456789
 
 # FixedFloat API

@@ -8,7 +8,7 @@ import os
 from dotenv import load_dotenv
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
+load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"), override=True)
 USE_TESTNET = os.getenv("USE_TESTNET", "false").lower() == "true"
 
 # Mainnet configurations

@@ -89,7 +89,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Загрузка переменных окружения из .env файла
-load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
+load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"), override=True)
 
 
 def resolve_project_path(path_value: str, default_path: str) -> str:
@@ -1322,9 +1322,9 @@ class AccessControlMiddleware(BaseMiddleware):
         return
 
 # Токен Telegram бота из переменных окружения
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+BOT_TOKEN = os.getenv("DCA_TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN in .env")
+    raise ValueError("DCA_TELEGRAM_BOT_TOKEN is not set")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -1335,7 +1335,7 @@ DB_PATH = resolve_project_path(os.getenv("DATABASE_PATH", ""), DEFAULT_DB_PATH)
 def run_startup_checks() -> None:
     """Validate startup prerequisites before runtime initialization."""
     if not BOT_TOKEN:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN in .env")
+        raise ValueError("DCA_TELEGRAM_BOT_TOKEN is not set")
     if ADMIN_USER_ID <= 0:
         raise RuntimeError("Invalid ADMIN_USER_ID in .env. Expected a positive integer")
 
