@@ -12,6 +12,7 @@ import json
 import math
 import time
 import re
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 MIN_PYTHON_VERSION = (3, 9)
@@ -349,10 +350,10 @@ def format_code_address(address: Any) -> str:
 
 
 NOTIFICATION_REASONS = {
-    "offline": "Бот был офлайн",
-    "window_expired": "Окно исполнения пропущено",
+    "offline": "Бот был офлайн слишком долго",
+    "window_expired": "Покупка не была выполнена вовремя",
     "insufficient": "Недостаточно средств",
-    "order_expired": "Ордер истёк",
+    "order_expired": "Оплата не была получена вовремя",
 }
 
 
@@ -372,14 +373,47 @@ def format_notification_amount(amount: Any) -> str:
         return escape_html(amount)
 
 
-def format_order_deadline(expires_at: Optional[int], now_ts: Optional[int] = None) -> str:
+def format_time_until(target_ts: Optional[int], now_ts: Optional[int] = None) -> str:
     if now_ts is None:
         now_ts = int(time.time())
-    if not expires_at:
-        return "~0 минут"
-    remaining = max(0, int(expires_at) - int(now_ts))
+    if not target_ts:
+        return "—"
+    remaining = max(0, int(target_ts) - int(now_ts))
     minutes_left = math.ceil(remaining / 60)
-    return f"~{minutes_left} минут"
+    if minutes_left < 60:
+        return f"~{minutes_left} мин"
+    hours_left, rest_minutes = divmod(minutes_left, 60)
+    if rest_minutes == 0:
+        return f"~{hours_left} ч"
+    return f"~{hours_left} ч {rest_minutes} мин"
+
+
+def format_datetime_utc(ts: Optional[int]) -> str:
+    if not ts:
+        return "—"
+    months = ["янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
+    dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+    return f"{dt.day} {months[dt.month - 1]} {dt.hour:02d}:{dt.minute:02d} UTC"
+
+
+def format_order_deadline(expires_at: Optional[int], now_ts: Optional[int] = None) -> str:
+    absolute_deadline = format_datetime_utc(expires_at)
+    countdown = format_time_until(expires_at, now_ts)
+    if absolute_deadline == "—":
+        return countdown
+    if countdown == "—":
+        return absolute_deadline
+    return f"{absolute_deadline} ({countdown})"
+
+
+def format_next_buy_time(ts: Optional[int], now_ts: Optional[int] = None) -> str:
+    absolute_time = format_datetime_utc(ts)
+    countdown = format_time_until(ts, now_ts)
+    if absolute_time == "—":
+        return countdown
+    if countdown == "—":
+        return absolute_time
+    return f"{absolute_time} ({countdown})"
 
 
 def extract_order_expires_at(order_data: dict, fallback_now: Optional[int] = None) -> int:
@@ -517,34 +551,110 @@ def humanize_auto_send_error(error_msg: str, network_key: str) -> str:
 
 def build_auto_send_failed_notification(
     order_id: str,
+    plan_number: Optional[int],
     network_key: str,
     required_amount: float,
+    btc_address: str,
     deposit_address: str,
     order_expires: Optional[int],
     error_msg: str,
 ) -> str:
     """Build clear fallback message when auto-send fails."""
-    human_error = escape_html(humanize_auto_send_error(error_msg, network_key))
-    network_label = escape_html(get_network_label(network_key) or network_key)
-    deadline_text = escape_html(format_order_deadline(order_expires))
-    return (
-        "❌ Статус: Авто-отправка не выполнена\n\n"
-        f"🔗 Ордер: {format_order_link(order_id)}\n"
-        f"🌐 Сеть: {network_label}\n\n"
-        f"💰 Сумма: {format_notification_amount(required_amount)} USDT\n"
-        f"⏰ До истечения: {deadline_text}\n\n"
-        f"Причина:\n{human_error}\n\n"
-        f"📍 Адрес: {format_code_address(deposit_address)}\n\n"
-        "Действие:\n"
-        "Оплатите ордер на указанный адрес до дедлайна."
+    human_error = humanize_auto_send_error(error_msg, network_key)
+    status_title = "⚠️ Недостаточно средств" if "Недостаточно средств" in human_error else "⚠️ Требуется оплата"
+    return build_order_state_message(
+        status_title=status_title,
+        plan_number=plan_number,
+        order_id=order_id,
+        amount=required_amount,
+        network_key=network_key,
+        btc_address=btc_address,
+        payment_address=deposit_address,
+        deadline_text=format_order_deadline(order_expires),
+        reason_text=human_error,
     )
 
 
 def format_scheduled_time(ts: int) -> str:
     """Format Unix timestamp for user-facing notifications."""
-    months = ["янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
-    dt = time.localtime(int(ts))
-    return f"{dt.tm_mday} {months[dt.tm_mon - 1]} {dt.tm_hour:02d}:{dt.tm_min:02d}"
+    return format_datetime_utc(ts)
+
+
+def format_btc_recipient_short(address: Any) -> str:
+    text = str(address or "").strip()
+    return short_address(text) if text else "—"
+
+
+def format_txid_short(txid: Any) -> str:
+    text = str(txid or "").strip()
+    if len(text) <= 16:
+        return text or "TX"
+    return f"{text[:10]}...{text[-8:]}"
+
+
+def build_status_hint() -> str:
+    return "📊 Статус планов: /status"
+
+
+def build_plan_context(
+    *,
+    plan_number: Optional[int],
+    amount: Any,
+    network_key: str,
+    btc_address: str,
+) -> str:
+    network_label = escape_html(get_network_label(network_key) or network_key or "—")
+    lines = []
+    if plan_number is not None:
+        lines.append(f"План: #{int(plan_number)}")
+    lines.extend([
+        f"Сумма: {format_notification_amount(amount)} USDT",
+        f"Сеть: {network_label}",
+        f"Получатель BTC: {escape_html(format_btc_recipient_short(btc_address))}",
+    ])
+    return "\n".join(lines)
+
+
+def build_order_state_message(
+    *,
+    status_title: str,
+    plan_number: Optional[int],
+    order_id: Optional[str],
+    amount: Any,
+    network_key: str,
+    btc_address: str,
+    reason_text: str,
+    deadline_text: str = "",
+    scheduled_text: str = "",
+    payment_address: str = "",
+    extra_lines: Optional[list[str]] = None,
+) -> str:
+    lines = [status_title, ""]
+    if order_id:
+        lines.append(f"🔗 Ордер: {format_order_link(order_id)}")
+        lines.append("")
+    lines.append(build_plan_context(
+        plan_number=plan_number,
+        amount=amount,
+        network_key=network_key,
+        btc_address=btc_address,
+    ))
+    if payment_address:
+        payment_network = escape_html(get_network_label(network_key) or network_key or "—")
+        lines.extend([
+            "",
+            f"📍 Адрес для оплаты USDT ({payment_network}):",
+            format_code_address(payment_address),
+        ])
+    if scheduled_text:
+        lines.extend(["", f"📅 Планировалось:\n{escape_html(scheduled_text)}"])
+    if deadline_text:
+        lines.extend(["", f"⏰ Срок оплаты:\n{escape_html(deadline_text)}"])
+    lines.extend(["", f"Причина:\n{escape_html(reason_text)}"])
+    if extra_lines:
+        lines.extend(["", *extra_lines])
+    lines.extend(["", build_status_hint()])
+    return "\n".join(lines)
 
 
 def calculate_next_run_preserving_schedule(scheduled_time: int, interval_hours: int, now_ts: int) -> int:
@@ -596,70 +706,160 @@ def build_missed_dca_cycle_notification(
     plan_number: int,
     network_key: str,
     amount: Any,
+    btc_address: str,
     scheduled_time: int,
     execute_command: str,
     reason_code: str = "window_expired",
 ) -> str:
     """Notification text for skipped missed cycle."""
-    network_label = escape_html(network_key)
-    reason_text = escape_html(get_notification_reason(reason_code))
-    return (
-        "⚠️ Статус: Платёж пропущен\n\n"
-        f"🔗 План: #{plan_number}\n"
-        f"🌐 Сеть: {network_label}\n\n"
-        f"💰 Сумма: {format_notification_amount(amount)} USDT\n"
-        f"📅 Планировалось: {format_scheduled_time(scheduled_time)}\n\n"
-        f"Причина:\n{reason_text}\n\n"
-        "Действие:\n"
-        "Выполните план вручную:\n"
-        f"{execute_command}"
+    reason_text = get_notification_reason(reason_code)
+    return build_order_state_message(
+        status_title="⚠️ Покупка пропущена",
+        plan_number=plan_number,
+        order_id=None,
+        amount=amount,
+        network_key=network_key,
+        btc_address=btc_address,
+        scheduled_text=format_scheduled_time(scheduled_time),
+        reason_text=reason_text,
     )
 
 
 def build_order_expired_notification(
     *,
     order_id: str,
+    plan_number: Optional[int],
     network_key: str,
     amount: Any,
+    btc_address: str,
     execute_command: str,
 ) -> str:
     """Notification text when order expired before send attempt."""
-    network_label = escape_html(get_network_label(network_key) or network_key)
-    reason_text = escape_html(get_notification_reason("order_expired"))
-    return (
-        "❌ Статус: Ордер истёк\n\n"
-        f"🔗 Ордер: {format_order_link(order_id)}\n"
-        f"🌐 Сеть: {network_label}\n\n"
-        f"💰 Сумма: {format_notification_amount(amount)} USDT\n\n"
-        f"Причина:\n{reason_text}\n\n"
-        "Действие:\n"
-        "Вы можете повторить этот платёж вручную:\n"
-        f"{execute_command}"
+    return build_order_state_message(
+        status_title=f"❌ Ордер {order_id} истёк",
+        plan_number=plan_number,
+        order_id=order_id,
+        amount=amount,
+        network_key=network_key,
+        btc_address=btc_address,
+        reason_text="Оплата не была получена вовремя.\n\nОрдер отменён и недействителен.",
     )
 
 
 def build_order_payment_notification(
     *,
     order_id: str,
+    plan_number: Optional[int],
     network_key: str,
     amount: Any,
+    btc_address: str,
     deposit_address: str,
     order_expires: Optional[int],
     action_text: str,
 ) -> str:
     """Notification text for active order payment instructions."""
-    network_label = escape_html(get_network_label(network_key) or network_key)
-    return (
-        "⏳ Статус: Ордер ожидает оплату\n\n"
-        f"🔗 Ордер: {format_order_link(order_id)}\n"
-        f"🌐 Сеть: {network_label}\n\n"
-        f"💰 Сумма: {format_notification_amount(amount)} USDT\n\n"
-        f"📍 Адрес: {format_code_address(deposit_address)}\n"
-        f"⏰ До истечения: {escape_html(format_order_deadline(order_expires))}\n\n"
-        "Причина:\n"
-        "Ордер создан и ожидает оплату\n\n"
-        "Действие:\n"
-        f"{action_text}"
+    extra_lines = [escape_html(action_text)] if action_text else None
+    return build_order_state_message(
+        status_title="⏳ Ожидает оплаты",
+        plan_number=plan_number,
+        order_id=order_id,
+        amount=amount,
+        network_key=network_key,
+        btc_address=btc_address,
+        payment_address=deposit_address,
+        deadline_text=format_order_deadline(order_expires),
+        reason_text="Ордер создан и ожидает оплату.",
+        extra_lines=extra_lines,
+    )
+
+
+def build_purchase_success_notification(
+    *,
+    order_id: str,
+    plan_number: Optional[int],
+    network_key: str,
+    amount: Any,
+    btc_address: str,
+    btc_txid: str,
+    btc_amount: str,
+) -> str:
+    return build_order_state_message(
+        status_title="✅ BTC получен",
+        plan_number=plan_number,
+        order_id=order_id,
+        amount=amount,
+        network_key=network_key,
+        btc_address=btc_address,
+        reason_text="Выплата BTC подтверждена.",
+        extra_lines=[
+            f"₿ Получено:\n{escape_html(btc_amount or '—')}",
+            f'🔗 BTC транзакция:\n<a href="{escape_html(get_blockchair_url(btc_txid))}">{escape_html(format_txid_short(btc_txid))}</a>',
+            "Статус:\nBitcoin транзакция подтверждена сетью.",
+        ],
+    )
+
+
+def build_btc_tx_sent_notification(
+    *,
+    order_id: str,
+    plan_number: Optional[int],
+    network_key: str,
+    amount: Any,
+    btc_address: str,
+    btc_txid: str,
+) -> str:
+    return build_order_state_message(
+        status_title="⏳ BTC транзакция отправлена",
+        plan_number=plan_number,
+        order_id=order_id,
+        amount=amount,
+        network_key=network_key,
+        btc_address=btc_address,
+        reason_text="Транзакция обнаружена в сети Bitcoin.\nОжидается подтверждение.",
+        extra_lines=[f'🔗 BTC транзакция:\n<a href="{escape_html(get_blockchair_url(btc_txid))}">{escape_html(format_txid_short(btc_txid))}</a>'],
+    )
+
+
+def build_payout_review_notification(
+    *,
+    order_id: str,
+    plan_number: Optional[int],
+    network_key: str,
+    amount: Any,
+    btc_address: str,
+) -> str:
+    return build_order_state_message(
+        status_title="⚠️ Требуется проверка выплаты",
+        plan_number=plan_number,
+        order_id=order_id,
+        amount=amount,
+        network_key=network_key,
+        btc_address=btc_address,
+        reason_text="Статус выплаты BTC пока не удалось подтвердить автоматически.",
+    )
+
+
+def build_requote_notification(
+    *,
+    order_id: str,
+    plan_number: Optional[int],
+    network_key: str,
+    amount: Any,
+    btc_address: str,
+) -> str:
+    return build_order_state_message(
+        status_title="⚠️ Ордер требует подтверждения нового курса",
+        plan_number=plan_number,
+        order_id=order_id,
+        amount=amount,
+        network_key=network_key,
+        btc_address=btc_address,
+        reason_text=(
+            "FixedFloat сообщил,\n"
+            "что первоначальный курс истёк.\n\n"
+            "Для продолжения обмена\n"
+            "требуется подтверждение нового курса."
+        ),
     )
 
 
@@ -674,38 +874,38 @@ def build_offline_startup_notification(items: list[dict]) -> str:
 
     total_missed = sum(item["cycle_count"] for item in grouped.values())
     lines = [
-        "🤖 Статус: Бот был офлайн",
+        "⚠️ Бот был офлайн слишком долго",
         "",
-        f"Пропущено циклов: {total_missed}",
+        f"Пропущено покупок: {total_missed}",
         "",
-        "Пропущенные платежи:",
+        "Что затронуто:",
         "",
     ]
-
-    action_lines = []
-    for item in grouped.values():
+    grouped_items = list(grouped.values())
+    max_items = 5
+    shown_items = grouped_items[:max_items]
+    hidden_count = max(0, len(grouped_items) - max_items)
+    for item in shown_items:
         network_label = get_network_label(item["network_key"]) or item["network_key"]
         reason_text = get_notification_reason(item["reason_code"])
         start_time = min(item["times"])
         end_time = max(item["times"])
         lines.extend([
-            f"• План #{item['plan_number']} — {format_notification_amount(item['amount'])} USDT ({escape_html(network_label)})",
-            f"Пропущено: {item['cycle_count']} раз",
+            f"• План #{item['plan_number']}",
+            f"  Сумма: {format_notification_amount(item['amount'])} USDT",
+            f"  Сеть: {escape_html(network_label)}",
+            f"  Получатель BTC: {escape_html(format_btc_recipient_short(item.get('btc_address')))}",
+            f"  Пропущено: {item['cycle_count']} раз",
             f"Период: {format_scheduled_time(start_time)} → {format_scheduled_time(end_time)}",
             f"Причина: {escape_html(reason_text)}",
             "",
         ])
-        action_lines.append(
-            f"{item['execute_command']} — план #{item['plan_number']} "
-            f"({format_notification_amount(item['amount'])} USDT, {escape_html(network_label)})"
-        )
-
-    lines.extend([
-        "Действие:",
-        "Выполните нужный план вручную:",
-        "",
-        *action_lines,
-    ])
+    if hidden_count:
+        lines.extend([
+            f"… ещё планов: {hidden_count}",
+            "",
+        ])
+    lines.extend(["", build_status_hint()])
     return "\n".join(lines)
 
 
@@ -753,12 +953,13 @@ async def skip_missed_dca_cycle(
     plan_number = await get_plan_display_number(user_id, plan_id)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT from_asset, amount FROM dca_plans WHERE id = ?",
+            "SELECT from_asset, amount, btc_address FROM dca_plans WHERE id = ?",
             (plan_id,)
         ) as cur:
             plan_details = await cur.fetchone()
     network_key = plan_details[0] if plan_details else ""
     amount = plan_details[1] if plan_details else 0
+    btc_address = plan_details[2] if plan_details else ""
     try:
         await bot.send_message(
             user_id,
@@ -766,6 +967,7 @@ async def skip_missed_dca_cycle(
                 plan_number=plan_number,
                 network_key=network_key,
                 amount=amount,
+                btc_address=btc_address,
                 scheduled_time=scheduled_time,
                 execute_command=execute_command,
                 reason_code=reason_code,
@@ -799,7 +1001,7 @@ async def mark_order_expired_before_send(
     now_ts = int(time.time())
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT next_run, interval_hours, from_asset, amount FROM dca_plans WHERE id = ?",
+            "SELECT next_run, interval_hours, from_asset, amount, btc_address FROM dca_plans WHERE id = ?",
             (plan_id,)
         ) as cur:
             plan_row = await cur.fetchone()
@@ -817,6 +1019,7 @@ async def mark_order_expired_before_send(
             base_interval_hours = 24
         network_key = plan_row[2] if plan_row else ""
         amount = plan_row[3] if plan_row else 0
+        btc_address = plan_row[4] if plan_row else ""
         if base_scheduled > now_ts:
             # Manual execution flow should not shift future strategy schedule.
             new_next_run = base_scheduled
@@ -842,14 +1045,84 @@ async def mark_order_expired_before_send(
 
     logger.warning("Ордер истёк до отправки средств: plan_id=%s, order_id=%s", plan_id, order_id)
 
-    execute_command = await get_execute_command_hint(user_id, plan_id)
-    notification = build_order_expired_notification(
-        order_id=order_id,
-        network_key=network_key,
-        amount=amount,
-        execute_command=execute_command,
-    )
+    plan_number = await get_plan_display_number(user_id, plan_id)
+    order_data = await fetch_fixedfloat_order_details(order_id)
+    if is_requote_order_state(order_data):
+        notification = build_requote_notification(
+            order_id=order_id,
+            plan_number=plan_number,
+            network_key=network_key,
+            amount=amount,
+            btc_address=btc_address,
+        )
+    else:
+        notification = build_order_expired_notification(
+            order_id=order_id,
+            plan_number=plan_number,
+            network_key=network_key,
+            amount=amount,
+            btc_address=btc_address,
+            execute_command="",
+        )
     await bot.send_message(user_id, notification)
+
+
+async def notify_and_clear_expired_order(plan_id: int, order_id: str) -> bool:
+    """Send one expiry notification and clear active-order fields."""
+    user_id = None
+    network_key = ""
+    amount = 0
+    should_notify = False
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute(
+            "SELECT user_id, from_asset, amount, btc_address, order_expired_notified "
+            "FROM dca_plans WHERE id = ? AND active_order_id = ?",
+            (plan_id, order_id)
+        ) as cur:
+            row = await cur.fetchone()
+
+        if not row:
+            await db.rollback()
+            return False
+
+        user_id, network_key, amount, btc_address, order_expired_notified = row
+        should_notify = int(order_expired_notified or 0) != 1
+
+        await db.execute(
+            "UPDATE dca_plans SET order_expired_notified = 1, "
+            "active_order_id = NULL, active_order_address = NULL, "
+            "active_order_amount = NULL, active_order_expires = NULL "
+            "WHERE id = ? AND active_order_id = ?",
+            (plan_id, order_id)
+        )
+        await db.commit()
+
+    if should_notify and user_id is not None:
+        plan_number = await get_plan_display_number(int(user_id), plan_id)
+        order_data = await fetch_fixedfloat_order_details(order_id)
+        if is_requote_order_state(order_data):
+            notification = build_requote_notification(
+                order_id=order_id,
+                plan_number=plan_number,
+                network_key=network_key,
+                amount=amount,
+                btc_address=btc_address,
+            )
+        else:
+            notification = build_order_expired_notification(
+                order_id=order_id,
+                plan_number=plan_number,
+                network_key=network_key,
+                amount=amount,
+                btc_address=btc_address,
+                execute_command="",
+            )
+        await bot.send_message(int(user_id), notification, parse_mode="HTML", disable_web_page_preview=True)
+
+    logger.info("Expired order cleared: plan_id=%s, order_id=%s, notified=%s", plan_id, order_id, should_notify)
+    return True
 
 
 async def claim_plan_execution(plan_id: int, user_id: Optional[int] = None) -> bool:
@@ -1003,6 +1276,74 @@ async def fetch_btc_txid(order_id: str) -> str:
         if attempt < 2:
             await asyncio.sleep(0.4)
     return ""
+
+
+async def fetch_fixedfloat_order_details(order_id: str) -> dict:
+    if not order_id:
+        return {}
+    try:
+        data = await ff_request_async("order", {"id": order_id})
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.warning("Failed to fetch FixedFloat order details for %s: %s", order_id, e)
+        return {}
+
+
+def extract_btc_amount_from_order_data(order_data: dict) -> str:
+    to_info = (order_data.get("to", {}) or {})
+    raw_amount = to_info.get("amount")
+    try:
+        return f"{float(raw_amount):.8f} BTC"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def is_requote_order_state(order_data: dict) -> bool:
+    candidates = [
+        str(order_data.get("status", "")).lower(),
+        str(order_data.get("action", "")).lower(),
+        str(order_data.get("type", "")).lower(),
+        str(order_data.get("reason", "")).lower(),
+        str(order_data.get("message", "")).lower(),
+    ]
+    flags = [
+        order_data.get("needConfirm"),
+        order_data.get("need_confirm"),
+        order_data.get("confirm"),
+        order_data.get("recalculate"),
+        order_data.get("requote"),
+    ]
+    if any(bool(flag) for flag in flags):
+        return True
+    joined = " ".join(item for item in candidates if item)
+    keywords = ("requote", "requote_required", "changed", "new_rate", "newprice", "confirm rate")
+    return any(keyword in joined for keyword in keywords)
+
+
+def _fetch_btc_tx_observation_sync(txid: str) -> dict:
+    url = f"https://api.blockchair.com/bitcoin/dashboards/transaction/{txid}"
+    response = requests.get(url, timeout=12)
+    response.raise_for_status()
+    payload = response.json() or {}
+    tx_data = ((payload.get("data") or {}).get(str(txid)) or {})
+    transaction = tx_data.get("transaction", {}) or {}
+    confirmations = transaction.get("confirmations")
+    if confirmations is None:
+        confirmations = 1 if transaction.get("block_id") else 0
+    return {
+        "confirmations": int(confirmations or 0),
+        "found": bool(tx_data),
+    }
+
+
+async def fetch_btc_tx_observation(txid: str) -> dict:
+    if not txid:
+        return {"confirmations": 0, "found": False}
+    try:
+        return await asyncio.to_thread(_fetch_btc_tx_observation_sync, txid)
+    except Exception as e:
+        logger.warning("Failed to fetch BTC tx observation for %s: %s", txid, e)
+        return {"confirmations": 0, "found": False}
 
 
 def track_order_progress_message(order_id: str, user_id: int, message_id: int) -> None:
@@ -1355,7 +1696,7 @@ async def notify_offline_startup_status() -> None:
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute(
-                "SELECT user_id, id, from_asset, amount, next_run, skip_reason, missed_count, last_missed_at "
+                "SELECT user_id, id, from_asset, amount, btc_address, next_run, skip_reason, missed_count, last_missed_at "
                 "FROM dca_plans "
                 "WHERE deleted = 0 AND execution_state = 'skipped' "
                 "AND COALESCE(skip_notified, 0) = 0 ORDER BY user_id, id"
@@ -1368,7 +1709,7 @@ async def notify_offline_startup_status() -> None:
                 active_user_rows = await users_cur.fetchall()
 
             async with db.execute(
-                "SELECT user_id, id, from_asset, amount, interval_hours, next_run, "
+                "SELECT user_id, id, from_asset, amount, btc_address, interval_hours, next_run, "
                 "COALESCE(missed_count, 0), last_execution_attempt_at "
                 "FROM dca_plans WHERE active = 1 AND deleted = 0 ORDER BY user_id, id"
             ) as plans_cur:
@@ -1379,26 +1720,27 @@ async def notify_offline_startup_status() -> None:
         return
 
     skipped_by_user: Dict[int, list[dict]] = {}
-    for user_id, plan_id, network_key, amount, scheduled_time, skip_reason, missed_count, last_missed_at in skipped_rows:
+    for user_id, plan_id, network_key, amount, btc_address, scheduled_time, skip_reason, missed_count, last_missed_at in skipped_rows:
         execute_command = await get_execute_command_hint(user_id, plan_id)
-        scheduled_at = int(scheduled_time or last_missed_at or now_ts)
+        scheduled_at = int(last_missed_at or scheduled_time or now_ts)
         skipped_by_user.setdefault(user_id, []).append({
             "plan_id": plan_id,
             "plan_number": await get_plan_display_number(user_id, plan_id),
             "execute_command": execute_command,
             "network_key": network_key,
             "amount": amount,
+            "btc_address": btc_address,
             "scheduled_time": scheduled_at,
             "reason_code": skip_reason or "window_expired",
-            "missed_count": int(missed_count or 1),
-            "cycle_count": max(1, int(missed_count or 1)),
+            "missed_count": 1,
+            "cycle_count": 1,
         })
 
     offline_by_user: Dict[int, list[dict]] = {}
     offline_updates: list[tuple[int, int, int]] = []
     if offline_detected:
         offline_end = now_ts - DCA_EXECUTION_WINDOW_SECONDS
-        for user_id, plan_id, network_key, amount, interval_hours, next_run, current_missed_count, last_execution_attempt_at in active_plan_rows:
+        for user_id, plan_id, network_key, amount, btc_address, interval_hours, next_run, current_missed_count, last_execution_attempt_at in active_plan_rows:
             try:
                 scheduled_time = int(next_run)
                 interval_seconds = max(1, int(interval_hours) * 3600)
@@ -1418,9 +1760,10 @@ async def notify_offline_startup_status() -> None:
                     "execute_command": execute_command,
                     "network_key": network_key,
                     "amount": amount,
+                    "btc_address": btc_address,
                     "scheduled_time": scheduled_time,
                     "reason_code": "offline",
-                    "missed_count": int(current_missed_count or 0) + offline_count + 1,
+                    "missed_count": 1,
                     "cycle_count": 1,
                 })
                 offline_count += 1
@@ -1480,7 +1823,7 @@ async def notify_offline_startup_status() -> None:
                         tuple(notified_plan_ids)
                     )
                     await db.execute(
-                        f"UPDATE dca_plans SET skip_notified = 1 "
+                        f"UPDATE dca_plans SET skip_notified = 1, missed_count = 0, last_missed_at = NULL "
                         f"WHERE id IN ({placeholders})",
                         tuple(notified_plan_ids)
                     )
@@ -1496,10 +1839,8 @@ async def notify_offline_startup_status() -> None:
             if user_id in notified_users:
                 continue
             message_text = (
-                "🤖 Статус: Бот был офлайн\n\n"
-                "Пропущено циклов: 0\n\n"
-                "Действие:\n"
-                "Ничего делать не нужно."
+                "ℹ️ Бот был офлайн, но покупки не были пропущены.\n\n"
+                f"{build_status_hint()}"
             )
             try:
                 await bot.send_message(user_id, message_text)
@@ -1508,10 +1849,8 @@ async def notify_offline_startup_status() -> None:
     elif offline_detected:
         for (user_id,) in active_user_rows:
             message_text = (
-                "🤖 Статус: Бот был офлайн\n\n"
-                "Пропущено циклов: 0\n\n"
-                "Действие:\n"
-                "Ничего делать не нужно."
+                "ℹ️ Бот был офлайн, но покупки не были пропущены.\n\n"
+                f"{build_status_hint()}"
             )
             try:
                 await bot.send_message(user_id, message_text)
@@ -1801,13 +2140,13 @@ DB_PATH = resolve_project_path(os.getenv("DATABASE_PATH", ""), DEFAULT_DB_PATH)
 
 async def setup_bot_commands() -> None:
     await bot.set_my_commands([
-        BotCommand(command="start", description="старт"),
-        BotCommand(command="setdca", description="создать план"),
-        BotCommand(command="status", description="статус планов"),
-        BotCommand(command="limits", description="лимиты"),
-        BotCommand(command="walletstatus", description="баланс"),
-        BotCommand(command="history", description="история"),
-        BotCommand(command="help", description="помощь"),
+        BotCommand(command="start", description="👋 старт"),
+        BotCommand(command="setdca", description="➕ новый план"),
+        BotCommand(command="status", description="📊 планы"),
+        BotCommand(command="limits", description="🌐 лимиты"),
+        BotCommand(command="walletstatus", description="💼 баланс"),
+        BotCommand(command="history", description="📜 история"),
+        BotCommand(command="help", description="ℹ️ помощь"),
     ])
 
 
@@ -1873,7 +2212,8 @@ async def init_db():
                 skip_reason TEXT,
                 missed_count INTEGER DEFAULT 0,
                 last_missed_at INTEGER,
-                last_execution_attempt_at INTEGER
+                last_execution_attempt_at INTEGER,
+                order_expired_notified INTEGER DEFAULT 0
             )
         ''')
         
@@ -1906,6 +2246,8 @@ async def init_db():
             await db.execute("ALTER TABLE dca_plans ADD COLUMN last_missed_at INTEGER")
         if "last_execution_attempt_at" not in existing_columns:
             await db.execute("ALTER TABLE dca_plans ADD COLUMN last_execution_attempt_at INTEGER")
+        if "order_expired_notified" not in existing_columns:
+            await db.execute("ALTER TABLE dca_plans ADD COLUMN order_expired_notified INTEGER DEFAULT 0")
         
         # Создаём таблицу для хранения информации о кошельках (single wallet per user)
         await db.execute('''
@@ -2058,6 +2400,7 @@ async def dca_scheduler():
                 
                 for plan in plans:
                     plan_id, user_id, from_asset, amount, interval_hours, btc_address, next_run = plan
+                    plan_number = await get_plan_display_number(user_id, plan_id)
                     plan_claimed = False
                     try:
                         scheduled_time_for_cycle = int(next_run) if next_run is not None else now
@@ -2110,6 +2453,9 @@ async def dca_scheduler():
                         if order_check:
                             existing_order_id, existing_order_expires = order_check
                             if existing_order_id:
+                                if existing_order_expires and now > int(existing_order_expires):
+                                    await notify_and_clear_expired_order(plan_id, existing_order_id)
+                                    continue
                                 ff_order_status = await get_fixedfloat_order_status_with_retry(existing_order_id)
                                 if ff_order_status in SUCCESS_FIXEDFLOAT_ORDER_STATUSES:
                                     await mark_order_completed(plan_id, existing_order_id, f"fixedfloat_{ff_order_status}")
@@ -2400,7 +2746,7 @@ async def dca_scheduler():
                         # ВАЖНО: Сохраняем активный ордер в БД для предотвращения дубликатов
                         await db.execute(
                             "UPDATE dca_plans SET active_order_id = ?, active_order_address = ?, "
-                            "active_order_amount = ?, active_order_expires = ?, execution_state = 'scheduled', "
+                            "active_order_amount = ?, active_order_expires = ?, order_expired_notified = 0, execution_state = 'scheduled', "
                             "last_execution_attempt_at = ? WHERE id = ?",
                             (order_id, deposit_address, f"{deposit_amount} {deposit_code}", order_expires, now, plan_id)
                         )
@@ -2434,15 +2780,17 @@ async def dca_scheduler():
                             
                             progress_msg = await bot.send_message(
                                 user_id,
-                                "⏳ Статус: Ордер выполняется\n\n"
-                                f"🔗 Ордер: {format_order_link(order_id)}\n"
-                                f"🌐 Сеть: {escape_html(get_network_label(from_asset) or from_asset)}\n\n"
-                                f"💰 Сумма: {format_notification_amount(required_amount)} USDT\n"
-                                f"⏰ До истечения: {escape_html(format_order_deadline(order_expires))}\n\n"
-                                "Причина:\n"
-                                "Авто-отправка запущена\n\n"
-                                "Действие:\n"
-                                "Ожидайте подтверждения транзакции.",
+                                build_order_state_message(
+                                    status_title="⏳ Ожидается оплата",
+                                    plan_number=plan_number,
+                                    order_id=order_id,
+                                    amount=required_amount,
+                                    network_key=from_asset,
+                                    btc_address=btc_address,
+                                    payment_address=deposit_address,
+                                    deadline_text=format_order_deadline(order_expires),
+                                    reason_text="Авто-отправка запущена.",
+                                ),
                                 parse_mode="HTML",
                                 disable_web_page_preview=True,
                             )
@@ -2494,14 +2842,16 @@ async def dca_scheduler():
                                     
                                     await bot.send_message(
                                         user_id,
-                                        f"⚠️ Статус: Выполнение отложено\n\n"
-                                        f"🔗 Ордер: {format_order_link(order_id)}\n"
-                                        f"🌐 Сеть: {escape_html(get_network_label(from_asset) or from_asset)}\n\n"
-                                        f"💰 Сумма: {format_notification_amount(required_amount)} USDT\n"
-                                        f"⏰ До истечения: {escape_html(format_order_deadline(order_expires))}\n\n"
-                                        f"Причина:\n{escape_html(human_error)}\n\n"
-                                        "Действие:\n"
-                                        f"Повтор запланирован на следующий интервал ({interval_hours}ч).",
+                                        build_order_state_message(
+                                            status_title="⚠️ Требуется проверка выплаты",
+                                            plan_number=plan_number,
+                                            order_id=order_id,
+                                            amount=required_amount,
+                                            network_key=from_asset,
+                                            btc_address=btc_address,
+                                            deadline_text=format_order_deadline(order_expires),
+                                            reason_text=human_error,
+                                        ),
                                         parse_mode="HTML",
                                         disable_web_page_preview=True,
                                     )
@@ -2532,8 +2882,10 @@ async def dca_scheduler():
                                         user_id,
                                         build_auto_send_failed_notification(
                                             order_id=order_id,
+                                            plan_number=plan_number,
                                             network_key=from_asset,
                                             required_amount=required_amount,
+                                            btc_address=btc_address,
                                             deposit_address=deposit_address,
                                             order_expires=order_expires,
                                             error_msg=error_str,
@@ -2559,15 +2911,16 @@ async def dca_scheduler():
                                 await db.commit()
                                 
                                 msg = (
-                                    f"⏳ Статус: USDT отправлен\n\n"
-                                    f"🔗 Ордер: {format_order_link(order_id)}\n"
-                                    f"🌐 Сеть: {escape_html(get_network_label(from_asset) or from_asset)}\n\n"
-                                    f"💰 Сумма: {format_notification_amount(required_amount)} USDT\n\n"
-                                    f"📍 Адрес: {format_code_address(deposit_address)}\n\n"
-                                    "Причина:\n"
-                                    "Авто-отправка выполнена\n\n"
-                                    "Действие:\n"
-                                    "Ожидайте завершения обмена FixedFloat."
+                                    build_order_state_message(
+                                        status_title="✅ Оплата получена",
+                                        plan_number=plan_number,
+                                        order_id=order_id,
+                                        amount=required_amount,
+                                        network_key=from_asset,
+                                        btc_address=btc_address,
+                                        payment_address=deposit_address,
+                                        reason_text="USDT отправлены. Ожидаем перевод BTC.",
+                                    )
                                 )
                                 
                                 if DRY_RUN:
@@ -2598,14 +2951,15 @@ async def dca_scheduler():
                                     await db.commit()
                                     await bot.send_message(
                                         user_id,
-                                        f"⚠️ Статус: TX ожидает подтверждения\n\n"
-                                        f"🔗 Ордер: {format_order_link(order_id)}\n"
-                                        f"🌐 Сеть: {escape_html(get_network_label(from_asset) or from_asset)}\n\n"
-                                        f"💰 Сумма: {format_notification_amount(required_amount)} USDT\n\n"
-                                        "Причина:\n"
-                                        "Транзакция отправлена, подтверждение сети ещё не получено\n\n"
-                                        "Действие:\n"
-                                        "Новый ордер не будет создан, пока статус TX не определится.",
+                                        build_order_state_message(
+                                            status_title="⚠️ Требуется проверка выплаты",
+                                            plan_number=plan_number,
+                                            order_id=order_id,
+                                            amount=required_amount,
+                                            network_key=from_asset,
+                                            btc_address=btc_address,
+                                            reason_text="Транзакция отправлена, но подтверждение сети ещё не получено.",
+                                        ),
                                         parse_mode="HTML",
                                         disable_web_page_preview=True,
                                     )
@@ -2622,14 +2976,15 @@ async def dca_scheduler():
                                         await db.commit()
                                         await bot.send_message(
                                             user_id,
-                                            f"⚠️ Статус: TX ожидает подтверждения\n\n"
-                                            f"🔗 Ордер: {format_order_link(order_id)}\n"
-                                            f"🌐 Сеть: {escape_html(get_network_label(from_asset) or from_asset)}\n\n"
-                                            f"💰 Сумма: {format_notification_amount(required_amount)} USDT\n\n"
-                                            "Причина:\n"
-                                            "Транзакция отправлена, подтверждение сети ещё не получено\n\n"
-                                            "Действие:\n"
-                                            "Новый ордер не будет создан, пока статус TX не определится.",
+                                            build_order_state_message(
+                                                status_title="⚠️ Требуется проверка выплаты",
+                                                plan_number=plan_number,
+                                                order_id=order_id,
+                                                amount=required_amount,
+                                                network_key=from_asset,
+                                                btc_address=btc_address,
+                                                reason_text="Транзакция отправлена, но подтверждение сети ещё не получено.",
+                                            ),
                                             parse_mode="HTML",
                                             disable_web_page_preview=True,
                                         )
@@ -2642,14 +2997,16 @@ async def dca_scheduler():
                                         await db.commit()
                                         await bot.send_message(
                                             user_id,
-                                            f"⚠️ Статус: Выполнение отложено\n\n"
-                                            f"🔗 Ордер: {format_order_link(order_id)}\n"
-                                            f"🌐 Сеть: {escape_html(get_network_label(from_asset) or from_asset)}\n\n"
-                                            f"💰 Сумма: {format_notification_amount(required_amount)} USDT\n"
-                                            f"⏰ До истечения: {escape_html(format_order_deadline(order_expires))}\n\n"
-                                            f"Причина:\n{escape_html(human_error)}\n\n"
-                                            "Действие:\n"
-                                            f"Повтор запланирован на следующий интервал ({interval_hours}ч).",
+                                            build_order_state_message(
+                                                status_title="⚠️ Требуется проверка выплаты",
+                                                plan_number=plan_number,
+                                                order_id=order_id,
+                                                amount=required_amount,
+                                                network_key=from_asset,
+                                                btc_address=btc_address,
+                                                deadline_text=format_order_deadline(order_expires),
+                                                reason_text=human_error,
+                                            ),
                                             parse_mode="HTML",
                                             disable_web_page_preview=True,
                                         )
@@ -2677,8 +3034,10 @@ async def dca_scheduler():
 
                                     error_notification = build_auto_send_failed_notification(
                                         order_id=order_id,
+                                        plan_number=plan_number,
                                         network_key=from_asset,
                                         required_amount=required_amount,
+                                        btc_address=btc_address,
                                         deposit_address=deposit_address,
                                         order_expires=order_expires,
                                         error_msg=error_msg,
@@ -2714,11 +3073,13 @@ async def dca_scheduler():
                                 user_id,
                                 build_order_payment_notification(
                                     order_id=order_id,
+                                    plan_number=plan_number,
                                     network_key=from_asset,
                                     amount=deposit_amount,
+                                    btc_address=btc_address,
                                     deposit_address=deposit_address,
                                     order_expires=order_expires,
-                                    action_text="Оплатите ордер на указанный адрес. Для следующих платежей настройте авто-отправку: /setwallet",
+                                    action_text="Оплатите ордер на указанный адрес.",
                                 ),
                                 parse_mode="HTML",
                                 disable_web_page_preview=True,
@@ -2786,18 +3147,13 @@ async def cmd_start(message: Message):
         "━━━━━━━━━━━━━━━━━━\n"
         "📊 Основные команды\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "/status — активные планы\n"
-        "/execute_<id> — выполнить сейчас\n"
-        "/pause_<id> — остановить\n"
-        "/resume_<id> — продолжить\n"
-        "/delete_<id> — удалить\n\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "ℹ️ Дополнительно\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "/walletstatus — баланс\n"
-        "/history — история\n"
-        "/limits — лимиты сетей\n"
-        "/help — подробная справка\n\n"
+        "🔐 /setwallet — настроить кошелёк\n"
+        "➕ /setdca — создать план\n"
+        "📊 /status — планы и ордера\n"
+        "🌐 /limits — лимиты сетей\n"
+        "💼 /walletstatus — баланс\n"
+        "📜 /history — история\n"
+        "ℹ️ /help — помощь\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "Created by @Cryptobotan",
         parse_mode=None  # Plain text, no markdown
@@ -2811,39 +3167,32 @@ async def cmd_help(message: Message):
     Команда /help - подробная справка по использованию бота.
     """
     await message.answer(
-        "🤖 Я Bitcoin AutoDCA Bot, разработанный для автопокупки BTC по стратегии DCA\n\n"
-        "🔐 Что я могу?\n\n"
-        "Автопокупка BTC за USDT с вашего EVM кошелька\n"
-        "Сети: Arbitrum, Polygon, BSC\n"
-        "Автоотправка BTC на ваш Bitcoin адрес\n"
-        "DCA стратегии: 1 раз в 12 часов / день / неделю / месяц\n\n"
+        "🤖 Я Bitcoin AutoDCA Bot для регулярной покупки BTC по стратегии DCA\n\n"
+        "⚙️ Как это работает?\n\n"
+        "1. 🔐 Настраиваешь EVM-кошелёк через /setwallet\n"
+        "2. ➕ Создаёшь DCA план через /setdca\n"
+        "3. Бот создаёт ордер на ff.io\n"
+        "4. Отправляет USDT и переводит BTC на указанный адрес\n"
+        "5. 📊 Текущий статус всегда доступен в /status\n\n"
         "—\n\n"
-        "⚠️ ВАЖНО:\n\n"
+        "💼 Кошелёк\n\n"
+        "Поддерживаются сети: Arbitrum, Polygon, BSC\n"
+        "Кошелёк используется для отправки USDT на оплату ордеров\n"
+        "BTC поступают на указанный тобой Bitcoin-адрес\n"
+        "Для замены кошелька используй /deletewallet, затем /setwallet\n\n"
+        "—\n\n"
+        "📌 Основные команды\n\n"
+        "📊 /status — планы и ордера\n"
+        "🌐 /limits — лимиты сетей\n"
+        "💼 /walletstatus — баланс\n"
+        "📜 /history — история\n\n"
+        "—\n\n"
+        "🔐 Безопасность\n\n"
         "• После успешного /setwallet не забудь удалить wallet.json\n"
         "• Бот работает локально на вашем компьютере\n"
         "• Все приватные ключи зашифрованы и хранятся у вас\n"
         "• Для работы 24/7 нужен сервер или автозапуск\n"
-        "—\n\n"
-        "⚙️ Как это работает?\n\n"
-        "1. Создаешь DCA план: /setdca\n"
-        "2. Бот создает ордер на ff.io\n"
-        "3. Отправляет USDT с вашего EVM кошелька для покупки BTC\n"
-        "4. BTC приходят на указанный адрес\n\n"
-        "—\n\n"
-        "📊 Команды:\n\n"
-        "/setwallet — настроить кошелёк\n"
-        "/setdca — создать DCA план\n"
-        "/status — статус планов\n"
-        "/execute_<id> — выполнить план\n"
-        "/pause_<id> /resume_<id> /delete_<id> — управление планом\n"
-        "/limits — сети и лимиты\n"
-        "/history — история операций\n"
-        "/walletstatus — баланс EVM-кошелька\n"
-        "—\n\n"
-        "🔄 Замена EVM-кошелька (если нужен другой кошелек):\n\n"
-        "1. Выполни /deletewallet\n"
-        "2. Вручную создай новый wallet.json\n"
-        "3. Выполни /setwallet снова\n\n"
+        "• Проверяй лимиты сетей через /limits и баланс через /walletstatus\n\n"
         "—\n\n"
         "Created by @Cryptobotan\n",
         parse_mode=None
@@ -2880,13 +3229,13 @@ async def cmd_history(message: Message):
 
     lines = ["📜 Последние завершённые операции:\n"]
     for idx, (plan_id, order_id, network_key, amount, btc_tx_hash, created_at, completed_at) in enumerate(rows, start=1):
-        created_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(created_at or 0)))
-        completed_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(completed_at or 0)))
+        created_str = format_datetime_utc(int(created_at or 0))
+        completed_str = format_datetime_utc(int(completed_at or 0))
         normalized_network_key = normalize_network_key(str(network_key or ""))
         network_label = get_network_label(normalized_network_key) or normalized_network_key
         if btc_tx_hash:
             safe_tx_hash = html.escape(str(btc_tx_hash))
-            tx_line = f'TX: <a href="https://blockchair.com/bitcoin/transaction/{safe_tx_hash}">TX ID</a>\n'
+            tx_line = f'🔗 BTC транзакция: <a href="{escape_html(get_blockchair_url(safe_tx_hash))}">{escape_html(format_txid_short(safe_tx_hash))}</a>\n'
         else:
             tx_line = ""
         lines.append(
@@ -2991,7 +3340,8 @@ async def cmd_limits(message: Message):
         limits_text = (
             "🌐 Лимиты и сети (USDT → BTC)\n\n"
             + "\n\n".join(blocks)
-            + "\n\n💡 Данные обновляются в реальном времени"
+            + "\n\n💡 Данные обновляются в реальном времени\n"
+            + build_status_hint()
         )
         await message.answer(limits_text, parse_mode=None)
 
@@ -3093,21 +3443,15 @@ async def cmd_execute(message: Message):
             # Если план один - выполняем его автоматически
             requested_plan_id = int(plans[0][0])
         else:
-            # Показываем список для выбора
-            text = "📋 Выбери план для выполнения:\n\n"
-            for idx, p in enumerate(plans, start=1):
-                interval_text = format_interval(p[3])
-                text += (
-                    f"• /execute_{p[0]} — план #{idx} "
-                    f"({format_amount(float(p[2]))} USDT, {get_network_label(p[1]) or p[1]}), "
-                    f"раз в {interval_text}\n"
-                )
-            await message.answer(text)
+            await message.answer(
+                "📋 Найдено несколько планов.\n\n"
+                "Открой /status и выбери нужный план по его номеру."
+            )
             return
     
     plan_ids = {int(plan[0]) for plan in plans}
     if requested_plan_id not in plan_ids:
-        await message.answer(f"❌ План id={requested_plan_id} не найден\n\nУ тебя {len(plans)} план(ов)")
+        await message.answer(f"❌ План не найден.\n\n{build_status_hint()}")
         return
     
     plan_id = requested_plan_id
@@ -3127,6 +3471,7 @@ async def cmd_execute(message: Message):
         return
     
     from_asset, amount, interval_hours, btc_address, active_order_id, active_order_address, active_order_amount, active_order_expires, plan_next_run = row
+    plan_number = await get_plan_display_number(user_id, plan_id)
     plan_claimed = False
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -3155,8 +3500,7 @@ async def cmd_execute(message: Message):
             active_order_expires = None
         else:
             await message.answer(
-                f"⚠️ Для плана уже есть незавершённая транзакция ({inflight_state}) по ордеру {format_order_link(inflight_order_id)}.\n"
-                "Новый ордер заблокирован до определения статуса.",
+                f"⚠️ Для плана #{plan_number} уже идёт предыдущая покупка.\n\n{build_status_hint()}",
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
@@ -3206,7 +3550,7 @@ async def cmd_execute(message: Message):
                     await db.commit()
                 if claim_cur.rowcount != 1:
                     await message.answer(
-                        f"⚠️ Transfer по ордеру {format_order_link(active_order_id)} уже выполняется другим процессом.",
+                        f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} уже обрабатывается.\n\n{build_status_hint()}",
                         parse_mode="HTML",
                         disable_web_page_preview=True,
                     )
@@ -3238,13 +3582,13 @@ async def cmd_execute(message: Message):
                     await db.commit()
                 if resume_state == "confirmed":
                     await message.answer(
-                        f"✅ Transfer по ордеру {format_order_link(active_order_id)} успешно подтверждён.",
+                        f"✅ Оплата по ордеру {format_order_link(active_order_id)} подтверждена.\n\n{build_status_hint()}",
                         parse_mode="HTML",
                         disable_web_page_preview=True,
                     )
                 elif resume_state == "tx_pending":
                     await message.answer(
-                        f"⚠️ Transfer по ордеру {format_order_link(active_order_id)} отправлен, но ещё не подтверждён.",
+                        f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} ещё проверяется.\n\n{build_status_hint()}",
                         parse_mode="HTML",
                         disable_web_page_preview=True,
                     )
@@ -3252,7 +3596,7 @@ async def cmd_execute(message: Message):
                     return
                 else:
                     await message.answer(
-                        f"❌ Transfer по ордеру {format_order_link(active_order_id)} не выполнен: {escape_html(resume_error)}",
+                        f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} требует проверки.\n\n{build_status_hint()}",
                         parse_mode="HTML",
                         disable_web_page_preview=True,
                     )
@@ -3268,7 +3612,7 @@ async def cmd_execute(message: Message):
                     )
                     await db.commit()
                 await message.answer(
-                    f"⚠️ Для ордера {format_order_link(active_order_id)} нет tx_hash, предыдущая попытка помечена как failed.",
+                    f"⚠️ Для ордера {format_order_link(active_order_id)} требуется ручная проверка выплаты.\n\n{build_status_hint()}",
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
@@ -3282,8 +3626,7 @@ async def cmd_execute(message: Message):
                     )
                     await db.commit()
                 await message.answer(
-                    f"⚠️ Для ордера {format_order_link(active_order_id)} ещё не определён статус транзакции.\n"
-                    "Новый ордер блокирован до подтверждения/фейла текущей TX.",
+                    f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} ещё проверяется.\n\n{build_status_hint()}",
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
@@ -3302,7 +3645,7 @@ async def cmd_execute(message: Message):
                         await db.commit()
                     if claim_cur.rowcount != 1:
                         await message.answer(
-                            f"⚠️ Transfer по ордеру {format_order_link(active_order_id)} уже выполняется другим процессом.",
+                            f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} уже обрабатывается.\n\n{build_status_hint()}",
                             parse_mode="HTML",
                             disable_web_page_preview=True,
                         )
@@ -3334,13 +3677,13 @@ async def cmd_execute(message: Message):
                         await db.commit()
                     if resume_state == "confirmed":
                         await message.answer(
-                            f"✅ Transfer по ордеру {format_order_link(active_order_id)} успешно подтверждён.",
+                            f"✅ Оплата по ордеру {format_order_link(active_order_id)} подтверждена.\n\n{build_status_hint()}",
                             parse_mode="HTML",
                             disable_web_page_preview=True,
                         )
                     elif resume_state == "tx_pending":
                         await message.answer(
-                            f"⚠️ Transfer по ордеру {format_order_link(active_order_id)} отправлен, но ещё не подтверждён.",
+                            f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} ещё проверяется.\n\n{build_status_hint()}",
                             parse_mode="HTML",
                             disable_web_page_preview=True,
                         )
@@ -3348,7 +3691,7 @@ async def cmd_execute(message: Message):
                         return
                     else:
                         await message.answer(
-                            f"❌ Transfer по ордеру {format_order_link(active_order_id)} не выполнен: {escape_html(resume_error)}",
+                            f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} требует проверки.\n\n{build_status_hint()}",
                             parse_mode="HTML",
                             disable_web_page_preview=True,
                         )
@@ -3360,7 +3703,7 @@ async def cmd_execute(message: Message):
                     )
                     await db.commit()
                 await message.answer(
-                    f"✅ Предыдущая TX по ордеру {format_order_link(active_order_id)} подтверждена. Повтори /execute через несколько секунд.",
+                    f"✅ Оплата по ордеру {format_order_link(active_order_id)} подтверждена.\n\n{build_status_hint()}",
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
@@ -3377,11 +3720,13 @@ async def cmd_execute(message: Message):
         await message.answer(
             build_order_payment_notification(
                 order_id=active_order_id,
+                plan_number=plan_number,
                 network_key=from_asset,
                 amount=active_order_amount,
+                btc_address=btc_address,
                 deposit_address=active_order_address,
                 order_expires=active_order_expires,
-                action_text="Дождитесь истечения текущего ордера или завершения обмена.",
+                action_text="Дождитесь завершения текущего ордера.",
             ),
             parse_mode="HTML",
             disable_web_page_preview=True,
@@ -3391,8 +3736,7 @@ async def cmd_execute(message: Message):
         fallback_result = await finalize_expired_unavailable_order(plan_id, active_order_id, active_order_expires, now)
         if fallback_result == "pending":
             await message.answer(
-                f"⚠️ Ордер {format_order_link(active_order_id)} истёк, но transfer TX ещё в pending.\n"
-                "Новый ордер пока заблокирован до определения статуса транзакции.",
+                f"⚠️ По ордеру {format_order_link(active_order_id)} ещё проверяется выплата.\n\n{build_status_hint()}",
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
@@ -3476,7 +3820,7 @@ async def cmd_execute(message: Message):
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "UPDATE dca_plans SET active_order_id = ?, active_order_address = ?, "
-                "active_order_amount = ?, active_order_expires = ?, execution_state = 'scheduled', "
+                "active_order_amount = ?, active_order_expires = ?, order_expired_notified = 0, execution_state = 'scheduled', "
                 "last_execution_attempt_at = ? WHERE id = ?",
                 (order_id, deposit_address, f"{deposit_amount} {deposit_code}", order_expires, int(time.time()), plan_id)
             )
@@ -3510,15 +3854,17 @@ async def cmd_execute(message: Message):
                 await db.commit()
             
             progress_msg = await message.answer(
-                "⏳ Статус: Ордер выполняется\n\n"
-                f"🔗 Ордер: {format_order_link(order_id)}\n"
-                f"🌐 Сеть: {escape_html(get_network_label(from_asset) or from_asset)}\n\n"
-                f"💰 Сумма: {format_notification_amount(required_amount)} USDT\n"
-                f"⏰ До истечения: {escape_html(format_order_deadline(order_expires))}\n\n"
-                "Причина:\n"
-                "Авто-отправка запущена\n\n"
-                "Действие:\n"
-                "Ожидайте подтверждения транзакции.",
+                build_order_state_message(
+                    status_title="⏳ Ожидается оплата",
+                    plan_number=plan_number,
+                    order_id=order_id,
+                    amount=required_amount,
+                    network_key=from_asset,
+                    btc_address=btc_address,
+                    payment_address=deposit_address,
+                    deadline_text=format_order_deadline(order_expires),
+                    reason_text="Авто-отправка запущена.",
+                ),
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
@@ -3566,15 +3912,16 @@ async def cmd_execute(message: Message):
                     await db.commit()
                 
                 msg = (
-                    f"⏳ Статус: USDT отправлен\n\n"
-                    f"🔗 Ордер: {format_order_link(order_id)}\n"
-                    f"🌐 Сеть: {escape_html(get_network_label(from_asset) or from_asset)}\n\n"
-                    f"💰 Сумма: {format_notification_amount(required_amount)} USDT\n\n"
-                    f"📍 Адрес: {format_code_address(deposit_address)}\n\n"
-                    "Причина:\n"
-                    "Авто-отправка выполнена\n\n"
-                    "Действие:\n"
-                    "Ожидайте завершения обмена FixedFloat."
+                    build_order_state_message(
+                        status_title="✅ Оплата получена",
+                        plan_number=plan_number,
+                        order_id=order_id,
+                        amount=required_amount,
+                        network_key=from_asset,
+                        btc_address=btc_address,
+                        payment_address=deposit_address,
+                        reason_text="USDT отправлены. Ожидаем перевод BTC.",
+                    )
                 )
                 
                 if DRY_RUN:
@@ -3615,14 +3962,15 @@ async def cmd_execute(message: Message):
                 if is_pending_tx_error(error_msg):
                     pending_tx_hash = approve_tx if error_msg.startswith("APPROVE_TX_PENDING:") else transfer_tx
                     await message.answer(
-                        f"⚠️ Статус: TX ожидает подтверждения\n\n"
-                        f"🔗 Ордер: {format_order_link(order_id)}\n"
-                        f"🌐 Сеть: {escape_html(get_network_label(from_asset) or from_asset)}\n\n"
-                        f"💰 Сумма: {format_notification_amount(required_amount)} USDT\n\n"
-                        "Причина:\n"
-                        "Транзакция отправлена, подтверждение сети ещё не получено\n\n"
-                        "Действие:\n"
-                        "Новый ордер не будет создан, пока статус TX не определится.",
+                        build_order_state_message(
+                            status_title="⚠️ Требуется проверка выплаты",
+                            plan_number=plan_number,
+                            order_id=order_id,
+                            amount=required_amount,
+                            network_key=from_asset,
+                            btc_address=btc_address,
+                            reason_text="Транзакция отправлена, но подтверждение сети ещё не получено.",
+                        ),
                         parse_mode="HTML",
                         disable_web_page_preview=True,
                     )
@@ -3630,14 +3978,15 @@ async def cmd_execute(message: Message):
                 if is_retryable_network_error(error_msg) and (approve_tx or transfer_tx):
                     pending_tx_hash = transfer_tx or approve_tx
                     await message.answer(
-                        f"⚠️ Статус: TX ожидает подтверждения\n\n"
-                        f"🔗 Ордер: {format_order_link(order_id)}\n"
-                        f"🌐 Сеть: {escape_html(get_network_label(from_asset) or from_asset)}\n\n"
-                        f"💰 Сумма: {format_notification_amount(required_amount)} USDT\n\n"
-                        "Причина:\n"
-                        "Транзакция отправлена, подтверждение сети ещё не получено\n\n"
-                        "Действие:\n"
-                        "Новый ордер не будет создан, пока статус TX не определится.",
+                        build_order_state_message(
+                            status_title="⚠️ Требуется проверка выплаты",
+                            plan_number=plan_number,
+                            order_id=order_id,
+                            amount=required_amount,
+                            network_key=from_asset,
+                            btc_address=btc_address,
+                            reason_text="Транзакция отправлена, но подтверждение сети ещё не получено.",
+                        ),
                         parse_mode="HTML",
                         disable_web_page_preview=True,
                     )
@@ -3658,8 +4007,10 @@ async def cmd_execute(message: Message):
                     await record_plan_skip_metadata(plan_id, "insufficient")
                 error_notification = build_auto_send_failed_notification(
                     order_id=order_id,
+                    plan_number=plan_number,
                     network_key=from_asset,
                     required_amount=required_amount,
+                    btc_address=btc_address,
                     deposit_address=deposit_address,
                     order_expires=order_expires,
                     error_msg=error_msg,
@@ -3685,11 +4036,13 @@ async def cmd_execute(message: Message):
             await message.answer(
                 build_order_payment_notification(
                     order_id=order_id,
+                    plan_number=plan_number,
                     network_key=from_asset,
                     amount=deposit_amount,
+                    btc_address=btc_address,
                     deposit_address=deposit_address,
                     order_expires=order_expires,
-                    action_text="Оплатите ордер на указанный адрес. Для следующих платежей настройте авто-отправку: /setwallet и /setpassword",
+                    action_text="Оплатите ордер на указанный адрес.",
                 ),
                 parse_mode="HTML",
                 disable_web_page_preview=True,
@@ -3738,18 +4091,20 @@ async def cmd_status(message: Message):
     now = int(time.time())
     transfer_hash_by_order = {}
     state_by_order = {}
+    error_by_order = {}
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT plan_id, order_id, transfer_tx_hash, state "
+            "SELECT plan_id, order_id, transfer_tx_hash, state, error_message "
             "FROM sent_transactions WHERE user_id = ? ORDER BY sent_at DESC",
             (user_id,)
         ) as tx_cur:
             tx_rows = await tx_cur.fetchall()
-    for tx_plan_id, tx_order_id, tx_hash, tx_state in tx_rows:
+    for tx_plan_id, tx_order_id, tx_hash, tx_state, tx_error in tx_rows:
         key = (tx_plan_id, tx_order_id)
         if key not in transfer_hash_by_order:
             transfer_hash_by_order[key] = tx_hash
             state_by_order[key] = tx_state
+            error_by_order[key] = tx_error or ""
     
     status_text = f"📊 Твои DCA планы ({len(plans)}):\n\n"
     
@@ -3758,24 +4113,19 @@ async def cmd_status(message: Message):
         plan_id, from_asset, amount, interval_hours, btc_address, next_run, active, \
         order_id, order_address, order_amount, order_expires = plan
         
-        # Вычисляем время до следующего запуска
-        time_left = next_run - now
-        hours_left = max(0, time_left // 3600)
-        minutes_left = max(0, (time_left % 3600) // 60)
-        
         status_emoji = "🟢" if active else "🔴"
-        status_name = "Активен" if active else "Не активен"
+        status_name = "Активен" if active else "На паузе"
         
         btc_display = short_address(btc_address)
         network_label = get_network_label(from_asset) or from_asset
         amount_compact = f"{format_amount(float(amount))} USDT / {interval_hours}ч"
         
         status_text += (
-            f"📌 План {idx}\n"
+            f"📌 План #{idx}\n"
             f"{status_emoji} {escape_html(network_label)} — {status_name}\n"
             f"💰 {amount_compact}\n"
-            f"🎯 BTC: {btc_display}\n"
-            f"⏱ До покупки: {hours_left}ч {minutes_left}м\n"
+            f"🎯 Получатель BTC: {escape_html(btc_display)}\n"
+            f"⏱ Следующая покупка: {escape_html(format_next_buy_time(next_run, now))}\n"
         )
         
         # Проверяем есть ли активный ордер (и не истёк ли он)
@@ -3796,43 +4146,30 @@ async def cmd_status(message: Message):
                 
                 transfer_tx_hash = transfer_hash_by_order.get((plan_id, order_id))
                 order_state = (state_by_order.get((plan_id, order_id)) or "").lower()
-                status_line = (
-                    "USDT отправлены, обмен выполняется"
-                    if transfer_tx_hash
-                    else "❗ Требуется ручная отправка" if order_state in {"failed", "blocked"} else "ожидается отправка USDT"
-                )
+                order_error = error_by_order.get((plan_id, order_id)) or ""
+                if transfer_tx_hash:
+                    status_line = "✅ Оплата получена"
+                elif "insufficient" in order_error.lower():
+                    status_line = "⚠️ Недостаточно средств"
+                elif order_state in {"failed", "blocked"}:
+                    status_line = "⏳ Ожидает оплаты"
+                else:
+                    status_line = "⏳ Ожидает оплаты"
                 formatted_order_amount = format_order_amount(order_amount, network_key=from_asset)
                 amount_line = formatted_order_amount
                 
                 status_text += (
-                    f"\n🔥 Ордер:\n"
-                    f"{status_line}\n"
+                    f"\n🔄 Ордер: {status_line}\n"
                     f"🔗 {format_order_link(order_id)}\n"
                     f"💵 {amount_line}\n"
-                    f"📍 {format_code_address(order_address or '—')}\n"
-                    f"⏳ {order_time_text}\n"
+                    f"📍 Адрес оплаты: {format_code_address(order_address or '—')}\n"
+                    f"⏰ Срок оплаты: {escape_html(format_order_deadline(order_expires, now))}\n"
                 )
             else:
-                # Ордер истёк - очищаем его в фоне
-                async def cleanup_expired_order(plan_id):
-                    async with aiosqlite.connect(DB_PATH) as db:
-                        await db.execute(
-                            "UPDATE dca_plans SET active_order_id = NULL, active_order_address = NULL, "
-                            "active_order_amount = NULL, active_order_expires = NULL WHERE id = ?",
-                            (plan_id,)
-                        )
-                        await db.commit()
-                
-                # Запускаем очистку в фоне (не блокируем ответ)
-                asyncio.create_task(cleanup_expired_order(plan_id))
-        
-        status_text += f"\n⚙️ Управление:\n"
-        status_text += f"▶️ Выполнить: /execute_{plan_id}\n"
-        if active:
-            status_text += f"⏸️ Пауза: /pause_{plan_id}\n"
-        else:
-            status_text += f"▶️ Возобновить: /resume_{plan_id}\n"
-        status_text += f"❌ Удалить: /delete_{plan_id}\n\n"
+                # Очистку и уведомление об истечении выполняет scheduler.
+                pass
+
+        status_text += "\n"
     
     await message.answer(
         status_text,
@@ -3872,7 +4209,7 @@ async def cmd_pause(message: Message):
                 plan_row = await cur.fetchone()
             
             if not plan_row:
-                await message.answer(f"❌ План id={plan_id} не найден")
+                await message.answer(f"❌ План не найден.\n\n{build_status_hint()}")
                 return
             
             # Приостанавливаем по ID
@@ -3895,7 +4232,7 @@ async def cmd_pause(message: Message):
     await message.answer(
         f"{msg}\n\n"
         "Автоматические покупки остановлены.\n"
-        "Для возобновления: /resume"
+        f"{build_status_hint()}"
     )
     if plan_id:
         logger.info(f"DCA план приостановлен: user_id={user_id}, plan_id={plan_id}")
@@ -3934,7 +4271,7 @@ async def cmd_resume(message: Message):
                 plan_row = await cur.fetchone()
             
             if not plan_row:
-                await message.answer(f"❌ План id={plan_id} не найден")
+                await message.answer(f"❌ План не найден.\n\n{build_status_hint()}")
                 return
             
             # Возобновляем по ID
@@ -3957,7 +4294,7 @@ async def cmd_resume(message: Message):
     await message.answer(
         f"{msg}\n\n"
         "Автоматические покупки снова активны.\n"
-        "Проверь статус: /status"
+        f"{build_status_hint()}"
     )
     if plan_id:
         logger.info(f"DCA план возобновлён: user_id={user_id}, plan_id={plan_id}")
@@ -3989,9 +4326,7 @@ async def cmd_delete(message: Message):
     
     if plan_id is None:
         await message.answer(
-            "❌ Укажи id плана для удаления\n\n"
-            "Формат: /delete_<id>\n"
-            "Посмотри команды в /status"
+            f"❌ Не удалось определить план для удаления.\n\n{build_status_hint()}"
         )
         return
     
@@ -4026,11 +4361,10 @@ async def cmd_delete(message: Message):
                     f"🗑 План {from_asset} удалён\n\n"
                     f"⚠️ У этого плана был активный ордер:\n"
                     f"🔗 Ордер: {format_order_link(active_order_id)}\n"
-                    f"⏰ До истечения: {format_order_deadline(active_order_expires, now)}\n\n"
+                    f"⏰ Срок оплаты: {format_order_deadline(active_order_expires, now)}\n\n"
                     f"💡 Ордер остаётся активным на FixedFloat.\n"
-                    f"Завершите обмен или дождитесь истечения.\n\n"
-                    f"❗️ Новый план с теми же параметрами (сеть + сумма + интервал + BTC адрес) можно создать только после истечения ордера.\n\n"
-                    f"Проверь оставшиеся планы: /status",
+                    f"Дождитесь завершения или истечения.\n\n"
+                    f"{build_status_hint()}",
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
@@ -4046,7 +4380,7 @@ async def cmd_delete(message: Message):
     
     await message.answer(
         f"🗑 План {from_asset} удалён\n\n"
-        "Проверь оставшиеся планы: /status"
+        f"{build_status_hint()}"
     )
     logger.info(f"DCA план удалён: user_id={user_id}, plan_id={plan_id}, asset={from_asset}")
 
@@ -4722,8 +5056,7 @@ async def cmd_setdca(message: Message):
             f"⏱ Интервал: раз в {interval_text}\n"
             f"🎯 На адрес: {masked_addr}\n\n"
             f"⏰ Первый запуск через {interval_text}\n\n"
-            f"💡 Проверить статус: /status\n"
-            f"💡 Выполнить сейчас: /execute"
+            f"{build_status_hint()}"
         )
         
         logger.info(f"DCA план {action}: user_id={user_id}, {from_asset}, {amount} USD, {interval}ч")
@@ -4777,11 +5110,11 @@ async def order_monitor():
                 # Получаем все отправленные ордера без history-записи
                 async with db.execute(
                     "SELECT st.order_id, st.user_id, st.plan_id, st.network_key, st.amount, "
-                    "st.transfer_tx_hash, st.sent_at, dp.btc_address, dp.active_order_expires "
+                    "st.transfer_tx_hash, st.sent_at, dp.btc_address, dp.active_order_expires, COALESCE(co.notified, 0) "
                     "FROM sent_transactions st "
                     "JOIN dca_plans dp ON st.plan_id = dp.id "
                     "LEFT JOIN completed_orders co ON st.order_id = co.order_id "
-                    "WHERE (co.order_id IS NULL OR co.notified = 0) AND st.transfer_tx_hash IS NOT NULL "
+                    "WHERE (co.order_id IS NULL OR COALESCE(co.notified, 0) < 2) AND st.transfer_tx_hash IS NOT NULL "
                     "AND st.id = ("
                     "  SELECT st2.id FROM sent_transactions st2 "
                     "  WHERE st2.order_id = st.order_id ORDER BY st2.sent_at DESC LIMIT 1"
@@ -4789,35 +5122,72 @@ async def order_monitor():
                 ) as cursor:
                     orders_to_check = await cursor.fetchall()
             
-            for order_id, user_id, plan_id, network_key, amount, transfer_tx_hash, sent_at, btc_address, active_order_expires in orders_to_check:
+            for order_id, user_id, plan_id, network_key, amount, transfer_tx_hash, sent_at, btc_address, active_order_expires, notified_stage in orders_to_check:
                 try:
+                    plan_number = await get_plan_display_number(int(user_id), int(plan_id))
                     status = await get_fixedfloat_order_status_with_retry(order_id)
                     if status in SUCCESS_FIXEDFLOAT_ORDER_STATUSES:
                         await mark_order_completed(plan_id, order_id, f"fixedfloat_{status}")
                         btc_txid = await fetch_btc_txid(order_id)
                         if btc_txid:
-                            safe_btc_txid = html.escape(str(btc_txid))
-                            completion_text = (
-                                f'✅ Ордер завершён\n\n'
-                                f"🔗 Ордер: {format_order_link(order_id)}\n"
-                                f"💵 Сумма: {format_order_amount(amount, network_key=network_key)}\n"
-                                f"🎯 BTC адрес:\n{format_code_address(btc_address)}\n\n"
-                                f'TX: <a href="https://blockchair.com/bitcoin/transaction/{safe_btc_txid}">TX ID</a>'
-                            )
-                            await update_order_progress_message(int(user_id), str(order_id), completion_text)
-                            async with aiosqlite.connect(DB_PATH) as ndb:
-                                await ndb.execute("UPDATE completed_orders SET notified = 1 WHERE order_id = ?", (order_id,))
-                                await ndb.commit()
-                            _order_progress_messages.pop(str(order_id), None)
+                            tx_observation = await fetch_btc_tx_observation(btc_txid)
+                            confirmations = int(tx_observation.get("confirmations", 0) or 0)
+                            order_data = await fetch_fixedfloat_order_details(order_id)
+                            btc_amount = extract_btc_amount_from_order_data(order_data)
+                            if confirmations >= 1:
+                                completion_text = build_purchase_success_notification(
+                                    order_id=order_id,
+                                    plan_number=plan_number,
+                                    network_key=network_key,
+                                    amount=amount,
+                                    btc_address=btc_address,
+                                    btc_txid=btc_txid,
+                                    btc_amount=btc_amount,
+                                )
+                                await update_order_progress_message(int(user_id), str(order_id), completion_text)
+                                async with aiosqlite.connect(DB_PATH) as ndb:
+                                    await ndb.execute("UPDATE completed_orders SET notified = 2 WHERE order_id = ?", (order_id,))
+                                    await ndb.commit()
+                                _order_progress_messages.pop(str(order_id), None)
+                            elif int(notified_stage or 0) < 1:
+                                sent_text = build_btc_tx_sent_notification(
+                                    order_id=order_id,
+                                    plan_number=plan_number,
+                                    network_key=network_key,
+                                    amount=amount,
+                                    btc_address=btc_address,
+                                    btc_txid=btc_txid,
+                                )
+                                await update_order_progress_message(int(user_id), str(order_id), sent_text)
+                                async with aiosqlite.connect(DB_PATH) as ndb:
+                                    await ndb.execute("UPDATE completed_orders SET notified = 1 WHERE order_id = ?", (order_id,))
+                                    await ndb.commit()
+                            else:
+                                logger.info("BTC tx pending confirmations for order %s", order_id)
                         else:
-                            logger.info("Waiting for BTC TX for order %s", order_id)
-                            waiting_text = (
-                                f'⏳ Ордер выполнен, ожидаем BTC транзакцию...\n\n'
-                                f"🔗 Ордер: {format_order_link(order_id)}\n"
-                                f"💵 Сумма: {format_order_amount(amount, network_key=network_key)}\n"
-                                f"🎯 BTC адрес:\n{format_code_address(btc_address)}"
-                            )
-                            await update_order_progress_message(int(user_id), str(order_id), waiting_text)
+                            order_data = await fetch_fixedfloat_order_details(order_id)
+                            if is_requote_order_state(order_data):
+                                await update_order_progress_message(
+                                    int(user_id),
+                                    str(order_id),
+                                    build_requote_notification(
+                                        order_id=order_id,
+                                        plan_number=plan_number,
+                                        network_key=network_key,
+                                        amount=amount,
+                                        btc_address=btc_address,
+                                    ),
+                                )
+                            else:
+                                logger.info("Waiting for BTC TX for order %s", order_id)
+                                waiting_text = build_payout_review_notification(
+                                    order_id=order_id,
+                                    plan_number=plan_number,
+                                    network_key=network_key,
+                                    amount=amount,
+                                    btc_address=btc_address,
+                                )
+                                await update_order_progress_message(int(user_id), str(order_id), waiting_text)
                         logger.info(f"Order {order_id} marked as completed for user {user_id}")
                     elif status in FINAL_FIXEDFLOAT_ORDER_STATUSES:
                         await mark_order_failed(plan_id, order_id, f"FixedFloat order {status}")

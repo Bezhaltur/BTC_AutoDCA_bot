@@ -73,3 +73,7 @@ temp/
 # Coverage
 .coverage
 htmlcov/
+
+logs/
+botlock_*
+.planning/
