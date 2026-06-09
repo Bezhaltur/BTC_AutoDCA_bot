@@ -180,6 +180,7 @@ except ImportError:
 # This is ONLY a cache - keyring is the single source of truth
 _wallet_passwords = {}
 _order_progress_messages: Dict[str, tuple[int, int]] = {}
+_user_plan_mapping: Dict[int, Dict[int, int]] = {}
 _web3_cache: Dict[str, Any] = {}
 _balances_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
 CACHE_TTL = 20
@@ -585,6 +586,17 @@ def format_btc_recipient_short(address: Any) -> str:
     return short_address(text) if text else "—"
 
 
+def format_btc_recipient_copyable(address: Any) -> str:
+    """Show a short recipient and keep the full address available for copying."""
+    full_address = str(address or "").strip()
+    if not full_address:
+        return "<code>—</code>"
+    return (
+        f"<code>{escape_html(short_address(full_address))}</code> "
+        f"<tg-spoiler><code>{escape_html(full_address)}</code></tg-spoiler>"
+    )
+
+
 def format_txid_short(txid: Any) -> str:
     text = str(txid or "").strip()
     if len(text) <= 16:
@@ -608,9 +620,9 @@ def build_plan_context(
     if plan_number is not None:
         lines.append(f"План: #{int(plan_number)}")
     lines.extend([
-        f"Сумма: {format_notification_amount(amount)} USDT",
-        f"Сеть: {network_label}",
-        f"Получатель BTC: {escape_html(format_btc_recipient_short(btc_address))}",
+        f"💰 Сумма: {format_notification_amount(amount)} USDT",
+        f"🌐 Сеть: {network_label}",
+        f"📥 Получатель BTC: {format_btc_recipient_copyable(btc_address)}",
     ])
     return "\n".join(lines)
 
@@ -683,12 +695,18 @@ def is_order_expired(order_expires: Optional[int], now_ts: Optional[int] = None)
 
 
 async def get_execute_command_hint(user_id: int, plan_id: int) -> str:
-    """Return user-facing execute command for a specific plan."""
-    return f"/execute_{int(plan_id)}"
+    """Return a user-facing execute command without exposing the database ID."""
+    for display_index, mapped_plan_id in _user_plan_mapping.get(int(user_id), {}).items():
+        if int(mapped_plan_id) == int(plan_id):
+            return f"/execute_{int(display_index)}"
+    return "/status"
 
 
-async def get_plan_display_number(user_id: int, plan_id: int) -> int:
-    """Return stable UI number for a plan without using it as command identity."""
+async def get_plan_display_number(user_id: int, plan_id: int) -> Optional[int]:
+    """Return a user-facing plan number without exposing the database ID."""
+    for display_index, mapped_plan_id in _user_plan_mapping.get(int(user_id), {}).items():
+        if int(mapped_plan_id) == int(plan_id):
+            return int(display_index)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT id FROM dca_plans WHERE user_id = ? AND deleted = 0 ORDER BY id",
@@ -698,7 +716,20 @@ async def get_plan_display_number(user_id: int, plan_id: int) -> int:
     for idx, row in enumerate(rows, start=1):
         if row[0] == plan_id:
             return idx
-    return int(plan_id)
+    return None
+
+
+async def resolve_display_plan_id(message: Message, display_index: int) -> Optional[int]:
+    """Resolve a user-facing plan index created by the latest /status call."""
+    user_id = int(message.from_user.id)
+    plan_id = _user_plan_mapping.get(user_id, {}).get(int(display_index))
+    if plan_id is not None:
+        return int(plan_id)
+    await message.answer(
+        "<b>⚠️ Сведения о планах обновились. Пожалуйста, проверьте актуальное состояние через /status</b>",
+        parse_mode="HTML",
+    )
+    return None
 
 
 def build_missed_dca_cycle_notification(
@@ -735,14 +766,18 @@ def build_order_expired_notification(
     execute_command: str,
 ) -> str:
     """Notification text when order expired before send attempt."""
-    return build_order_state_message(
-        status_title=f"❌ Ордер {order_id} истёк",
-        plan_number=plan_number,
-        order_id=order_id,
-        amount=amount,
-        network_key=network_key,
-        btc_address=btc_address,
-        reason_text="Оплата не была получена вовремя.\n\nОрдер отменён и недействителен.",
+    network_label = escape_html(get_network_label(network_key) or network_key or "—")
+    return (
+        "❌ <b>Статус: Время оплаты ордера истекло</b>\n\n"
+        f"🔗 Ордер: {format_order_link(order_id)}\n"
+        f"🌐 Сеть: {network_label}\n"
+        f"📥 Получатель BTC: <code>{escape_html(format_btc_recipient_short(btc_address))}</code>\n"
+        f"💰 Сумма: {format_notification_amount(amount)} USDT\n\n"
+        "<b>Причина:</b>\n"
+        "Ордер не был оплачен в отведенные 10 минут и автоматически аннулирован.\n\n"
+        "<b>⚠️ Действие:</b>\n"
+        "НЕ ОТПРАВЛЯЙТЕ средства на ранее указанный адрес депозита! Ордер больше не действителен.\n\n"
+        f"{build_status_hint()}"
     )
 
 
@@ -1101,24 +1136,14 @@ async def notify_and_clear_expired_order(plan_id: int, order_id: str) -> bool:
 
     if should_notify and user_id is not None:
         plan_number = await get_plan_display_number(int(user_id), plan_id)
-        order_data = await fetch_fixedfloat_order_details(order_id)
-        if is_requote_order_state(order_data):
-            notification = build_requote_notification(
-                order_id=order_id,
-                plan_number=plan_number,
-                network_key=network_key,
-                amount=amount,
-                btc_address=btc_address,
-            )
-        else:
-            notification = build_order_expired_notification(
-                order_id=order_id,
-                plan_number=plan_number,
-                network_key=network_key,
-                amount=amount,
-                btc_address=btc_address,
-                execute_command="",
-            )
+        notification = build_order_expired_notification(
+            order_id=order_id,
+            plan_number=plan_number,
+            network_key=network_key,
+            amount=amount,
+            btc_address=btc_address,
+            execute_command="",
+        )
         await bot.send_message(int(user_id), notification, parse_mode="HTML", disable_web_page_preview=True)
 
     logger.info("Expired order cleared: plan_id=%s, order_id=%s, notified=%s", plan_id, order_id, should_notify)
@@ -3167,35 +3192,31 @@ async def cmd_help(message: Message):
     Команда /help - подробная справка по использованию бота.
     """
     await message.answer(
-        "🤖 Я Bitcoin AutoDCA Bot для регулярной покупки BTC по стратегии DCA\n\n"
-        "⚙️ Как это работает?\n\n"
-        "1. 🔐 Настраиваешь EVM-кошелёк через /setwallet\n"
-        "2. ➕ Создаёшь DCA план через /setdca\n"
-        "3. Бот создаёт ордер на ff.io\n"
-        "4. Отправляет USDT и переводит BTC на указанный адрес\n"
-        "5. 📊 Текущий статус всегда доступен в /status\n\n"
-        "—\n\n"
-        "💼 Кошелёк\n\n"
-        "Поддерживаются сети: Arbitrum, Polygon, BSC\n"
-        "Кошелёк используется для отправки USDT на оплату ордеров\n"
-        "BTC поступают на указанный тобой Bitcoin-адрес\n"
-        "Для замены кошелька используй /deletewallet, затем /setwallet\n\n"
-        "—\n\n"
-        "📌 Основные команды\n\n"
-        "📊 /status — планы и ордера\n"
-        "🌐 /limits — лимиты сетей\n"
-        "💼 /walletstatus — баланс\n"
-        "📜 /history — история\n\n"
-        "—\n\n"
-        "🔐 Безопасность\n\n"
-        "• После успешного /setwallet не забудь удалить wallet.json\n"
-        "• Бот работает локально на вашем компьютере\n"
-        "• Все приватные ключи зашифрованы и хранятся у вас\n"
-        "• Для работы 24/7 нужен сервер или автозапуск\n"
-        "• Проверяй лимиты сетей через /limits и баланс через /walletstatus\n\n"
-        "—\n\n"
-        "Created by @Cryptobotan\n",
-        parse_mode=None
+        "🤖 <b>Я AutoDCA Cryptobotan Bot созданный для автопокупки BTC по стратегии DCA</b>\n\n"
+        "🔐 <b>Что я могу?</b>\n"
+        "Автоматически покупать BTC за USDT с вашего EVM кошелька согласно вашей стратегии\n\n"
+        "Сети: Arbitrum, Polygon, BSC\n"
+        "DCA стратегии: 1 раз в 12 часов / день / неделю / месяц\n\n"
+        "━━━━━━━━━━━━━━\n"
+        "⚙️ <b>Как это работает?</b>\n\n"
+        "1. Создаешь DCA план: /setdca\n"
+        "2. Бот создает ордер на ff.io\n"
+        "3. Отправляет USDT с вашего EVM кошелька для покупки BTC\n"
+        "4. ВТC приходят на указанный адрес\n\n"
+        "━━━━━━━━━━━━━━\n"
+        "📜 <b>Команды:</b>\n\n"
+        "/setwallet — настроить кошелёк\n"
+        "/setdca — создать DCA план\n"
+        "/status — статус планов\n"
+        "/limits — сети и лимиты\n"
+        "/history — история операций\n"
+        "/walletstatus — баланс EVM-кошелька\n\n"
+        "━━━━━━━━━━━━━━\n"
+        "🔄 <b>Замена EVM-кошелька (если нужен другой кошелек):</b>\n\n"
+        "1. Выполни /deletewallet\n"
+        "2. Вручную создай новый wallet.json\n"
+        "3. Выполни /setwallet снова",
+        parse_mode="HTML",
     )
 
 
@@ -3238,9 +3259,18 @@ async def cmd_history(message: Message):
             tx_line = f'🔗 BTC транзакция: <a href="{escape_html(get_blockchair_url(safe_tx_hash))}">{escape_html(format_txid_short(safe_tx_hash))}</a>\n'
         else:
             tx_line = ""
+        display_index = next(
+            (
+                display_idx
+                for display_idx, mapped_plan_id in _user_plan_mapping.get(user_id, {}).items()
+                if mapped_plan_id == plan_id
+            ),
+            None,
+        )
+        plan_line = f"План: {display_index} | " if display_index is not None else ""
         lines.append(
             f"{idx}. 🔗 Ордер: {format_order_link(order_id)}\n"
-            f"План: {plan_id} | Сеть: {network_label}\n"
+            f"{plan_line}Сеть: {network_label}\n"
             f"Сумма: {format_order_amount(amount, network_key=normalized_network_key)}\n"
             f"{tx_line}"
             f"Создан: {created_str}\n"
@@ -3396,28 +3426,25 @@ def is_network_available_on_fixedfloat(network_key: str, available_networks: dic
     return False
 
 
-@dp.message(lambda message: message.text and message.text.startswith("/execute"))
+@dp.message(lambda message: message.text and re.fullmatch(r"/execute(?:_\d+|\s+\d+)?", message.text.strip()))
 async def cmd_execute(message: Message):
     """
-    Команда /execute или /execute_<plan_id> - ручное выполнение обмена по DCA-плану.
-    В UI план отображается как #N, но команда использует стабильный id из БД.
+    Команда /execute или /execute_<index> - ручное выполнение обмена по DCA-плану.
     """
     user_id = message.from_user.id
     
-    # Пытаемся извлечь стабильный id плана из команды
+    # Экранный индекс разрешается через mapping последнего /status.
     text = message.text.strip()
-    requested_plan_id = None
+    requested_index = None
     
-    # Пробуем формат /execute_123
     if "_" in text:
         try:
-            requested_plan_id = int(text.split("_", 1)[1])
+            requested_index = int(text.split("_", 1)[1])
         except:
             pass
-    # Пробуем формат /execute 123
     elif " " in text:
         try:
-            requested_plan_id = int(text.split()[1])
+            requested_index = int(text.split()[1])
         except:
             pass
     
@@ -3437,24 +3464,20 @@ async def cmd_execute(message: Message):
         )
         return
     
-    # Если id не указан - показываем список
-    if requested_plan_id is None:
+    if requested_index is None:
         if len(plans) == 1:
-            # Если план один - выполняем его автоматически
-            requested_plan_id = int(plans[0][0])
+            plan_id = int(plans[0][0])
         else:
             await message.answer(
                 "📋 Найдено несколько планов.\n\n"
                 "Открой /status и выбери нужный план по его номеру."
             )
             return
-    
-    plan_ids = {int(plan[0]) for plan in plans}
-    if requested_plan_id not in plan_ids:
-        await message.answer(f"❌ План не найден.\n\n{build_status_hint()}")
-        return
-    
-    plan_id = requested_plan_id
+    else:
+        mapped_plan_id = await resolve_display_plan_id(message, requested_index)
+        if mapped_plan_id is None:
+            return
+        plan_id = mapped_plan_id
     
     # Получаем конкретный план по ID (только не удаленные)
     async with aiosqlite.connect(DB_PATH) as db:
@@ -3473,6 +3496,28 @@ async def cmd_execute(message: Message):
     from_asset, amount, interval_hours, btc_address, active_order_id, active_order_address, active_order_amount, active_order_expires, plan_next_run = row
     plan_number = await get_plan_display_number(user_id, plan_id)
     plan_claimed = False
+
+    now = int(time.time())
+    if active_order_id and (not active_order_expires or int(active_order_expires) > now):
+        existing_text = (
+            f"⚠️ <b>Ордер {format_order_link(active_order_id)} уже создан и ожидает обработки.</b>\n\n"
+            f"{build_status_hint()}"
+        )
+        progress_meta = _order_progress_messages.get(str(active_order_id))
+        if progress_meta and progress_meta[0] == int(user_id):
+            try:
+                await bot.edit_message_text(
+                    chat_id=int(user_id),
+                    message_id=progress_meta[1],
+                    text=existing_text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+                return
+            except Exception as e:
+                logger.warning("Failed to refresh existing order message %s: %s", active_order_id, e)
+        await message.answer(existing_text, parse_mode="HTML", disable_web_page_preview=True)
+        return
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -4080,6 +4125,7 @@ async def cmd_status(message: Message):
             plans = await cursor.fetchall()
     
     if not plans:
+        _user_plan_mapping[user_id] = {}
         await message.answer(
             "📋 У тебя нет DCA планов\n\n"
             "Создай план командой:\n"
@@ -4107,11 +4153,13 @@ async def cmd_status(message: Message):
             error_by_order[key] = tx_error or ""
     
     status_text = f"📊 Твои DCA планы ({len(plans)}):\n\n"
+    _user_plan_mapping[user_id] = {}
     
-    # Используем порядковый номер вместо ID из базы для понятной нумерации
-    for idx, plan in enumerate(plans, start=1):
+    # Экранные индексы существуют только в mapping последнего /status.
+    for index, plan in enumerate(plans, start=1):
         plan_id, from_asset, amount, interval_hours, btc_address, next_run, active, \
         order_id, order_address, order_amount, order_expires = plan
+        _user_plan_mapping[user_id][index] = int(plan_id)
         
         status_emoji = "🟢" if active else "🔴"
         status_name = "Активен" if active else "На паузе"
@@ -4121,7 +4169,7 @@ async def cmd_status(message: Message):
         amount_compact = f"{format_amount(float(amount))} USDT / {interval_hours}ч"
         
         status_text += (
-            f"📌 План #{idx}\n"
+            f"📌 План {index}\n"
             f"{status_emoji} {escape_html(network_label)} — {status_name}\n"
             f"💰 {amount_compact}\n"
             f"🎯 Получатель BTC: {escape_html(btc_display)}\n"
@@ -4169,7 +4217,10 @@ async def cmd_status(message: Message):
                 # Очистку и уведомление об истечении выполняет scheduler.
                 pass
 
-        status_text += "\n"
+        plan_toggle_command = f"/pause_{index}" if active else f"/resume_{index}"
+        status_text += (
+            f"\n⚙️ /execute_{index} · {plan_toggle_command} · /delete_{index}\n\n"
+        )
     
     await message.answer(
         status_text,
@@ -4178,27 +4229,31 @@ async def cmd_status(message: Message):
     )
 
 
-@dp.message(lambda message: message.text and message.text.startswith("/pause"))
+@dp.message(lambda message: message.text and re.fullmatch(r"/pause(?:_\d+|\s+\d+)?", message.text.strip()))
 async def cmd_pause(message: Message):
     """
-    Команда /pause или /pause_<plan_id> - приостановить автоматическое выполнение DCA плана.
+    Команда /pause или /pause_<index> - приостановить автоматическое выполнение DCA плана.
     """
     user_id = message.from_user.id
     
-    # Пытаемся извлечь стабильный id плана из команды
     text = message.text.strip()
     plan_id = None
+    display_index = None
     
     if "_" in text:
         try:
-            plan_id = int(text.split("_", 1)[1])
+            display_index = int(text.split("_", 1)[1])
         except:
             pass
     elif " " in text:
         try:
-            plan_id = int(text.split()[1])
+            display_index = int(text.split()[1])
         except:
             pass
+    if display_index is not None:
+        plan_id = await resolve_display_plan_id(message, display_index)
+        if plan_id is None:
+            return
     
     async with aiosqlite.connect(DB_PATH) as db:
         if plan_id:
@@ -4228,6 +4283,7 @@ async def cmd_pause(message: Message):
             msg = "⏸ Все DCA планы приостановлены"
         
         await db.commit()
+    _user_plan_mapping.pop(user_id, None)
     
     await message.answer(
         f"{msg}\n\n"
@@ -4240,27 +4296,31 @@ async def cmd_pause(message: Message):
         logger.info(f"Все DCA планы приостановлены: user_id={user_id}")
 
 
-@dp.message(lambda message: message.text and message.text.startswith("/resume"))
+@dp.message(lambda message: message.text and re.fullmatch(r"/resume(?:_\d+|\s+\d+)?", message.text.strip()))
 async def cmd_resume(message: Message):
     """
-    Команда /resume или /resume_<plan_id> - возобновить автоматическое выполнение DCA плана.
+    Команда /resume или /resume_<index> - возобновить автоматическое выполнение DCA плана.
     """
     user_id = message.from_user.id
     
-    # Пытаемся извлечь стабильный id плана из команды
     text = message.text.strip()
     plan_id = None
+    display_index = None
     
     if "_" in text:
         try:
-            plan_id = int(text.split("_", 1)[1])
+            display_index = int(text.split("_", 1)[1])
         except:
             pass
     elif " " in text:
         try:
-            plan_id = int(text.split()[1])
+            display_index = int(text.split()[1])
         except:
             pass
+    if display_index is not None:
+        plan_id = await resolve_display_plan_id(message, display_index)
+        if plan_id is None:
+            return
     
     async with aiosqlite.connect(DB_PATH) as db:
         if plan_id:
@@ -4290,6 +4350,7 @@ async def cmd_resume(message: Message):
             msg = "▶️ Все DCA планы возобновлены"
         
         await db.commit()
+    _user_plan_mapping.pop(user_id, None)
     
     await message.answer(
         f"{msg}\n\n"
@@ -4305,24 +4366,28 @@ async def cmd_resume(message: Message):
 @dp.message(lambda message: message.text and re.fullmatch(r"/delete(?:_\d+|\s+\d+)?", message.text.strip()))
 async def cmd_delete(message: Message):
     """
-    Команда /delete_<plan_id> - удалить DCA план полностью.
+    Команда /delete_<index> - удалить DCA план полностью.
     """
     user_id = message.from_user.id
     
-    # Извлекаем стабильный id плана из команды
     text = message.text.strip()
     plan_id = None
+    display_index = None
     
     if "_" in text:
         try:
-            plan_id = int(text.split("_", 1)[1])
+            display_index = int(text.split("_", 1)[1])
         except:
             pass
     elif " " in text:
         try:
-            plan_id = int(text.split()[1])
+            display_index = int(text.split()[1])
         except:
             pass
+    if display_index is not None:
+        plan_id = await resolve_display_plan_id(message, display_index)
+        if plan_id is None:
+            return
     
     if plan_id is None:
         await message.answer(
@@ -4356,6 +4421,7 @@ async def cmd_delete(message: Message):
                     (plan_id, user_id)
                 )
                 await db.commit()
+                _user_plan_mapping.pop(user_id, None)
                 
                 await message.answer(
                     f"🗑 План {from_asset} удалён\n\n"
@@ -4377,6 +4443,7 @@ async def cmd_delete(message: Message):
             (plan_id, user_id)
         )
         await db.commit()
+    _user_plan_mapping.pop(user_id, None)
     
     await message.answer(
         f"🗑 План {from_asset} удалён\n\n"
@@ -4504,6 +4571,7 @@ async def cmd_setwallet(message: Message):
 async def fetch_network_status(network_key: str, wallet_address: str):
     from web3 import Web3
 
+    network_key = normalize_network_key(network_key)
     config = get_network_config(network_key)
     gas_token = config["native_token"]
     rpc_timeout = 10
@@ -4708,63 +4776,103 @@ async def cmd_walletstatus(message: Message):
 
     wallet_address = wallet_row[0]
     if not Web3.is_address(wallet_address):
-        await message.answer("❌ Invalid wallet address")
+        await message.answer("<b>❌ Invalid wallet address</b>", parse_mode="HTML")
         return
 
-    status_text = f"💼 Wallet Status:\n\n"
-    status_text += f"📍 Address:\n{format_code_address(wallet_address)}\n\n"
-    status_text += f"Balances on all networks:\n\n"
-
-    from networks import NETWORKS
+    network_order = ["USDT-ARB", "USDT-BSC", "USDT-POLYGON"]
     semaphore = asyncio.Semaphore(3)
 
     async def _fetch_with_limit(network_key: str):
         async with semaphore:
-            return await fetch_network_status(network_key, wallet_address)
+            try:
+                return await fetch_network_status(network_key, wallet_address)
+            except Exception as e:
+                logger.error("walletstatus failed for %s: %s", network_key, e)
+                fallback = {
+                    "USDT-ARB": ("Arbitrum", "ETH"),
+                    "USDT-BSC": ("BSC", "BNB"),
+                    "USDT-POLYGON": ("Polygon", "MATIC"),
+                }
+                name, gas_token = fallback[network_key]
+                return {
+                    "name": name,
+                    "gas_token": gas_token,
+                    "rpc_error": True,
+                    "balance_error": False,
+                    "usdt_balance": None,
+                    "native_balance": None,
+                }
 
-    results = await asyncio.gather(
-        *[_fetch_with_limit(nk) for nk in NETWORKS.keys()],
+    async def _fetch_minimum(network_key: str) -> Optional[float]:
+        try:
+            return float((await get_fixedfloat_limits(network_key))["min"])
+        except Exception as e:
+            logger.warning("walletstatus FixedFloat minimum unavailable for %s: %s", network_key, e)
+            return None
+
+    results, minimums = await asyncio.gather(
+        asyncio.gather(*[_fetch_with_limit(network_key) for network_key in network_order]),
+        asyncio.gather(*[_fetch_minimum(network_key) for network_key in network_order]),
         return_exceptions=False
     )
 
-    for result in results:
-        name = result["name"]
-        gas_token = result["gas_token"]
-        usdt_text = result["usdt_text"]
-        native_text = result["native_text"]
+    blocks = []
+    for network_key, result, ff_minimum in zip(network_order, results, minimums):
+        name = escape_html(result["name"])
+        gas_token = escape_html(result["gas_token"])
         rpc_error = result["rpc_error"]
         balance_error = result["balance_error"]
 
         if rpc_error:
-            status_text += (
-                f"━━━━━━━━━━━━━━\n"
-                f"🌐 {name}\n"
+            blocks.append(
+                f"🌐 <b>{name}</b>\n"
                 f"💵 USDT: —\n"
                 f"⛽ {gas_token}: —\n"
-                f"❌ RPC недоступен\n\n"
+                "<b>❌ RPC недоступен</b>"
             )
             continue
 
         if balance_error:
-            status_text += (
-                f"━━━━━━━━━━━━━━\n"
-                f"🌐 {name}\n"
+            blocks.append(
+                f"🌐 <b>{name}</b>\n"
                 f"💵 USDT: —\n"
                 f"⛽ {gas_token}: —\n"
-                f"⚠️ Ошибка получения баланса\n\n"
+                "<b>⚠️ Ошибка получения баланса</b>"
             )
             continue
 
-        status_text += (
-            f"━━━━━━━━━━━━━━\n"
-            f"🌐 {name}\n"
-            f"💵 USDT: {usdt_text}\n"
-            f"⛽ {gas_token}: {native_text}\n"
+        usdt_balance = result.get("usdt_balance")
+        native_balance = result.get("native_balance")
+        usdt_text = format_balance(float(usdt_balance)) if usdt_balance is not None else "—"
+        native_text = format_native_balance(float(native_balance)) if native_balance is not None else "—"
+        usdt_warning = (
+            " <b>⚠️ Недостаточно средств</b>"
+            if usdt_balance is not None and ff_minimum is not None and float(usdt_balance) < ff_minimum
+            else ""
+        )
+        gas_warning = ""
+        if native_balance is not None and float(native_balance) == 0:
+            gas_warning = (
+                " <b>⚠️ Недостаточно газа</b>"
+                if network_key == "USDT-POLYGON"
+                else " <b>⚠️ Нет газа</b>"
+            )
+        blocks.append(
+            f"🌐 <b>{name}</b>\n"
+            f"💵 USDT: {usdt_text}{usdt_warning}\n"
+            f"⛽ {gas_token}: {native_text}{gas_warning}"
         )
 
-        status_text += "\n"
+    status_text = (
+        "💼 <b>Wallet Status:</b>\n\n"
+        "📍 <b>Address:</b>\n"
+        f"{format_code_address(wallet_address)}\n"
+        "━━━━━━━━━━━━━━\n"
+        "<b>Баланс:</b>\n\n"
+        + "\n\n━━━━━━━━━━━━━━\n".join(blocks)
+    )
     
-    await message.answer(status_text)
+    await message.answer(status_text, parse_mode="HTML")
 
 
 
@@ -5089,11 +5197,14 @@ async def order_monitor():
             async with aiosqlite.connect(DB_PATH) as db:
                 async with db.execute(
                     "SELECT id, active_order_id, active_order_expires FROM dca_plans "
-                    "WHERE active_order_id IS NOT NULL AND deleted = 0"
+                    "WHERE active_order_id IS NOT NULL"
                 ) as active_cur:
                     active_orders = await active_cur.fetchall()
 
             for plan_id, order_id, active_order_expires in active_orders:
+                if active_order_expires and int(active_order_expires) <= now:
+                    await notify_and_clear_expired_order(plan_id, order_id)
+                    continue
                 status = await get_fixedfloat_order_status_with_retry(order_id)
                 if status in SUCCESS_FIXEDFLOAT_ORDER_STATUSES:
                     await mark_order_completed(plan_id, order_id, f"fixedfloat_{status}")
