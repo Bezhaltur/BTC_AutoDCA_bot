@@ -14,7 +14,6 @@ import time
 import re
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Optional
-from urllib.parse import quote
 
 MIN_PYTHON_VERSION = (3, 9)
 if sys.version_info < MIN_PYTHON_VERSION:
@@ -59,14 +58,11 @@ from wallet import (
     save_password_to_keyring, load_password_from_keyring,
     delete_password_from_keyring, keystore_exists, KEYSTORE_DIR
 )
-from auto_send import auto_send_usdt, GAS_PRICE_MULTIPLIER, MIN_NATIVE_MULTIPLIER
+from auto_send import auto_send_usdt
 from erc20 import (
     get_web3_instance,
     get_usdt_balance,
     get_native_balance,
-    estimate_gas_for_approve,
-    estimate_gas_for_transfer,
-    build_gas_params,
 )
 
 try:
@@ -191,7 +187,9 @@ _order_progress_messages: Dict[str, tuple[int, int]] = {}
 _user_plan_mapping: Dict[int, Dict[int, int]] = {}
 _web3_cache: Dict[str, Any] = {}
 _balances_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
+_fixedfloat_limits_cache: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 20
+LIMITS_CACHE_TTL = 300
 
 # Runtime-копия, может обновляться по данным API на старте
 NETWORK_CODES = {
@@ -221,6 +219,11 @@ RETRYABLE_ERROR_KEYWORDS = (
 )
 FINAL_FIXEDFLOAT_ORDER_STATUSES = {"expired", "cancelled", "failed"}
 SUCCESS_FIXEDFLOAT_ORDER_STATUSES = {"finished", "completed", "done"}
+WALLETSTATUS_MIN_NATIVE_GAS = {
+    "USDT-ARB": 0.0001,
+    "USDT-BSC": 0.0005,
+    "USDT-POLYGON": 0.05,
+}
 
 try:
     DCA_EXECUTION_WINDOW_SECONDS = int(os.getenv("DCA_EXECUTION_WINDOW_SECONDS", "300"))
@@ -273,15 +276,6 @@ def format_native_balance(value: float) -> str:
     if value is None:
         return "—"
     return f"{float(value):.6f}"
-
-
-def short_address(addr: str) -> str:
-    if not addr:
-        return addr
-    value = str(addr)
-    if len(value) < 10:
-        return escape_html(value)
-    return f"{escape_html(value[:6])}...{escape_html(value[-4:])}"
 
 
 def format_amount(x: float) -> str:
@@ -472,7 +466,7 @@ def get_fixedfloat_symbol(user_symbol: str) -> str:
 def validate_btc_address(address: str) -> bool:
     """
     Валидация Bitcoin адреса (Legacy, SegWit, Native SegWit).
-    Поддерживает форматы: 1..., 3..., bc1...
+    Поддерживает Legacy, SegWit и Native SegWit.
     """
     if not address:
         return False
@@ -590,19 +584,12 @@ def format_scheduled_time(ts: int) -> str:
     return format_datetime_utc(ts)
 
 
-def format_btc_recipient_short(address: Any) -> str:
-    text = str(address or "").strip()
-    return short_address(text) if text else "—"
-
-
 def format_btc_recipient_copyable(address: Any) -> str:
-    """Show a short recipient and keep the full address available for copying."""
+    """Show the full BTC recipient on a copy-friendly line."""
     full_address = str(address or "").strip()
     if not full_address:
         return "<code>—</code>"
-    short_text = short_address(full_address)
-    share_url = f"https://t.me/share/url?url={quote(full_address, safe='')}"
-    return f'<a href="{escape_html(share_url)}">{short_text}</a>'
+    return format_code_address(full_address)
 
 
 def format_txid_short(txid: Any) -> str:
@@ -634,7 +621,7 @@ def build_plan_context(
     lines.extend([
         f"💰 Сумма: {format_notification_amount(amount)} USDT",
         f"🌐 Сеть: {network_label}",
-        f"📥 Получатель BTC: {format_btc_recipient_copyable(btc_address)}",
+        f"📥 Получатель BTC:\n{format_btc_recipient_copyable(btc_address)}",
     ])
     return "\n".join(lines)
 
@@ -786,7 +773,7 @@ def build_order_expired_notification(
         "❌ <b>Время для оплаты истекло</b>\n\n"
         f"🔗 Ордер: {format_order_link(order_id)}\n"
         f"🌐 Сеть: {network_label}\n"
-        f"📥 Получатель BTC: {format_btc_recipient_copyable(btc_address)}\n"
+        f"📥 Получатель BTC:\n{format_btc_recipient_copyable(btc_address)}\n"
         f"💰 Сумма: {format_notification_amount(amount)} USDT\n\n"
         "Оплата не поступила. Ордер автоматически отменён.\n\n"
         "⚠️ <b>НЕ ОТПРАВЛЯЙТЕ средства на ранее выданный адрес оплаты!</b>\n\n"
@@ -942,7 +929,7 @@ def build_offline_startup_notification(items: list[dict]) -> str:
             f"• План #{item['plan_number']}",
             f"  Сумма: {format_notification_amount(item['amount'])} USDT",
             f"  Сеть: {escape_html(network_label)}",
-            f"  Получатель BTC: {format_btc_recipient_copyable(item.get('btc_address'))}",
+            f"  Получатель BTC:\n  {format_btc_recipient_copyable(item.get('btc_address'))}",
             f"  Пропущено: {item['cycle_count']} раз",
             f"Период: {format_scheduled_time(start_time)} → {format_scheduled_time(end_time)}",
             f"Причина: {escape_html(reason_text)}",
@@ -2055,6 +2042,10 @@ async def get_fixedfloat_limits(network_key: str) -> dict:
     from_ccy = get_fixedfloat_symbol(network_key)
     if not from_ccy:
         raise ValueError(f"Неизвестная сеть: {network_key}")
+    cached = _fixedfloat_limits_cache.get(network_key)
+    now_ts = time.time()
+    if cached and now_ts - float(cached.get("ts", 0)) < LIMITS_CACHE_TTL:
+        return dict(cached["data"])
     
     try:
         # Используем price API для получения лимитов
@@ -2081,11 +2072,13 @@ async def get_fixedfloat_limits(network_key: str) -> dict:
         except (TypeError, ValueError):
             rate = None
         
-        return {
+        result = {
             "min": float(min_amt),
             "max": float(max_amt),
             "rate": rate,
         }
+        _fixedfloat_limits_cache[network_key] = {"ts": now_ts, "data": result}
+        return dict(result)
     except RuntimeError as e:
         # Пробрасываем ошибки API дальше
         raise
@@ -3183,20 +3176,38 @@ async def cmd_start(message: Message):
     Первая команда, которую видит новый пользователь.
     """
     await message.answer(
-        "👋 <b>AutoDCA Bot</b>\n\n"
-        "Бот для регулярной покупки BTC за USDT по DCA-стратегии.\n\n"
-        "<b>🚀 Быстрый старт</b>\n\n"
-        "1. /setwallet — настроить EVM-кошелёк\n"
-        "2. /setdca — создать DCA-план\n"
-        "3. /status — проверить планы и активные ордера\n\n"
-        "<b>📊 Основные команды</b>\n\n"
-        "🔐 /setwallet — настроить кошелёк\n"
-        "➕ /setdca — создать план\n"
+        "👋 <b>Добро пожаловать в AutoDCA Cryptobotan Bot</b>\n\n"
+        "Я создан для автоматической покупки BTC по стратегии DCA через FixedFloat.\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
+        "<b>🚀 Быстрый старт</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        "1️⃣ <b>Настрой кошелёк</b>\n\n"
+
+        "Создай файл wallet.json со своим приватным ключом и выполни:\n\n"
+        "/setwallet\n\n"
+
+        "Приватный ключ будет зашифрован и сохранён в безопасном виде на твоем устройстве.\n\n"
+
+        "После успешной настройки файл wallet.json рекомендуется удалить.\n\n"
+
+        "2️⃣ <b>Создай DCA план</b>\n\n"
+        "/setdca\n\n"
+
+        "После этого бот будет выполнять покупки автоматически по заданному расписанию.\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
+        "<b>📌 Полезные команды</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
         "📊 /status — планы и ордера\n"
-        "🌐 /limits — лимиты сетей\n"
+        "🌐 /limits — сети и лимиты\n"
         "💼 /walletstatus — баланс\n"
-        "📜 /history — история\n"
-        "ℹ️ /help — помощь\n\n"
+        "📜 /history — история покупок\n"
+        "ℹ️ /help — подробная справка\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
         "<b>Created by @Cryptobotan</b>",
         parse_mode="HTML",
     )
@@ -3209,31 +3220,62 @@ async def cmd_help(message: Message):
     Команда /help - подробная справка по использованию бота.
     """
     await message.answer(
-        "🤖 <b>AutoDCA Bot</b>\n\n"
-        "<b>Что делает бот</b>\n"
-        "Покупает BTC за USDT через FixedFloat по расписанию DCA.\n\n"
-        "<b>Поддерживаемые сети</b>\n"
-        "Arbitrum, Polygon, BSC\n\n"
-        "<b>Интервалы</b>\n"
-        "12 часов, день, неделя, месяц\n\n"
-        "<b>Как это работает</b>\n"
-        "1. Создаёте DCA-план: /setdca\n"
-        "2. Бот создаёт ордер FixedFloat\n"
-        "3. USDT отправляются с EVM-кошелька\n"
-        "4. BTC поступают на указанный BTC-адрес\n\n"
-        "<b>Команды</b>\n\n"
-        "/setwallet — настроить кошелёк\n"
-        "/setdca — создать DCA план\n"
-        "/status — статус планов\n"
-        "/limits — сети и лимиты\n"
-        "/history — история операций\n"
-        "/walletstatus — баланс EVM-кошелька\n\n"
-        "🔄 <b>Замена кошелька</b>\n\n"
-        "1. /deletewallet\n"
-        "2. Создать новый wallet.json\n"
-        "3. /setwallet",
-        parse_mode="HTML",
-    )
+    "ℹ️ <b>Справка AutoDCA Cryptobotan Bot</b>\n\n"
+
+    "Автоматическая покупка BTC по стратегии DCA через FixedFloat.\n\n"
+
+    "━━━━━━━━━━━━━━━━━━\n"
+    "<b>⚙️ Как работает бот</b>\n"
+    "━━━━━━━━━━━━━━━━━━\n\n"
+
+    "1. Создаётся DCA план через /setdca\n"
+    "2. По расписанию бот создаёт ордер на FixedFloat\n"
+    "3. Бот автоматически отправляет USDT с EVM-кошелька на адрес депозита FixedFloat\n"
+    "4. После получения USDT FixedFloat отправляет BTC на указанный адрес\n\n"
+
+    "<b>Поддерживаемые сети:</b>\n\n"
+    "• Arbitrum\n"
+    "• Polygon\n"
+    "• BSC\n\n"
+
+    "<b>Интервалы покупок:</b>\n\n"
+    "• Каждые 12 часов\n"
+    "• Каждый день\n"
+    "• Каждую неделю\n"
+    "• Каждый месяц\n\n"
+
+    "━━━━━━━━━━━━━━━━━━\n"
+    "<b>📜 Команды</b>\n"
+    "━━━━━━━━━━━━━━━━━━\n\n"
+
+    "🔐 /setwallet - Добавить EVM-кошелёк\n"
+    "➕ /setdca - Создать DCA план\n"
+    "📊 /status - Планы и активные ордера\n"
+    "🌐 /limits - Поддерживаемые сети и лимиты\n"
+    "💼 /walletstatus - Баланс EVM-кошелька\n"
+    "📜 /history - История покупок\n"
+    "❌ /deletewallet - Удалить текущий кошелёк\n\n"
+
+    "━━━━━━━━━━━━━━━━━━\n"
+    "<b>🔒 Безопасность</b>\n"
+    "━━━━━━━━━━━━━━━━━━\n\n"
+
+    "Во время настройки через /setwallet приватный ключ шифруется и сохраняется на устройстве.\n\n"
+
+    "После успешной настройки файл wallet.json рекомендуется удалить.\n\n"
+
+    "━━━━━━━━━━━━━━━━━━\n"
+    "<b>🔄 Замена EVM-кошелька</b>\n"
+    "━━━━━━━━━━━━━━━━━━\n\n"
+
+    "1. Выполни /deletewallet\n"
+    "2. Вручную создай новый wallet.json\n"
+    "3. Выполни /setwallet снова\n\n"
+
+    "━━━━━━━━━━━━━━━━━━\n"
+    "<b>Created by @Cryptobotan</b>",
+    parse_mode="HTML",
+)
 
 
 @dp.message(Command("history"))
@@ -3246,10 +3288,12 @@ async def cmd_history(message: Message):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT st.plan_id, st.order_id, st.network_key, st.amount, "
+            "COALESCE(dp.btc_address, '') AS btc_address, "
             "COALESCE(co.btc_txid, '') AS btc_tx_hash, "
             "st.sent_at, co.completed_at "
             "FROM completed_orders co "
             "JOIN sent_transactions st ON st.order_id = co.order_id "
+            "LEFT JOIN dca_plans dp ON st.plan_id = dp.id "
             "WHERE co.user_id = ? "
             "AND st.id = ("
             "  SELECT st2.id FROM sent_transactions st2 "
@@ -3265,7 +3309,7 @@ async def cmd_history(message: Message):
         return
 
     lines = ["📜 Последние завершённые операции:\n"]
-    for idx, (plan_id, order_id, network_key, amount, btc_tx_hash, created_at, completed_at) in enumerate(rows, start=1):
+    for idx, (plan_id, order_id, network_key, amount, btc_address, btc_tx_hash, created_at, completed_at) in enumerate(rows, start=1):
         created_str = format_datetime_utc(int(created_at or 0))
         completed_str = format_datetime_utc(int(completed_at or 0))
         normalized_network_key = normalize_network_key(str(network_key or ""))
@@ -3288,6 +3332,7 @@ async def cmd_history(message: Message):
             f"{idx}. 🔗 Ордер: {format_order_link(order_id)}\n"
             f"{plan_line}Сеть: {network_label}\n"
             f"Сумма: {format_order_amount(amount, network_key=normalized_network_key)}\n"
+            f"📥 Получатель BTC:\n{format_btc_recipient_copyable(btc_address)}\n"
             f"{tx_line}"
             f"Создан: {created_str}\n"
             f"Завершён: {completed_str}\n"
@@ -3450,7 +3495,7 @@ async def cmd_execute(message: Message):
         await message.answer(
             "❗️У тебя нет DCA-планов.\n\n"
             "Создай план командой:\n"
-            "/setdca USDT-ARB 50 24 bc1q..."
+            "/setdca USDT-ARB 50 24 BTC_АДРЕС"
         )
         return
     
@@ -4125,7 +4170,7 @@ async def cmd_status(message: Message):
         await message.answer(
             "📋 У тебя нет DCA планов\n\n"
             "Создай план командой:\n"
-            "/setdca USDT-ARB 50 24 bc1q..."
+            "/setdca USDT-ARB 50 24 BTC_АДРЕС"
         )
         return
     
@@ -4163,17 +4208,22 @@ async def cmd_status(message: Message):
         btc_display = format_btc_recipient_copyable(btc_address)
         network_label = get_network_label(from_asset) or from_asset
         amount_compact = f"{format_amount(float(amount))} USDT / {interval_hours}ч"
+        schedule_line = (
+            "⏱ Следующая покупка: " + escape_html(format_next_buy_time(next_run, now))
+            if active
+            else "⏸ Покупки приостановлены"
+        )
         
         status_text += (
             f"📌 План {index}\n"
             f"{status_emoji} {escape_html(network_label)} — {status_name}\n"
             f"💰 {amount_compact}\n"
-            f"🎯 Получатель BTC: {btc_display}\n"
-            f"⏱ Следующая покупка: {escape_html(format_next_buy_time(next_run, now))}\n"
+            f"📥 Получатель BTC:\n{btc_display}\n"
+            f"{schedule_line}\n"
         )
         
         # Проверяем есть ли активный ордер (и не истёк ли он)
-        if order_id and order_expires:
+        if active and order_id and order_expires:
             ff_order_status = await get_fixedfloat_order_status(order_id)
             if ff_order_status in SUCCESS_FIXEDFLOAT_ORDER_STATUSES:
                 await mark_order_completed(plan_id, order_id, f"fixedfloat_{ff_order_status}")
@@ -4208,7 +4258,8 @@ async def cmd_status(message: Message):
                 )
                 
                 status_text += (
-                    f"\n└─ 🔄 Активный ордер: {status_line}\n"
+                    f"\n└─ 🔄 Активный ордер\n"
+                    f"{status_line}\n"
                     f"   🔗 {format_order_link(order_id)}\n"
                     f"   💵 {amount_line}\n"
                     f"   📍 Адрес оплаты: {format_code_address(order_address or '—')}\n"
@@ -4695,11 +4746,6 @@ async def fetch_network_status(network_key: str, wallet_address: str):
                     asyncio.to_thread(get_native_balance, w3, wallet_address),
                     timeout=balance_timeout
                 )
-            native_wei = await asyncio.to_thread(
-                w3.eth.get_balance,
-                Web3.to_checksum_address(wallet_address)
-            )
-            logger.info(f"[BALANCE] {network_key} native wei: {native_wei}")
             logger.info(f"[BALANCE] {network_key} native raw: {native_balance}")
         except Exception as e:
             logger.error(f"Error getting native balance for {network_key}: {e}")
@@ -4750,43 +4796,6 @@ async def fetch_network_status(network_key: str, wallet_address: str):
             "balance_error": False,
             "has_usdt": False,
         }
-
-
-async def estimate_walletstatus_gas_required(
-    network_key: str,
-    wallet_address: str,
-    amount: float,
-) -> Optional[float]:
-    try:
-        from web3 import Web3
-
-        w3 = await asyncio.to_thread(get_web3_instance, network_key)
-        checksum = Web3.to_checksum_address(wallet_address)
-        approve_gas = await asyncio.to_thread(
-            estimate_gas_for_approve,
-            w3,
-            network_key,
-            wallet_address,
-            checksum,
-            amount,
-        )
-        transfer_gas = await asyncio.to_thread(
-            estimate_gas_for_transfer,
-            w3,
-            network_key,
-            wallet_address,
-            checksum,
-            amount,
-        )
-        gas_params = await asyncio.to_thread(build_gas_params, w3, network_key)
-        gas_price_wei = int(gas_params.get("gasPrice") or gas_params.get("maxFeePerGas") or 0)
-        if gas_price_wei <= 0:
-            return None
-        total_gas_cost_wei = (approve_gas + transfer_gas) * gas_price_wei * GAS_PRICE_MULTIPLIER
-        return float(w3.from_wei(total_gas_cost_wei, "ether")) * MIN_NATIVE_MULTIPLIER
-    except Exception as e:
-        logger.warning("walletstatus gas estimate unavailable for %s: %s", network_key, e)
-        return None
 
 
 @dp.message(Command("walletstatus"))
@@ -4889,18 +4898,14 @@ async def cmd_walletstatus(message: Message):
         else:
             usdt_line = f"💵 USDT: {usdt_text}"
 
-        gas_required = (
-            await estimate_walletstatus_gas_required(network_key, wallet_address, ff_minimum)
-            if ff_minimum is not None and native_balance is not None
-            else None
-        )
+        gas_required = WALLETSTATUS_MIN_NATIVE_GAS.get(network_key)
         gas_warning = (
             " ⚠️ Недостаточно газа"
             if (
                 native_balance is not None
                 and (
                     (gas_required is not None and float(native_balance) < gas_required)
-                    or (gas_required is None and float(native_balance) <= 0)
+                    or float(native_balance) <= 0
                 )
             )
             else ""
@@ -4985,9 +4990,9 @@ async def cmd_setdca(message: Message):
             "Используй:\n"
             "/setdca СЕТЬ СУММА ИНТЕРВАЛ BTC_АДРЕС\n\n"
             "Примеры:\n"
-            "/setdca USDT-ARB 50 24 bc1qxy2...\n"
-            "/setdca USDT-BSC 100 168 bc1qxy2...\n"
-            "/setdca USDT-POLYGON 75 24 bc1qxy2...\n\n"
+            "/setdca USDT-ARB 50 24 BTC_АДРЕС\n"
+            "/setdca USDT-BSC 100 168 BTC_АДРЕС\n"
+            "/setdca USDT-POLYGON 75 24 BTC_АДРЕС\n\n"
             "Интервалы:\n"
             "12 - раз в 12 часов\n"
             "24 - раз в день\n"
@@ -5087,7 +5092,7 @@ async def cmd_setdca(message: Message):
                 "Поддерживаются форматы:\n"
                 "• Legacy (1...)\n"
                 "• SegWit (3...)\n"
-                "• Native SegWit (bc1...)"
+                "• Native SegWit (bech32)"
             )
             return
         
@@ -5170,8 +5175,8 @@ async def cmd_setdca(message: Message):
                     # BTC адрес отличается - не наследуем ордер, создаём новый план
                     await message.answer(
                         f"⚠️ Найден активный ордер от удалённого плана, но BTC адрес отличается!\n\n"
-                        f"Старый адрес: {format_btc_recipient_copyable(old_btc_address)}\n"
-                        f"Новый адрес: {format_btc_recipient_copyable(btc_address)}\n\n"
+                        f"Старый BTC адрес:\n{format_btc_recipient_copyable(old_btc_address)}\n"
+                        f"Новый BTC адрес:\n{format_btc_recipient_copyable(btc_address)}\n\n"
                         f"💡 Создаю новый план без наследования ордера.\n"
                         f"Старый ордер остаётся активным на FixedFloat."
                     )
@@ -5216,7 +5221,7 @@ async def cmd_setdca(message: Message):
             f"💱 Сеть: {get_network_label(from_asset) or from_asset}\n"
             f"💵 Сумма: {format_order_amount(amount, network_key=from_asset)}\n"
             f"⏱ Интервал: раз в {interval_text}\n"
-            f"🎯 На адрес: {masked_addr}\n\n"
+            f"📥 Получатель BTC:\n{masked_addr}\n\n"
             f"⏰ Первый запуск через {interval_text}\n\n"
             f"{build_execute_hint(execute_command)}\n\n"
             f"{build_status_hint()}"
