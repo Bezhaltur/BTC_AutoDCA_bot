@@ -77,3 +77,4 @@ htmlcov/
 logs/
 botlock_*
 .planning/
+gemini/
