@@ -184,6 +184,7 @@ except ImportError:
 # This is ONLY a cache - keyring is the single source of truth
 _wallet_passwords = {}
 _order_progress_messages: Dict[str, tuple[int, int]] = {}
+_status_messages: Dict[int, int] = {}
 _user_plan_mapping: Dict[int, Dict[int, int]] = {}
 _web3_cache: Dict[str, Any] = {}
 _balances_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
@@ -665,8 +666,6 @@ def build_order_state_message(
         lines.extend(["", f"Причина:\n{escape_html(reason_text)}"])
     if extra_lines:
         lines.extend(["", *extra_lines])
-    if build_status_hint() not in lines:
-        lines.extend(["", build_status_hint()])
     return "\n".join(lines)
 
 
@@ -697,18 +696,12 @@ def is_order_expired(order_expires: Optional[int], now_ts: Optional[int] = None)
 
 async def get_execute_command_hint(user_id: int, plan_id: int) -> str:
     """Return a user-facing execute command without exposing the database ID."""
-    for display_index, mapped_plan_id in _user_plan_mapping.get(int(user_id), {}).items():
-        if int(mapped_plan_id) == int(plan_id):
-            return f"/execute_{int(display_index)}"
     plan_number = await get_plan_display_number(int(user_id), int(plan_id))
     return f"/execute_{int(plan_number)}" if plan_number is not None else "/status"
 
 
 async def get_plan_display_number(user_id: int, plan_id: int) -> Optional[int]:
     """Return a user-facing plan number without exposing the database ID."""
-    for display_index, mapped_plan_id in _user_plan_mapping.get(int(user_id), {}).items():
-        if int(mapped_plan_id) == int(plan_id):
-            return int(display_index)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT id FROM dca_plans WHERE user_id = ? AND deleted = 0 ORDER BY id",
@@ -722,11 +715,18 @@ async def get_plan_display_number(user_id: int, plan_id: int) -> Optional[int]:
 
 
 async def resolve_display_plan_id(message: Message, display_index: int) -> Optional[int]:
-    """Resolve a user-facing plan index created by the latest /status call."""
+    """Resolve a user-facing plan index from the current database state."""
     user_id = int(message.from_user.id)
-    plan_id = _user_plan_mapping.get(user_id, {}).get(int(display_index))
-    if plan_id is not None:
-        return int(plan_id)
+    if int(display_index) > 0:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT id FROM dca_plans WHERE user_id = ? AND deleted = 0 "
+                "ORDER BY id LIMIT 1 OFFSET ?",
+                (user_id, int(display_index) - 1),
+            ) as cur:
+                row = await cur.fetchone()
+        if row:
+            return int(row[0])
     await message.answer(
         "<b>⚠️ Сведения о планах обновились. Пожалуйста, проверьте актуальное состояние через /status</b>",
         parse_mode="HTML",
@@ -1100,7 +1100,7 @@ async def mark_order_expired_before_send(
             btc_address=btc_address,
             execute_command=execute_command,
         )
-    await bot.send_message(user_id, notification)
+    await update_order_progress_message(user_id, order_id, notification)
 
 
 async def notify_and_clear_expired_order(plan_id: int, order_id: str) -> bool:
@@ -1146,7 +1146,7 @@ async def notify_and_clear_expired_order(plan_id: int, order_id: str) -> bool:
             btc_address=btc_address,
             execute_command=execute_command,
         )
-        await bot.send_message(int(user_id), notification, parse_mode="HTML", disable_web_page_preview=True)
+        await update_order_progress_message(int(user_id), order_id, notification)
 
     logger.info("Expired order cleared: plan_id=%s, order_id=%s, notified=%s", plan_id, order_id, should_notify)
     return True
@@ -1393,6 +1393,8 @@ async def update_order_progress_message(user_id: int, order_id: str, text: str) 
             )
             return
         except Exception as e:
+            if "message is not modified" in str(e).lower():
+                return
             logger.warning("Failed to edit progress message for order %s: %s", order_id, e)
     try:
         sent_msg = await bot.send_message(
@@ -1404,6 +1406,35 @@ async def update_order_progress_message(user_id: int, order_id: str, text: str) 
         track_order_progress_message(str(order_id), int(user_id), int(sent_msg.message_id))
     except Exception as e:
         logger.error("Failed to send progress message for order %s: %s", order_id, e)
+
+
+async def update_status_message(user_id: int, text: str) -> None:
+    """Keep one editable status card per user, with send fallback after restart."""
+    message_id = _status_messages.get(int(user_id))
+    if message_id is not None:
+        try:
+            await bot.edit_message_text(
+                chat_id=int(user_id),
+                message_id=message_id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=("fixedfloat.com/order/" in text),
+            )
+            return
+        except Exception as e:
+            if "message is not modified" in str(e).lower():
+                return
+            logger.info("Status message %s is not editable: %s", message_id, e)
+    try:
+        sent_msg = await bot.send_message(
+            int(user_id),
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=("fixedfloat.com/order/" in text),
+        )
+        _status_messages[int(user_id)] = int(sent_msg.message_id)
+    except Exception as e:
+        logger.error("Failed to send status message for user %s: %s", user_id, e)
 
 
 async def mark_order_completed(plan_id: int, order_id: str, reason: str) -> None:
@@ -2444,6 +2475,7 @@ async def dca_scheduler():
                     plan_id, user_id, from_asset, amount, interval_hours, btc_address, next_run = plan
                     plan_number = await get_plan_display_number(user_id, plan_id)
                     plan_claimed = False
+                    order_id = None
                     try:
                         scheduled_time_for_cycle = int(next_run) if next_run is not None else now
                     except (TypeError, ValueError):
@@ -2820,8 +2852,8 @@ async def dca_scheduler():
                             )
                             await db.commit()
                             
-                            progress_msg = await bot.send_message(
-                                user_id,
+                            await update_order_progress_message(
+                                int(user_id), str(order_id),
                                 build_order_state_message(
                                     status_title="⏳ Ожидается оплата",
                                     plan_number=plan_number,
@@ -2833,10 +2865,7 @@ async def dca_scheduler():
                                     deadline_text=format_order_deadline(order_expires),
                                     reason_text="",
                                 ),
-                                parse_mode="HTML",
-                                disable_web_page_preview=True,
                             )
-                            track_order_progress_message(str(order_id), int(user_id), int(progress_msg.message_id))
                             
                             if not await claim_auto_send_execution(plan_id, order_id):
                                 continue
@@ -2882,8 +2911,8 @@ async def dca_scheduler():
                                     )
                                     await db.commit()
                                     
-                                    await bot.send_message(
-                                        user_id,
+                                    await update_order_progress_message(
+                                        int(user_id), str(order_id),
                                         build_order_state_message(
                                             status_title="⚠️ Требуется проверка выплаты",
                                             plan_number=plan_number,
@@ -2894,8 +2923,6 @@ async def dca_scheduler():
                                             deadline_text=format_order_deadline(order_expires),
                                             reason_text=human_error,
                                         ),
-                                        parse_mode="HTML",
-                                        disable_web_page_preview=True,
                                     )
                                     # DO NOT advance schedule - will retry
                                     continue
@@ -2920,8 +2947,8 @@ async def dca_scheduler():
                                     if is_insufficient_auto_send_error(error_str):
                                         await record_plan_skip_metadata(plan_id, "insufficient", now)
 
-                                    await bot.send_message(
-                                        user_id,
+                                    await update_order_progress_message(
+                                        int(user_id), str(order_id),
                                         build_auto_send_failed_notification(
                                             order_id=order_id,
                                             plan_number=plan_number,
@@ -2932,8 +2959,6 @@ async def dca_scheduler():
                                             order_expires=order_expires,
                                             error_msg=error_str,
                                         ),
-                                        parse_mode="HTML",
-                                        disable_web_page_preview=True,
                                     )
                                     # Advance schedule for failed transactions
                                     new_next_run = now + (interval_hours * 3600)
@@ -2991,8 +3016,8 @@ async def dca_scheduler():
                                         (approve_tx, transfer_tx, error_msg[:500], order_id, plan_id)
                                     )
                                     await db.commit()
-                                    await bot.send_message(
-                                        user_id,
+                                    await update_order_progress_message(
+                                        int(user_id), str(order_id),
                                         build_order_state_message(
                                             status_title="⚠️ Требуется проверка выплаты",
                                             plan_number=plan_number,
@@ -3002,8 +3027,6 @@ async def dca_scheduler():
                                             btc_address=btc_address,
                                             reason_text="Транзакция отправлена, но подтверждение сети ещё не получено.",
                                         ),
-                                        parse_mode="HTML",
-                                        disable_web_page_preview=True,
                                     )
                                     continue
                                 
@@ -3016,8 +3039,8 @@ async def dca_scheduler():
                                             (approve_tx, transfer_tx, error_msg[:500], order_id, plan_id)
                                         )
                                         await db.commit()
-                                        await bot.send_message(
-                                            user_id,
+                                        await update_order_progress_message(
+                                            int(user_id), str(order_id),
                                             build_order_state_message(
                                                 status_title="⚠️ Требуется проверка выплаты",
                                                 plan_number=plan_number,
@@ -3027,8 +3050,6 @@ async def dca_scheduler():
                                                 btc_address=btc_address,
                                                 reason_text="Транзакция отправлена, но подтверждение сети ещё не получено.",
                                             ),
-                                            parse_mode="HTML",
-                                            disable_web_page_preview=True,
                                         )
                                     else:
                                         # No tx hash available; keep blocked for manual/scheduler retry policy
@@ -3037,8 +3058,8 @@ async def dca_scheduler():
                                             (error_msg[:500], order_id, plan_id)
                                         )
                                         await db.commit()
-                                        await bot.send_message(
-                                            user_id,
+                                        await update_order_progress_message(
+                                            int(user_id), str(order_id),
                                             build_order_state_message(
                                                 status_title="⚠️ Требуется проверка выплаты",
                                                 plan_number=plan_number,
@@ -3049,8 +3070,6 @@ async def dca_scheduler():
                                                 deadline_text=format_order_deadline(order_expires),
                                                 reason_text=human_error,
                                             ),
-                                            parse_mode="HTML",
-                                            disable_web_page_preview=True,
                                         )
                                     continue
                                 else:
@@ -3084,12 +3103,7 @@ async def dca_scheduler():
                                         order_expires=order_expires,
                                         error_msg=error_msg,
                                     )
-                                    await bot.send_message(
-                                        user_id,
-                                        error_notification,
-                                        parse_mode="HTML",
-                                        disable_web_page_preview=True,
-                                    )
+                                    await update_order_progress_message(int(user_id), str(order_id), error_notification)
                                     logger.error(f"Auto-send failed for order {order_id}: {error_msg}")
                                     
                                     # Advance schedule ONLY for failed (non-retryable) errors
@@ -3111,8 +3125,8 @@ async def dca_scheduler():
                                     manual_send_blocked=True,
                                 )
                                 continue
-                            await bot.send_message(
-                                user_id,
+                            await update_order_progress_message(
+                                int(user_id), str(order_id),
                                 build_order_payment_notification(
                                     order_id=order_id,
                                     plan_number=plan_number,
@@ -3123,8 +3137,6 @@ async def dca_scheduler():
                                     order_expires=order_expires,
                                     action_text="Оплатите ордер на указанный адрес.",
                                 ),
-                                parse_mode="HTML",
-                                disable_web_page_preview=True,
                             )
                             # Advance schedule for manual send case (order created, user notified)
                             new_next_run = now + (interval_hours * 3600)
@@ -3142,12 +3154,14 @@ async def dca_scheduler():
                         logger.error(f"Ошибка выполнения DCA для plan_id={plan_id}, user_id={user_id}: {e}")
                         # Отправляем уведомление об ошибке
                         try:
-                            await bot.send_message(
-                                user_id,
+                            error_text = (
                                 f"❌ Ошибка выполнения DCA плана:\n{escape_html(e)}\n\n"
-                                f"План будет повторён через {interval_hours}ч",
-                                parse_mode=None,
+                                f"План будет повторён через {interval_hours}ч"
                             )
+                            if order_id:
+                                await update_order_progress_message(int(user_id), str(order_id), error_text)
+                            else:
+                                await bot.send_message(user_id, error_text, parse_mode=None)
                         except:
                             pass
                         
@@ -3535,23 +3549,9 @@ async def cmd_execute(message: Message):
     now = int(time.time())
     if active_order_id and (not active_order_expires or int(active_order_expires) > now):
         existing_text = (
-            f"⚠️ <b>Ордер {format_order_link(active_order_id)} уже создан и ожидает обработки.</b>\n\n"
-            f"{build_status_hint()}"
+            f"⚠️ <b>Ордер {format_order_link(active_order_id)} уже создан и ожидает обработки.</b>"
         )
-        progress_meta = _order_progress_messages.get(str(active_order_id))
-        if progress_meta and progress_meta[0] == int(user_id):
-            try:
-                await bot.edit_message_text(
-                    chat_id=int(user_id),
-                    message_id=progress_meta[1],
-                    text=existing_text,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
-                return
-            except Exception as e:
-                logger.warning("Failed to refresh existing order message %s: %s", active_order_id, e)
-        await message.answer(existing_text, parse_mode="HTML", disable_web_page_preview=True)
+        await update_order_progress_message(int(user_id), str(active_order_id), existing_text)
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -3579,10 +3579,9 @@ async def cmd_execute(message: Message):
             active_order_amount = None
             active_order_expires = None
         else:
-            await message.answer(
-                f"⚠️ Для плана #{plan_number} уже идёт предыдущая покупка.\n\n{build_status_hint()}",
-                parse_mode="HTML",
-                disable_web_page_preview=True,
+            await update_order_progress_message(
+                int(user_id), str(inflight_order_id),
+                f"⚠️ Для плана #{plan_number} уже идёт предыдущая покупка."
             )
             return
 
@@ -3629,10 +3628,9 @@ async def cmd_execute(message: Message):
                     )
                     await db.commit()
                 if claim_cur.rowcount != 1:
-                    await message.answer(
-                        f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} уже обрабатывается.\n\n{build_status_hint()}",
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
+                    await update_order_progress_message(
+                        int(user_id), str(active_order_id),
+                        f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} уже обрабатывается."
                     )
                     return
                 resume_state, resume_approve_tx, resume_transfer_tx, resume_error = await resume_transfer_after_approve(
@@ -3661,24 +3659,21 @@ async def cmd_execute(message: Message):
                         )
                     await db.commit()
                 if resume_state == "confirmed":
-                    await message.answer(
-                        f"✅ Оплата по ордеру {format_order_link(active_order_id)} подтверждена.\n\n{build_status_hint()}",
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
+                    await update_order_progress_message(
+                        int(user_id), str(active_order_id),
+                        f"✅ Оплата по ордеру {format_order_link(active_order_id)} подтверждена."
                     )
                 elif resume_state == "tx_pending":
-                    await message.answer(
-                        f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} ещё проверяется.\n\n{build_status_hint()}",
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
+                    await update_order_progress_message(
+                        int(user_id), str(active_order_id),
+                        f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} ещё проверяется."
                     )
                 elif resume_state == "expired":
                     return
                 else:
-                    await message.answer(
-                        f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} требует проверки.\n\n{build_status_hint()}",
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
+                    await update_order_progress_message(
+                        int(user_id), str(active_order_id),
+                        f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} требует проверки."
                     )
                 return
 
@@ -3691,10 +3686,9 @@ async def cmd_execute(message: Message):
                         ("Blocked state without tx hash", active_order_id, plan_id)
                     )
                     await db.commit()
-                await message.answer(
-                    f"⚠️ Для ордера {format_order_link(active_order_id)} требуется ручная проверка выплаты.\n\n{build_status_hint()}",
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
+                await update_order_progress_message(
+                    int(user_id), str(active_order_id),
+                    f"⚠️ Для ордера {format_order_link(active_order_id)} требуется ручная проверка выплаты."
                 )
                 return
             tx_status = await get_transfer_tx_status(from_asset, pending_tx_hash)
@@ -3705,10 +3699,9 @@ async def cmd_execute(message: Message):
                         (active_order_id, plan_id)
                     )
                     await db.commit()
-                await message.answer(
-                    f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} ещё проверяется.\n\n{build_status_hint()}",
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
+                await update_order_progress_message(
+                    int(user_id), str(active_order_id),
+                    f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} ещё проверяется."
                 )
                 return
             if tx_status == "confirmed":
@@ -3724,10 +3717,9 @@ async def cmd_execute(message: Message):
                         )
                         await db.commit()
                     if claim_cur.rowcount != 1:
-                        await message.answer(
-                            f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} уже обрабатывается.\n\n{build_status_hint()}",
-                            parse_mode="HTML",
-                            disable_web_page_preview=True,
+                        await update_order_progress_message(
+                            int(user_id), str(active_order_id),
+                            f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} уже обрабатывается."
                         )
                         return
                     resume_state, resume_approve_tx, resume_transfer_tx, resume_error = await resume_transfer_after_approve(
@@ -3756,24 +3748,21 @@ async def cmd_execute(message: Message):
                             )
                         await db.commit()
                     if resume_state == "confirmed":
-                        await message.answer(
-                            f"✅ Оплата по ордеру {format_order_link(active_order_id)} подтверждена.\n\n{build_status_hint()}",
-                            parse_mode="HTML",
-                            disable_web_page_preview=True,
+                        await update_order_progress_message(
+                            int(user_id), str(active_order_id),
+                            f"✅ Оплата по ордеру {format_order_link(active_order_id)} подтверждена."
                         )
                     elif resume_state == "tx_pending":
-                        await message.answer(
-                            f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} ещё проверяется.\n\n{build_status_hint()}",
-                            parse_mode="HTML",
-                            disable_web_page_preview=True,
+                        await update_order_progress_message(
+                            int(user_id), str(active_order_id),
+                            f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} ещё проверяется."
                         )
                     elif resume_state == "expired":
                         return
                     else:
-                        await message.answer(
-                            f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} требует проверки.\n\n{build_status_hint()}",
-                            parse_mode="HTML",
-                            disable_web_page_preview=True,
+                        await update_order_progress_message(
+                            int(user_id), str(active_order_id),
+                            f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} требует проверки."
                         )
                     return
                 async with aiosqlite.connect(DB_PATH) as db:
@@ -3782,10 +3771,9 @@ async def cmd_execute(message: Message):
                         (active_order_id, plan_id)
                     )
                     await db.commit()
-                await message.answer(
-                    f"✅ Оплата по ордеру {format_order_link(active_order_id)} подтверждена.\n\n{build_status_hint()}",
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
+                await update_order_progress_message(
+                    int(user_id), str(active_order_id),
+                    f"✅ Оплата по ордеру {format_order_link(active_order_id)} подтверждена."
                 )
                 return
             async with aiosqlite.connect(DB_PATH) as db:
@@ -3797,7 +3785,8 @@ async def cmd_execute(message: Message):
 
     if active_order_id and active_order_expires and active_order_expires > now:
         # У этого плана уже есть активный неистёкший ордер
-        await message.answer(
+        await update_order_progress_message(
+            int(user_id), str(active_order_id),
             build_order_payment_notification(
                 order_id=active_order_id,
                 plan_number=plan_number,
@@ -3808,20 +3797,19 @@ async def cmd_execute(message: Message):
                 order_expires=active_order_expires,
                 action_text="Дождитесь завершения текущего ордера.",
             ),
-            parse_mode="HTML",
-            disable_web_page_preview=True,
         )
         return
     elif active_order_id and active_order_expires and active_order_expires <= now:
         fallback_result = await finalize_expired_unavailable_order(plan_id, active_order_id, active_order_expires, now)
         if fallback_result == "pending":
-            await message.answer(
-                f"⚠️ По ордеру {format_order_link(active_order_id)} ещё проверяется выплата.\n\n{build_status_hint()}",
-                parse_mode="HTML",
-                disable_web_page_preview=True,
+            await update_order_progress_message(
+                int(user_id), str(active_order_id),
+                f"⚠️ По ордеру {format_order_link(active_order_id)} ещё проверяется выплата."
             )
             return
 
+    order_id = None
+    progress_msg = None
     try:
         # Проверяем лимиты перед созданием ордера
         try:
@@ -4047,7 +4035,8 @@ async def cmd_execute(message: Message):
 
                 if is_pending_tx_error(error_msg):
                     pending_tx_hash = approve_tx if error_msg.startswith("APPROVE_TX_PENDING:") else transfer_tx
-                    await message.answer(
+                    await update_order_progress_message(
+                        int(user_id), str(order_id),
                         build_order_state_message(
                             status_title="⚠️ Требуется проверка выплаты",
                             plan_number=plan_number,
@@ -4057,13 +4046,12 @@ async def cmd_execute(message: Message):
                             btc_address=btc_address,
                             reason_text="Транзакция отправлена, но подтверждение сети ещё не получено.",
                         ),
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
                     )
                     return
                 if is_retryable_network_error(error_msg) and (approve_tx or transfer_tx):
                     pending_tx_hash = transfer_tx or approve_tx
-                    await message.answer(
+                    await update_order_progress_message(
+                        int(user_id), str(order_id),
                         build_order_state_message(
                             status_title="⚠️ Требуется проверка выплаты",
                             plan_number=plan_number,
@@ -4073,8 +4061,6 @@ async def cmd_execute(message: Message):
                             btc_address=btc_address,
                             reason_text="Транзакция отправлена, но подтверждение сети ещё не получено.",
                         ),
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
                     )
                     return
 
@@ -4101,10 +4087,9 @@ async def cmd_execute(message: Message):
                     order_expires=order_expires,
                     error_msg=error_msg,
                 )
-                await message.answer(
+                await update_order_progress_message(
+                    int(user_id), str(order_id),
                     error_notification,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
                 )
                 logger.error(f"Auto-send failed for order {order_id}: {error_msg}")
         else:
@@ -4146,7 +4131,23 @@ async def cmd_execute(message: Message):
         if plan_claimed:
             await release_plan_claim(plan_id)
         logger.error(f"Ошибка создания ордера для user_id={user_id}: {e}")
-        await message.answer(f"❌ Ошибка при создании ордера:\n{escape_html(e)}")
+        if order_id:
+            await update_order_progress_message(
+                int(user_id), str(order_id),
+                f"❌ Ошибка при создании ордера:\n{escape_html(e)}",
+            )
+        elif progress_msg is not None:
+            try:
+                await bot.edit_message_text(
+                    chat_id=int(user_id),
+                    message_id=int(progress_msg.message_id),
+                    text=f"❌ Ошибка при создании ордера:\n{escape_html(e)}",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                await message.answer(f"❌ Ошибка при создании ордера:\n{escape_html(e)}")
+        else:
+            await message.answer(f"❌ Ошибка при создании ордера:\n{escape_html(e)}")
 
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
@@ -4167,7 +4168,7 @@ async def cmd_status(message: Message):
     
     if not plans:
         _user_plan_mapping[user_id] = {}
-        await message.answer(
+        await update_status_message(user_id,
             "📋 У тебя нет DCA планов\n\n"
             "Создай план командой:\n"
             "/setdca USDT-ARB 50 24 BTC_АДРЕС"
@@ -4275,11 +4276,7 @@ async def cmd_status(message: Message):
             f"\n⚙️ /execute_{index} · {plan_toggle_command} · /delete_{index}\n\n"
         )
     
-    await message.answer(
-        status_text,
-        parse_mode="HTML",
-        disable_web_page_preview=("fixedfloat.com/order/" in status_text),
-    )
+    await update_status_message(user_id, status_text)
 
 
 @dp.message(lambda message: message.text and re.fullmatch(r"/pause(?:_\d+|\s+\d+)?", message.text.strip()))
@@ -5223,8 +5220,7 @@ async def cmd_setdca(message: Message):
             f"⏱ Интервал: раз в {interval_text}\n"
             f"📥 Получатель BTC:\n{masked_addr}\n\n"
             f"⏰ Первый запуск через {interval_text}\n\n"
-            f"{build_execute_hint(execute_command)}\n\n"
-            f"{build_status_hint()}"
+            f"{build_execute_hint(execute_command)}"
         )
         
         logger.info(f"DCA план {action}: user_id={user_id}, {from_asset}, {amount} USD, {interval}ч")
@@ -5315,12 +5311,7 @@ async def order_monitor():
                                     btc_txid=btc_txid,
                                     btc_amount=btc_amount,
                                 )
-                                await bot.send_message(
-                                    int(user_id),
-                                    completion_text,
-                                    parse_mode="HTML",
-                                    disable_web_page_preview=True,
-                                )
+                                await update_order_progress_message(int(user_id), str(order_id), completion_text)
                                 async with aiosqlite.connect(DB_PATH) as ndb:
                                     await ndb.execute("UPDATE completed_orders SET notified = 2 WHERE order_id = ?", (order_id,))
                                     await ndb.commit()
@@ -5334,12 +5325,7 @@ async def order_monitor():
                                     btc_address=btc_address,
                                     btc_txid=btc_txid,
                                 )
-                                await bot.send_message(
-                                    int(user_id),
-                                    sent_text,
-                                    parse_mode="HTML",
-                                    disable_web_page_preview=True,
-                                )
+                                await update_order_progress_message(int(user_id), str(order_id), sent_text)
                                 async with aiosqlite.connect(DB_PATH) as ndb:
                                     await ndb.execute("UPDATE completed_orders SET notified = 1 WHERE order_id = ?", (order_id,))
                                     await ndb.commit()
