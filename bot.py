@@ -243,7 +243,19 @@ LAST_SEEN_EXECUTION_FILE = resolve_project_path(
     os.getenv("LAST_SEEN_EXECUTION_FILE", ""),
     DEFAULT_LAST_SEEN_EXECUTION_FILE
 )
- 
+
+# These objects must exist before the confirmation callback decorators below
+# are evaluated during module import.
+BOT_TOKEN = os.getenv("DCA_TELEGRAM_BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("DCA_TELEGRAM_BOT_TOKEN is not set")
+
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
+dp = Dispatcher(storage=MemoryStorage())
+DB_PATH = resolve_project_path(os.getenv("DATABASE_PATH", ""), DEFAULT_DB_PATH)
 
 
 # ============================================================================
@@ -2568,18 +2580,7 @@ class AccessControlMiddleware(BaseMiddleware):
         logger.warning(f"Access denied for user_id={getattr(user, 'id', None)}")
         return
 
-# Токен Telegram бота из переменных окружения
-BOT_TOKEN = os.getenv("DCA_TELEGRAM_BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("DCA_TELEGRAM_BOT_TOKEN is not set")
-
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-)
-dp = Dispatcher(storage=MemoryStorage())
 dp.update.middleware(AccessControlMiddleware())
-DB_PATH = resolve_project_path(os.getenv("DATABASE_PATH", ""), DEFAULT_DB_PATH)
 
 
 async def setup_bot_commands() -> None:
