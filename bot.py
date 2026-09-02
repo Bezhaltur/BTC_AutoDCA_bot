@@ -13,6 +13,7 @@ import math
 import time
 import re
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 MIN_PYTHON_VERSION = (3, 9)
@@ -42,7 +43,7 @@ try:
     from aiogram.client.default import DefaultBotProperties
     from aiogram.enums import ParseMode
     from aiogram.filters import Command
-    from aiogram.types import BotCommand, CallbackQuery, Message
+    from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
     from aiogram.fsm.storage.memory import MemoryStorage
 except ModuleNotFoundError as exc:
     raise RuntimeError("Missing dependency 'aiogram'. Install requirements: pip install -r requirements.txt") from exc
@@ -232,11 +233,29 @@ except ValueError:
     DCA_EXECUTION_WINDOW_SECONDS = 300
 if DCA_EXECUTION_WINDOW_SECONDS < 0:
     DCA_EXECUTION_WINDOW_SECONDS = 0
+try:
+    DCA_CONFIRMATION_TIMEOUT_SECONDS = int(os.getenv("DCA_CONFIRMATION_TIMEOUT_SECONDS", "3600"))
+except ValueError:
+    DCA_CONFIRMATION_TIMEOUT_SECONDS = 3600
+if DCA_CONFIRMATION_TIMEOUT_SECONDS < 60:
+    DCA_CONFIRMATION_TIMEOUT_SECONDS = 60
 LAST_SEEN_EXECUTION_FILE = resolve_project_path(
     os.getenv("LAST_SEEN_EXECUTION_FILE", ""),
     DEFAULT_LAST_SEEN_EXECUTION_FILE
 )
- 
+
+# These objects must exist before the confirmation callback decorators below
+# are evaluated during module import.
+BOT_TOKEN = os.getenv("DCA_TELEGRAM_BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("DCA_TELEGRAM_BOT_TOKEN is not set")
+
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
+dp = Dispatcher(storage=MemoryStorage())
+DB_PATH = resolve_project_path(os.getenv("DATABASE_PATH", ""), DEFAULT_DB_PATH)
 
 
 # ============================================================================
@@ -806,6 +825,209 @@ def build_order_payment_notification(
         reason_text="Ордер создан и ожидает оплату.",
         extra_lines=extra_lines,
     )
+
+
+def build_dca_confirmation_message(
+    *,
+    plan_number: Optional[int],
+    network_key: str,
+    amount: Any,
+    expires_at: Optional[int] = None,
+) -> str:
+    """Build one-message confirmation card for scheduled DCA."""
+    network_label = escape_html(get_network_label(network_key) or network_key or "—")
+    lines = [
+        "⏰ <b>Время выполнить DCA-покупку</b>",
+        "",
+        f"План №{int(plan_number)}" if plan_number is not None else "План",
+        "",
+        f"Сумма: {format_notification_amount(amount)} USDT",
+        f"Сеть: {network_label}",
+        "",
+        "Подтвердите выполнение покупки.",
+    ]
+    if expires_at:
+        lines.extend(["", f"⏳ Подтверждение доступно до: {escape_html(format_datetime_utc(expires_at))}"])
+    return "\n".join(lines)
+
+
+def build_dca_confirmation_keyboard(plan_id: int, scheduled_at: int) -> InlineKeyboardMarkup:
+    callback_suffix = f"{int(plan_id)}:{int(scheduled_at)}"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"dca_confirm:{callback_suffix}"),
+            InlineKeyboardButton(text="❌ Пропустить", callback_data=f"dca_skip:{callback_suffix}"),
+        ]
+    ])
+
+
+def build_dca_executing_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⌛ Выполняется...", callback_data="dca_noop")]
+    ])
+
+
+def build_dca_skipped_by_user_message() -> str:
+    return (
+        "⏭ <b>Покупка пропущена.</b>\n\n"
+        "Следующая покупка будет выполнена по расписанию."
+    )
+
+
+def build_dca_confirmation_timeout_message() -> str:
+    return (
+        "⚠️ <b>Покупка пропущена</b>\n\n"
+        "Причина:\n"
+        "Не получено подтверждение операции.\n\n"
+        "Следующая покупка будет выполнена по расписанию."
+    )
+
+
+async def edit_confirmation_message(user_id: int, message_id: Optional[int], text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
+    if not message_id:
+        return
+    try:
+        await bot.edit_message_text(
+            chat_id=int(user_id),
+            message_id=int(message_id),
+            text=text,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        if "message is not modified" not in str(e).lower():
+            logger.warning("Failed to edit DCA confirmation message %s: %s", message_id, e)
+
+
+async def create_dca_confirmation_request(
+    *,
+    plan_id: int,
+    user_id: int,
+    network_key: str,
+    amount: Any,
+    interval_hours: int,
+    scheduled_at: int,
+    plan_number: Optional[int],
+) -> bool:
+    now = int(time.time())
+    expires_at = now + DCA_CONFIRMATION_TIMEOUT_SECONDS
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute(
+            "SELECT execution_state, confirmation_expires_at FROM dca_plans "
+            "WHERE id = ? AND user_id = ? AND active = 1 AND deleted = 0 AND active_order_id IS NULL",
+            (plan_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await db.rollback()
+            return False
+        current_state, current_expires_at = row
+        if current_state == "awaiting_confirmation" and current_expires_at and int(current_expires_at) > now:
+            await db.rollback()
+            return False
+        if current_state in ("claiming", "confirming"):
+            await db.rollback()
+            return False
+        await db.execute(
+            "UPDATE dca_plans SET execution_state = 'awaiting_confirmation', "
+            "confirmation_message_id = NULL, confirmation_expires_at = ?, confirmation_scheduled_at = ?, "
+            "last_execution_attempt_at = ? "
+            "WHERE id = ? AND user_id = ? AND active = 1 AND deleted = 0 AND active_order_id IS NULL",
+            (expires_at, int(scheduled_at), now, plan_id, user_id),
+        )
+        await db.commit()
+
+    try:
+        sent_msg = await bot.send_message(
+            int(user_id),
+            build_dca_confirmation_message(
+                plan_number=plan_number,
+                network_key=network_key,
+                amount=amount,
+                expires_at=expires_at,
+            ),
+            reply_markup=build_dca_confirmation_keyboard(plan_id, scheduled_at),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning("Failed to send DCA confirmation for plan %s: %s", plan_id, e)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE dca_plans SET execution_state = 'scheduled', confirmation_message_id = NULL, "
+                "confirmation_expires_at = NULL, confirmation_scheduled_at = NULL "
+                "WHERE id = ? AND execution_state = 'awaiting_confirmation' AND active_order_id IS NULL",
+                (plan_id,),
+            )
+            await db.commit()
+        return False
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE dca_plans SET confirmation_message_id = ? "
+            "WHERE id = ? AND execution_state = 'awaiting_confirmation' AND confirmation_scheduled_at = ?",
+            (int(sent_msg.message_id), plan_id, int(scheduled_at)),
+        )
+        await db.commit()
+    logger.info("DCA confirmation requested: plan_id=%s, scheduled_at=%s", plan_id, scheduled_at)
+    return True
+
+
+async def expire_dca_confirmation(plan_id: int, now_ts: Optional[int] = None) -> bool:
+    now = int(now_ts or time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute(
+            "SELECT user_id, interval_hours, next_run, confirmation_message_id, confirmation_scheduled_at, confirmation_expires_at "
+            "FROM dca_plans WHERE id = ? AND execution_state = 'awaiting_confirmation'",
+            (plan_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await db.rollback()
+            return False
+        user_id, interval_hours, next_run, message_id, scheduled_at, expires_at = row
+        if expires_at and int(expires_at) > now:
+            await db.rollback()
+            return False
+        base_scheduled = int(scheduled_at or next_run or now)
+        new_next_run = calculate_next_run_preserving_schedule(base_scheduled, int(interval_hours or 24), now)
+        cur = await db.execute(
+            "UPDATE dca_plans SET execution_state = 'scheduled', next_run = ?, "
+            "confirmation_message_id = NULL, confirmation_expires_at = NULL, confirmation_scheduled_at = NULL, "
+            "skip_reason = ?, missed_count = COALESCE(missed_count, 0) + 1, "
+            "last_missed_at = ?, last_execution_attempt_at = ? "
+            "WHERE id = ? AND execution_state = 'awaiting_confirmation'",
+            (new_next_run, "confirmation_timeout", now, now, plan_id),
+        )
+        await db.commit()
+    if cur.rowcount == 1:
+        await edit_confirmation_message(int(user_id), message_id, build_dca_confirmation_timeout_message())
+        logger.info("DCA confirmation expired: plan_id=%s", plan_id)
+        return True
+    return False
+
+
+async def recover_dca_confirmations() -> None:
+    """Expire pending DCA confirmations after restart without creating orders."""
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE dca_plans SET confirmation_expires_at = ? "
+            "WHERE execution_state = 'awaiting_confirmation' "
+            "AND confirmation_message_id IS NULL AND active_order_id IS NULL",
+            (now,),
+        )
+        await db.commit()
+        async with db.execute(
+            "SELECT id FROM dca_plans WHERE execution_state = 'awaiting_confirmation' "
+            "AND confirmation_expires_at IS NOT NULL AND confirmation_expires_at <= ?",
+            (now,),
+        ) as cur:
+            rows = await cur.fetchall()
+    for (plan_id,) in rows:
+        await expire_dca_confirmation(int(plan_id), now)
 
 
 def build_purchase_success_notification(
@@ -1698,18 +1920,185 @@ async def recovery_scan_pending_transactions() -> None:
 
 async def recover_stale_plan_claims() -> None:
     """
-    Clear stale 'claiming' states left after unexpected restart/crash.
+    Clear stale transient execution states left after unexpected restart/crash.
     Safe because only rows without active_order_id are reset.
     """
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "UPDATE dca_plans SET execution_state = 'scheduled' "
-            "WHERE execution_state = 'claiming' AND active_order_id IS NULL"
+            "WHERE execution_state IN ('claiming', 'confirming') AND active_order_id IS NULL"
         )
         await db.commit()
         recovered = cur.rowcount or 0
     if recovered:
         logger.warning("Recovered stale plan claims: %s", recovered)
+
+
+class CallbackExecuteMessage:
+    """Small adapter so confirmed DCA callbacks reuse the existing /execute handler."""
+
+    def __init__(self, callback: CallbackQuery, text: str) -> None:
+        self.from_user = callback.from_user
+        self.text = text
+        self._chat_id = int(callback.from_user.id)
+        self._message_id = int(callback.message.message_id) if callback.message else None
+        self._used_original = False
+
+    async def answer(self, text: str, **kwargs: Any) -> Any:
+        parse_mode = kwargs.get("parse_mode", "HTML")
+        disable_web_page_preview = kwargs.get("disable_web_page_preview", False)
+        if self._message_id is not None and not self._used_original:
+            self._used_original = True
+            try:
+                await bot.edit_message_text(
+                    chat_id=self._chat_id,
+                    message_id=self._message_id,
+                    text=text,
+                    parse_mode=parse_mode,
+                    disable_web_page_preview=disable_web_page_preview,
+                )
+                return SimpleNamespace(message_id=self._message_id)
+            except Exception as e:
+                if "message is not modified" in str(e).lower():
+                    return SimpleNamespace(message_id=self._message_id)
+                logger.warning("Failed to reuse confirmation message for execute: %s", e)
+        return await bot.send_message(
+            self._chat_id,
+            text,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+
+
+def parse_dca_confirmation_callback(data: Optional[str], prefix: str) -> Optional[tuple[int, int]]:
+    raw = str(data or "")
+    expected = f"{prefix}:"
+    if not raw.startswith(expected):
+        return None
+    try:
+        plan_raw, scheduled_raw = raw[len(expected):].split(":", 1)
+        return int(plan_raw), int(scheduled_raw)
+    except (TypeError, ValueError):
+        return None
+
+
+@dp.callback_query(lambda callback: callback.data == "dca_noop")
+async def cb_dca_noop(callback: CallbackQuery):
+    await callback.answer("Покупка уже выполняется.")
+
+
+@dp.callback_query(lambda callback: callback.data and callback.data.startswith("dca_skip:"))
+async def cb_dca_skip(callback: CallbackQuery):
+    parsed = parse_dca_confirmation_callback(callback.data, "dca_skip")
+    if not parsed:
+        await callback.answer("Некорректная команда.", show_alert=True)
+        return
+    plan_id, scheduled_at = parsed
+    user_id = int(callback.from_user.id)
+    now = int(time.time())
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute(
+            "SELECT interval_hours, next_run, confirmation_message_id "
+            "FROM dca_plans WHERE id = ? AND user_id = ? AND execution_state = 'awaiting_confirmation' "
+            "AND confirmation_scheduled_at = ? AND active_order_id IS NULL",
+            (plan_id, user_id, scheduled_at),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await db.rollback()
+            await callback.answer("Этот запрос уже обработан.")
+            return
+        interval_hours, next_run, message_id = row
+        new_next_run = calculate_next_run_preserving_schedule(
+            int(scheduled_at or next_run or now),
+            int(interval_hours or 24),
+            now,
+        )
+        cur = await db.execute(
+            "UPDATE dca_plans SET execution_state = 'scheduled', next_run = ?, "
+            "confirmation_message_id = NULL, confirmation_expires_at = NULL, confirmation_scheduled_at = NULL, "
+            "skip_reason = ?, missed_count = COALESCE(missed_count, 0) + 1, "
+            "last_missed_at = ?, last_execution_attempt_at = ? "
+            "WHERE id = ? AND user_id = ? AND execution_state = 'awaiting_confirmation' "
+            "AND confirmation_scheduled_at = ? AND active_order_id IS NULL",
+            (new_next_run, "user_skipped", now, now, plan_id, user_id, scheduled_at),
+        )
+        await db.commit()
+
+    if cur.rowcount != 1:
+        await callback.answer("Этот запрос уже обработан.")
+        return
+    await callback.answer("Покупка пропущена.")
+    await edit_confirmation_message(user_id, message_id, build_dca_skipped_by_user_message())
+
+
+@dp.callback_query(lambda callback: callback.data and callback.data.startswith("dca_confirm:"))
+async def cb_dca_confirm(callback: CallbackQuery):
+    parsed = parse_dca_confirmation_callback(callback.data, "dca_confirm")
+    if not parsed:
+        await callback.answer("Некорректная команда.", show_alert=True)
+        return
+    plan_id, scheduled_at = parsed
+    user_id = int(callback.from_user.id)
+    now = int(time.time())
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute(
+            "SELECT from_asset, amount, interval_hours, next_run, confirmation_message_id, confirmation_expires_at "
+            "FROM dca_plans WHERE id = ? AND user_id = ? AND execution_state = 'awaiting_confirmation' "
+            "AND confirmation_scheduled_at = ? AND active_order_id IS NULL AND active = 1 AND deleted = 0",
+            (plan_id, user_id, scheduled_at),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await db.rollback()
+            await callback.answer("Этот запрос уже обработан.")
+            return
+        from_asset, amount, interval_hours, next_run, message_id, expires_at = row
+        if expires_at and int(expires_at) <= now:
+            await db.rollback()
+            await expire_dca_confirmation(plan_id, now)
+            await callback.answer("Время подтверждения истекло.")
+            return
+        cur = await db.execute(
+            "UPDATE dca_plans SET execution_state = 'confirming', "
+            "confirmation_message_id = NULL, confirmation_expires_at = NULL, confirmation_scheduled_at = NULL, "
+            "last_execution_attempt_at = ? "
+            "WHERE id = ? AND user_id = ? AND execution_state = 'awaiting_confirmation' "
+            "AND confirmation_scheduled_at = ? AND active_order_id IS NULL",
+            (now, plan_id, user_id, scheduled_at),
+        )
+        await db.commit()
+
+    if cur.rowcount != 1:
+        await callback.answer("Этот запрос уже обработан.")
+        return
+    await callback.answer("Запускаю покупку.")
+    plan_number = await get_plan_display_number(user_id, plan_id)
+    await edit_confirmation_message(
+        user_id,
+        message_id,
+        build_dca_confirmation_message(
+            plan_number=plan_number,
+            network_key=from_asset,
+            amount=amount,
+        ),
+        reply_markup=build_dca_executing_keyboard(),
+    )
+    execute_message = CallbackExecuteMessage(callback, f"/execute_{plan_number}" if plan_number is not None else "/execute")
+    try:
+        await cmd_execute(execute_message)  # type: ignore[arg-type]
+    finally:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE dca_plans SET execution_state = 'scheduled' "
+                "WHERE id = ? AND user_id = ? AND execution_state = 'confirming' AND active_order_id IS NULL",
+                (plan_id, user_id),
+            )
+            await db.commit()
 
 
 def load_last_seen_execution_time() -> Optional[int]:
@@ -1769,7 +2158,8 @@ async def notify_offline_startup_status() -> None:
             async with db.execute(
                 "SELECT user_id, id, from_asset, amount, btc_address, interval_hours, next_run, "
                 "COALESCE(missed_count, 0), last_execution_attempt_at "
-                "FROM dca_plans WHERE active = 1 AND deleted = 0 ORDER BY user_id, id"
+                "FROM dca_plans WHERE active = 1 AND deleted = 0 "
+                "AND execution_state != 'awaiting_confirmation' ORDER BY user_id, id"
             ) as plans_cur:
                 active_plan_rows = await plans_cur.fetchall()
     except Exception as e:
@@ -2197,18 +2587,7 @@ class AccessControlMiddleware(BaseMiddleware):
         logger.warning(f"Access denied for user_id={getattr(user, 'id', None)}")
         return
 
-# Токен Telegram бота из переменных окружения
-BOT_TOKEN = os.getenv("DCA_TELEGRAM_BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("DCA_TELEGRAM_BOT_TOKEN is not set")
-
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-)
-dp = Dispatcher(storage=MemoryStorage())
 dp.update.middleware(AccessControlMiddleware())
-DB_PATH = resolve_project_path(os.getenv("DATABASE_PATH", ""), DEFAULT_DB_PATH)
 
 
 async def setup_bot_commands() -> None:
@@ -2286,6 +2665,9 @@ async def init_db():
                 missed_count INTEGER DEFAULT 0,
                 last_missed_at INTEGER,
                 last_execution_attempt_at INTEGER,
+                confirmation_message_id INTEGER,
+                confirmation_expires_at INTEGER,
+                confirmation_scheduled_at INTEGER,
                 order_expired_notified INTEGER DEFAULT 0
             )
         ''')
@@ -2319,6 +2701,12 @@ async def init_db():
             await db.execute("ALTER TABLE dca_plans ADD COLUMN last_missed_at INTEGER")
         if "last_execution_attempt_at" not in existing_columns:
             await db.execute("ALTER TABLE dca_plans ADD COLUMN last_execution_attempt_at INTEGER")
+        if "confirmation_message_id" not in existing_columns:
+            await db.execute("ALTER TABLE dca_plans ADD COLUMN confirmation_message_id INTEGER")
+        if "confirmation_expires_at" not in existing_columns:
+            await db.execute("ALTER TABLE dca_plans ADD COLUMN confirmation_expires_at INTEGER")
+        if "confirmation_scheduled_at" not in existing_columns:
+            await db.execute("ALTER TABLE dca_plans ADD COLUMN confirmation_scheduled_at INTEGER")
         if "order_expired_notified" not in existing_columns:
             await db.execute("ALTER TABLE dca_plans ADD COLUMN order_expired_notified INTEGER DEFAULT 0")
         
@@ -2462,17 +2850,27 @@ async def dca_scheduler():
             now = int(time.time())
             
             async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute(
+                    "SELECT id FROM dca_plans WHERE execution_state = 'awaiting_confirmation' "
+                    "AND confirmation_expires_at IS NOT NULL AND confirmation_expires_at <= ?",
+                    (now,),
+                ) as expired_confirmation_cur:
+                    expired_confirmation_rows = await expired_confirmation_cur.fetchall()
+                for (expired_plan_id,) in expired_confirmation_rows:
+                    await expire_dca_confirmation(int(expired_plan_id), now)
+
                 # Получаем все активные планы, которые пора выполнить (с ID!)
                 # Только НЕ удаленные планы
                 async with db.execute(
-                    "SELECT id, user_id, from_asset, amount, interval_hours, btc_address, next_run "
+                    "SELECT id, user_id, from_asset, amount, interval_hours, btc_address, next_run, "
+                    "execution_state, confirmation_expires_at "
                     "FROM dca_plans WHERE active = 1 AND deleted = 0 AND next_run <= ?",
                     (now,)
                 ) as cursor:
                     plans = await cursor.fetchall()
                 
                 for plan in plans:
-                    plan_id, user_id, from_asset, amount, interval_hours, btc_address, next_run = plan
+                    plan_id, user_id, from_asset, amount, interval_hours, btc_address, next_run, execution_state, confirmation_expires_at = plan
                     plan_number = await get_plan_display_number(user_id, plan_id)
                     plan_claimed = False
                     order_id = None
@@ -2484,6 +2882,16 @@ async def dca_scheduler():
                         interval_seconds = max(1, int(interval_hours) * 3600)
                     except (TypeError, ValueError):
                         interval_seconds = 24 * 3600
+
+                    if execution_state == "awaiting_confirmation":
+                        if confirmation_expires_at and int(confirmation_expires_at) <= now:
+                            await expire_dca_confirmation(plan_id, now)
+                        else:
+                            logger.info("Skip DCA plan_id=%s: awaiting user confirmation", plan_id)
+                        continue
+                    if execution_state in ("claiming", "confirming"):
+                        logger.info("Skip DCA plan_id=%s: execution_state=%s", plan_id, execution_state)
+                        continue
 
                     if next_run is not None and now > scheduled_time_for_cycle:
                         elapsed_seconds = now - scheduled_time_for_cycle
@@ -2749,6 +3157,17 @@ async def dca_scheduler():
                                 )
                                 continue
 
+                        await create_dca_confirmation_request(
+                            plan_id=plan_id,
+                            user_id=user_id,
+                            network_key=from_asset,
+                            amount=amount,
+                            interval_hours=interval_hours,
+                            scheduled_at=scheduled_time_for_cycle,
+                            plan_number=plan_number,
+                        )
+                        continue
+
                         logger.info(f"Выполнение DCA для plan_id={plan_id}, user_id={user_id}: {amount} {from_asset}")
                         
                         # Проверяем лимиты перед созданием ордера
@@ -2821,6 +3240,7 @@ async def dca_scheduler():
                         await db.execute(
                             "UPDATE dca_plans SET active_order_id = ?, active_order_address = ?, "
                             "active_order_amount = ?, active_order_expires = ?, order_expired_notified = 0, execution_state = 'scheduled', "
+                            "confirmation_message_id = NULL, confirmation_expires_at = NULL, confirmation_scheduled_at = NULL, "
                             "last_execution_attempt_at = ? WHERE id = ?",
                             (order_id, deposit_address, f"{deposit_amount} {deposit_code}", order_expires, now, plan_id)
                         )
@@ -3896,6 +4316,7 @@ async def cmd_execute(message: Message):
             await db.execute(
                 "UPDATE dca_plans SET active_order_id = ?, active_order_address = ?, "
                 "active_order_amount = ?, active_order_expires = ?, order_expired_notified = 0, execution_state = 'scheduled', "
+                "confirmation_message_id = NULL, confirmation_expires_at = NULL, confirmation_scheduled_at = NULL, "
                 "last_execution_attempt_at = ? WHERE id = ?",
                 (order_id, deposit_address, f"{deposit_amount} {deposit_code}", order_expires, int(time.time()), plan_id)
             )
@@ -4160,7 +4581,8 @@ async def cmd_status(message: Message):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT id, from_asset, amount, interval_hours, btc_address, next_run, active, "
-            "active_order_id, active_order_address, active_order_amount, active_order_expires "
+            "active_order_id, active_order_address, active_order_amount, active_order_expires, "
+            "execution_state, confirmation_expires_at "
             "FROM dca_plans WHERE user_id = ? AND deleted = 0 ORDER BY id", 
             (user_id,)
         ) as cursor:
@@ -4200,7 +4622,7 @@ async def cmd_status(message: Message):
     # Экранные индексы существуют только в mapping последнего /status.
     for index, plan in enumerate(plans, start=1):
         plan_id, from_asset, amount, interval_hours, btc_address, next_run, active, \
-        order_id, order_address, order_amount, order_expires = plan
+        order_id, order_address, order_amount, order_expires, execution_state, confirmation_expires_at = plan
         _user_plan_mapping[user_id][index] = int(plan_id)
         
         status_emoji = "🟢" if active else "🔴"
@@ -4209,11 +4631,14 @@ async def cmd_status(message: Message):
         btc_display = format_btc_recipient_copyable(btc_address)
         network_label = get_network_label(from_asset) or from_asset
         amount_compact = f"{format_amount(float(amount))} USDT / {interval_hours}ч"
-        schedule_line = (
-            "⏱ Следующая покупка: " + escape_html(format_next_buy_time(next_run, now))
-            if active
-            else "⏸ Покупки приостановлены"
-        )
+        if active and execution_state == "awaiting_confirmation":
+            schedule_line = "⏳ Ожидает подтверждения"
+            if confirmation_expires_at:
+                schedule_line += ": " + escape_html(format_order_deadline(confirmation_expires_at, now))
+        elif active:
+            schedule_line = "⏱ Следующая покупка: " + escape_html(format_next_buy_time(next_run, now))
+        else:
+            schedule_line = "⏸ Покупки приостановлены"
         
         status_text += (
             f"📌 План {index}\n"
@@ -5527,6 +5952,7 @@ async def main():
         # Recovery scan for in-flight transactions after restart
         await recovery_scan_pending_transactions()
         await recover_stale_plan_claims()
+        await recover_dca_confirmations()
         
         logger.info("🚀 AutoDCA Bot успешно запущен!")
         logger.info("=" * 60)
