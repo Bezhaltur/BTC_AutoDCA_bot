@@ -295,6 +295,7 @@ def test_restart_recovery_expires_only_due_and_resets_stale_claims(harness, monk
         pending_id = await harness.add_plan(
             state="awaiting_confirmation",
             next_run=now - 100,
+            message_id=90,
             expires_at=now + 300,
             scheduled_at=now - 100,
         )
@@ -414,3 +415,87 @@ def test_recovery_preserves_transient_states_with_active_orders(harness):
     assert harness.plan(empty_a)["active_order_id"] is None
     assert harness.plan(empty_b)["execution_state"] == "scheduled"
     assert harness.plan(empty_b)["active_order_id"] is None
+
+
+@pytest.mark.parametrize("telegram_was_sent", [False, True])
+def test_recovery_safely_expires_orphaned_confirmation(
+    harness, monkeypatch, telegram_was_sent
+):
+    now = 1_700_010_000
+    scheduled_at = now - 100
+    monkeypatch.setattr(app.time, "time", lambda: now)
+    plan_id = asyncio.run(
+        harness.add_plan(
+            state="awaiting_confirmation",
+            next_run=scheduled_at,
+            message_id=None,
+            expires_at=now + 300,
+            scheduled_at=scheduled_at,
+        )
+    )
+    if telegram_was_sent:
+        harness.bot.sent.append((USER_ID, "unpersisted confirmation", {}, 777))
+    sent_before_recovery = len(harness.bot.sent)
+
+    asyncio.run(app.recover_dca_confirmations())
+
+    row = harness.plan(plan_id)
+    assert row["execution_state"] == "scheduled"
+    assert row["next_run"] == app.calculate_next_run_preserving_schedule(
+        scheduled_at, 24, now
+    )
+    assert row["confirmation_message_id"] is None
+    assert row["confirmation_expires_at"] is None
+    assert row["confirmation_scheduled_at"] is None
+    assert row["skip_reason"] == "confirmation_timeout"
+    assert row["missed_count"] == 1
+    assert row["active_order_id"] is None
+    assert len(harness.bot.sent) == sent_before_recovery
+    assert harness.fixedfloat_calls == []
+
+
+def test_user_skip_replaces_previous_skip_reason(harness, monkeypatch):
+    now = 1_700_010_000
+    scheduled_at = now - 100
+    monkeypatch.setattr(app.time, "time", lambda: now)
+    plan_id = asyncio.run(
+        harness.add_plan(
+            state="awaiting_confirmation",
+            next_run=scheduled_at,
+            message_id=601,
+            expires_at=now + 300,
+            scheduled_at=scheduled_at,
+        )
+    )
+    with sqlite3.connect(harness.db_path) as db:
+        db.execute(
+            "UPDATE dca_plans SET skip_reason = 'confirmation_timeout' WHERE id = ?",
+            (plan_id,),
+        )
+    callback = FakeCallback(f"dca_skip:{plan_id}:{scheduled_at}", message_id=601)
+
+    asyncio.run(app.cb_dca_skip(callback))
+
+    assert harness.plan(plan_id)["skip_reason"] == "user_skipped"
+
+
+def test_timeout_replaces_previous_skip_reason(harness):
+    now = 1_700_010_000
+    scheduled_at = now - 100
+    plan_id = asyncio.run(
+        harness.add_plan(
+            state="awaiting_confirmation",
+            next_run=scheduled_at,
+            message_id=602,
+            expires_at=now,
+            scheduled_at=scheduled_at,
+        )
+    )
+    with sqlite3.connect(harness.db_path) as db:
+        db.execute(
+            "UPDATE dca_plans SET skip_reason = 'user_skipped' WHERE id = ?",
+            (plan_id,),
+        )
+
+    assert asyncio.run(app.expire_dca_confirmation(plan_id, now)) is True
+    assert harness.plan(plan_id)["skip_reason"] == "confirmation_timeout"

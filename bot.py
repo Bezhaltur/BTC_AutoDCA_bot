@@ -996,7 +996,7 @@ async def expire_dca_confirmation(plan_id: int, now_ts: Optional[int] = None) ->
         cur = await db.execute(
             "UPDATE dca_plans SET execution_state = 'scheduled', next_run = ?, "
             "confirmation_message_id = NULL, confirmation_expires_at = NULL, confirmation_scheduled_at = NULL, "
-            "skip_reason = COALESCE(skip_reason, ?), missed_count = COALESCE(missed_count, 0) + 1, "
+            "skip_reason = ?, missed_count = COALESCE(missed_count, 0) + 1, "
             "last_missed_at = ?, last_execution_attempt_at = ? "
             "WHERE id = ? AND execution_state = 'awaiting_confirmation'",
             (new_next_run, "confirmation_timeout", now, now, plan_id),
@@ -1013,6 +1013,13 @@ async def recover_dca_confirmations() -> None:
     """Expire pending DCA confirmations after restart without creating orders."""
     now = int(time.time())
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE dca_plans SET confirmation_expires_at = ? "
+            "WHERE execution_state = 'awaiting_confirmation' "
+            "AND confirmation_message_id IS NULL AND active_order_id IS NULL",
+            (now,),
+        )
+        await db.commit()
         async with db.execute(
             "SELECT id FROM dca_plans WHERE execution_state = 'awaiting_confirmation' "
             "AND confirmation_expires_at IS NOT NULL AND confirmation_expires_at <= ?",
@@ -2012,7 +2019,7 @@ async def cb_dca_skip(callback: CallbackQuery):
         cur = await db.execute(
             "UPDATE dca_plans SET execution_state = 'scheduled', next_run = ?, "
             "confirmation_message_id = NULL, confirmation_expires_at = NULL, confirmation_scheduled_at = NULL, "
-            "skip_reason = COALESCE(skip_reason, ?), missed_count = COALESCE(missed_count, 0) + 1, "
+            "skip_reason = ?, missed_count = COALESCE(missed_count, 0) + 1, "
             "last_missed_at = ?, last_execution_attempt_at = ? "
             "WHERE id = ? AND user_id = ? AND execution_state = 'awaiting_confirmation' "
             "AND confirmation_scheduled_at = ? AND active_order_id IS NULL",
