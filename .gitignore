@@ -78,3 +78,6 @@ logs/
 botlock_*
 .planning/
 gemini/
+
+# Runtime state
+logs/last_seen_execution.txt
