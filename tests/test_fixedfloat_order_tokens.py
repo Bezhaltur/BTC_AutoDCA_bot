@@ -194,3 +194,64 @@ def test_clearing_active_order_also_clears_token(tmp_path, monkeypatch, clearer)
         ).fetchone()[0]
     assert plan_row == (None, None)
     assert tx_token == "historical-token"
+
+
+def test_secondary_monitor_selects_only_unnotified_orders_with_token(tmp_path, monkeypatch):
+    db_path = init_temp_db(tmp_path, monkeypatch, "secondary-monitor.sqlite3")
+    valid_plan = insert_plan(db_path)
+    null_plan = insert_plan(db_path)
+    empty_plan = insert_plan(db_path)
+    notified_plan = insert_plan(db_path)
+
+    with sqlite3.connect(db_path) as db:
+        rows = [
+            (valid_plan, "valid-order", "valid-token"),
+            (null_plan, "null-token-order", None),
+            (empty_plan, "empty-token-order", ""),
+            (notified_plan, "already-notified-order", "notified-token"),
+        ]
+        for plan_id, order_id, order_token in rows:
+            db.execute(
+                "INSERT INTO sent_transactions ("
+                "user_id, plan_id, order_id, order_token, network_key, transfer_tx_hash, "
+                "amount, deposit_address, state"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sent')",
+                (
+                    10001,
+                    plan_id,
+                    order_id,
+                    order_token,
+                    "USDT-ARB",
+                    f"tx-{order_id}",
+                    25.0,
+                    "0xdeposit",
+                ),
+            )
+        db.execute(
+            "INSERT INTO completed_orders (user_id, order_id, notified) VALUES (?, ?, 2)",
+            (10001, "already-notified-order"),
+        )
+
+    status_calls = []
+
+    async def fake_status(order_id, order_token, *args, **kwargs):
+        status_calls.append((order_id, order_token))
+        return ""
+
+    sleep_calls = 0
+
+    async def one_iteration_sleep(*args, **kwargs):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls > 1:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(app, "get_fixedfloat_order_status_with_retry", fake_status)
+    monkeypatch.setattr(app.asyncio, "sleep", one_iteration_sleep)
+
+    async def scenario():
+        with pytest.raises(asyncio.CancelledError):
+            await app.order_monitor()
+
+    asyncio.run(scenario())
+    assert status_calls == [("valid-order", "valid-token")]

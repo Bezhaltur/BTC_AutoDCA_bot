@@ -5869,6 +5869,7 @@ async def order_monitor():
                     "JOIN dca_plans dp ON st.plan_id = dp.id "
                     "LEFT JOIN completed_orders co ON st.order_id = co.order_id "
                     "WHERE (co.order_id IS NULL OR COALESCE(co.notified, 0) < 2) AND st.transfer_tx_hash IS NOT NULL "
+                    "AND st.order_token IS NOT NULL AND st.order_token <> '' "
                     "AND st.id = ("
                     "  SELECT st2.id FROM sent_transactions st2 "
                     "  WHERE st2.order_id = st.order_id ORDER BY st2.sent_at DESC LIMIT 1"
