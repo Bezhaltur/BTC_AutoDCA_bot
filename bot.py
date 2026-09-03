@@ -2819,7 +2819,7 @@ async def init_db():
         await db.execute(
             "DELETE FROM sent_transactions "
             "WHERE order_id IS NOT NULL AND id NOT IN ("
-            "  SELECT MIN(id) FROM sent_transactions WHERE order_id IS NOT NULL GROUP BY order_id"
+            "  SELECT MAX(id) FROM sent_transactions WHERE order_id IS NOT NULL GROUP BY order_id"
             ")"
         )
         await db.commit()
