@@ -180,6 +180,25 @@ except ImportError:
     def mask_sensitive_data(data):  # type: ignore[no-untyped-def]
         return data
 
+_base_mask_sensitive_data = mask_sensitive_data
+
+
+def mask_sensitive_data(data):  # type: ignore[no-untyped-def]
+    """Apply configured masking and always redact FixedFloat order tokens."""
+    masked = _base_mask_sensitive_data(copy.deepcopy(data))
+
+    def redact(value):  # type: ignore[no-untyped-def]
+        if isinstance(value, dict):
+            return {
+                key: ("***" if str(key).lower() == "token" else redact(item))
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        return value
+
+    return redact(masked)
+
 # In-memory password cache (loaded from keyring at startup)
 # Keys: user_id -> password
 # This is ONLY a cache - keyring is the single source of truth
@@ -221,6 +240,7 @@ RETRYABLE_ERROR_KEYWORDS = (
 )
 FINAL_FIXEDFLOAT_ORDER_STATUSES = {"expired", "cancelled", "failed"}
 SUCCESS_FIXEDFLOAT_ORDER_STATUSES = {"finished", "completed", "done"}
+FIXEDFLOAT_TOKEN_UNAVAILABLE_STATUS = "token_unavailable"
 WALLETSTATUS_MIN_NATIVE_GAS = {
     "USDT-ARB": 0.0001,
     "USDT-BSC": 0.0005,
@@ -1258,7 +1278,8 @@ async def mark_order_expired_before_send(
     now_ts = int(time.time())
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT next_run, interval_hours, from_asset, amount, btc_address FROM dca_plans WHERE id = ?",
+            "SELECT next_run, interval_hours, from_asset, amount, btc_address, active_order_token "
+            "FROM dca_plans WHERE id = ?",
             (plan_id,)
         ) as cur:
             plan_row = await cur.fetchone()
@@ -1277,6 +1298,14 @@ async def mark_order_expired_before_send(
         network_key = plan_row[2] if plan_row else ""
         amount = plan_row[3] if plan_row else 0
         btc_address = plan_row[4] if plan_row else ""
+        order_token = plan_row[5] if plan_row else None
+        if not order_token:
+            await db.rollback()
+            logger.warning(
+                "FixedFloat order token unavailable for order %s; automatic expiry skipped",
+                order_id,
+            )
+            return
         if base_scheduled > now_ts:
             # Manual execution flow should not shift future strategy schedule.
             new_next_run = base_scheduled
@@ -1284,7 +1313,7 @@ async def mark_order_expired_before_send(
             new_next_run = calculate_next_run_preserving_schedule(base_scheduled, base_interval_hours, now_ts)
 
         await db.execute(
-            "UPDATE dca_plans SET active_order_id = NULL, active_order_address = NULL, "
+            "UPDATE dca_plans SET active_order_id = NULL, active_order_token = NULL, active_order_address = NULL, "
             "active_order_amount = NULL, active_order_expires = NULL, "
             "execution_state = 'expired', next_run = ?, skip_reason = COALESCE(skip_reason, ?), "
             "missed_count = COALESCE(missed_count, 0) + 1, last_missed_at = ?, "
@@ -1304,7 +1333,7 @@ async def mark_order_expired_before_send(
 
     plan_number = await get_plan_display_number(user_id, plan_id)
     execute_command = await get_execute_command_hint(user_id, plan_id)
-    order_data = await fetch_fixedfloat_order_details(order_id)
+    order_data = await fetch_fixedfloat_order_details(order_id, order_token)
     if is_requote_order_state(order_data):
         notification = build_requote_notification(
             order_id=order_id,
@@ -1335,7 +1364,7 @@ async def notify_and_clear_expired_order(plan_id: int, order_id: str) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
         async with db.execute(
-            "SELECT user_id, from_asset, amount, btc_address, order_expired_notified "
+            "SELECT user_id, from_asset, amount, btc_address, order_expired_notified, active_order_token "
             "FROM dca_plans WHERE id = ? AND active_order_id = ?",
             (plan_id, order_id)
         ) as cur:
@@ -1345,12 +1374,19 @@ async def notify_and_clear_expired_order(plan_id: int, order_id: str) -> bool:
             await db.rollback()
             return False
 
-        user_id, network_key, amount, btc_address, order_expired_notified = row
+        user_id, network_key, amount, btc_address, order_expired_notified, order_token = row
+        if not order_token:
+            await db.rollback()
+            logger.warning(
+                "FixedFloat order token unavailable for order %s; automatic clear skipped",
+                order_id,
+            )
+            return False
         should_notify = int(order_expired_notified or 0) != 1
 
         await db.execute(
             "UPDATE dca_plans SET order_expired_notified = 1, "
-            "active_order_id = NULL, active_order_address = NULL, "
+            "active_order_id = NULL, active_order_token = NULL, active_order_address = NULL, "
             "active_order_amount = NULL, active_order_expires = NULL "
             "WHERE id = ? AND active_order_id = ?",
             (plan_id, order_id)
@@ -1483,12 +1519,15 @@ async def get_transfer_tx_status(network_key: str, tx_hash: str) -> str:
     return "pending"
 
 
-async def get_fixedfloat_order_status(order_id: str) -> str:
+async def get_fixedfloat_order_status(order_id: str, order_token: Optional[str]) -> str:
     """Get FixedFloat order status or empty string if unavailable."""
     if not order_id:
         return ""
+    if not order_token:
+        logger.warning("FixedFloat order token unavailable for order %s; status request skipped", order_id)
+        return FIXEDFLOAT_TOKEN_UNAVAILABLE_STATUS
     try:
-        data = await ff_request_async("order", {"id": order_id})
+        data = await ff_request_async("order", {"id": order_id, "token": order_token})
         status = str((data or {}).get("status", "")).lower()
         return status
     except Exception as e:
@@ -1496,10 +1535,15 @@ async def get_fixedfloat_order_status(order_id: str) -> str:
         return ""
 
 
-async def get_fixedfloat_order_status_with_retry(order_id: str, attempts: int = 7, delay_seconds: float = 2.5) -> str:
+async def get_fixedfloat_order_status_with_retry(
+    order_id: str,
+    order_token: Optional[str],
+    attempts: int = 7,
+    delay_seconds: float = 2.5,
+) -> str:
     """Retry FixedFloat status checks and return empty string if still unavailable."""
     for attempt in range(attempts):
-        status = await get_fixedfloat_order_status(order_id)
+        status = await get_fixedfloat_order_status(order_id, order_token)
         if status:
             return status
         if attempt < attempts - 1:
@@ -1527,11 +1571,14 @@ async def fetch_btc_txid(order_id: str) -> str:
     return ""
 
 
-async def fetch_fixedfloat_order_details(order_id: str) -> dict:
+async def fetch_fixedfloat_order_details(order_id: str, order_token: Optional[str]) -> dict:
     if not order_id:
         return {}
+    if not order_token:
+        logger.warning("FixedFloat order token unavailable for order %s; detail request skipped", order_id)
+        return {"error": FIXEDFLOAT_TOKEN_UNAVAILABLE_STATUS}
     try:
-        data = await ff_request_async("order", {"id": order_id})
+        data = await ff_request_async("order", {"id": order_id, "token": order_token})
         return data if isinstance(data, dict) else {}
     except Exception as e:
         logger.warning("Failed to fetch FixedFloat order details for %s: %s", order_id, e)
@@ -1685,7 +1732,7 @@ async def mark_order_completed(plan_id: int, order_id: str, reason: str) -> None
                 (user_id, order_id, completed_at)
             )
         await db.execute(
-            "UPDATE dca_plans SET active_order_id = NULL, active_order_address = NULL, "
+            "UPDATE dca_plans SET active_order_id = NULL, active_order_token = NULL, active_order_address = NULL, "
             "active_order_amount = NULL, active_order_expires = NULL, execution_state = 'scheduled', "
             "missed_count = 0 WHERE id = ?",
             (plan_id,)
@@ -1704,7 +1751,7 @@ async def mark_order_failed(plan_id: int, order_id: str, reason: str) -> None:
             (reason[:500], plan_id, order_id)
         )
         await db.execute(
-            "UPDATE dca_plans SET active_order_id = NULL, active_order_address = NULL, "
+            "UPDATE dca_plans SET active_order_id = NULL, active_order_token = NULL, active_order_address = NULL, "
             "active_order_amount = NULL, active_order_expires = NULL, execution_state = 'scheduled' WHERE id = ?",
             (plan_id,)
         )
@@ -2431,7 +2478,12 @@ def ff_request(method: str, params=None) -> dict:
         elif code == 501:
             error_msg = "Нет прав доступа к API"
         
-        logger.error(f"FixedFloat API ошибка (code={code}): {error_msg}, data={error_data}")
+        logger.error(
+            "FixedFloat API ошибка (code=%s): %s, data=%s",
+            code,
+            error_msg,
+            mask_sensitive_data(error_data),
+        )
         raise RuntimeError(f"FixedFloat error (code={code}): {error_msg}")
     
     return data["data"]
@@ -2656,6 +2708,7 @@ async def init_db():
                 active BOOLEAN DEFAULT 1,
                 created_at INTEGER DEFAULT (strftime('%s','now')),
                 active_order_id TEXT,
+                active_order_token TEXT,
                 active_order_address TEXT,
                 active_order_amount TEXT,
                 active_order_expires INTEGER,
@@ -2679,6 +2732,8 @@ async def init_db():
         
         if "active_order_id" not in existing_columns:
             await db.execute("ALTER TABLE dca_plans ADD COLUMN active_order_id TEXT")
+        if "active_order_token" not in existing_columns:
+            await db.execute("ALTER TABLE dca_plans ADD COLUMN active_order_token TEXT")
         if "active_order_address" not in existing_columns:
             await db.execute("ALTER TABLE dca_plans ADD COLUMN active_order_address TEXT")
         if "active_order_amount" not in existing_columns:
@@ -2735,6 +2790,7 @@ async def init_db():
                 user_id INTEGER NOT NULL,
                 plan_id INTEGER,
                 order_id TEXT NOT NULL,
+                order_token TEXT,
                 network_key TEXT NOT NULL,
                 approve_tx_hash TEXT,
                 transfer_tx_hash TEXT,
@@ -2756,6 +2812,8 @@ async def init_db():
             await db.execute("ALTER TABLE sent_transactions ADD COLUMN state TEXT DEFAULT 'scheduled'")
         if "error_message" not in existing_columns:
             await db.execute("ALTER TABLE sent_transactions ADD COLUMN error_message TEXT")
+        if "order_token" not in existing_columns:
+            await db.execute("ALTER TABLE sent_transactions ADD COLUMN order_token TEXT")
 
         # Safe migration: ensure transfer_tx_hash is nullable for pre-send records
         async with db.execute("PRAGMA table_info(sent_transactions)") as cursor:
@@ -2773,6 +2831,7 @@ async def init_db():
                         user_id INTEGER NOT NULL,
                         plan_id INTEGER,
                         order_id TEXT NOT NULL,
+                        order_token TEXT,
                         network_key TEXT NOT NULL,
                         approve_tx_hash TEXT,
                         transfer_tx_hash TEXT,
@@ -2786,11 +2845,11 @@ async def init_db():
                 ''')
                 await db.execute('''
                     INSERT INTO sent_transactions_new (
-                        id, user_id, plan_id, order_id, network_key, approve_tx_hash,
+                        id, user_id, plan_id, order_id, order_token, network_key, approve_tx_hash,
                         transfer_tx_hash, amount, deposit_address, state, error_message, sent_at
                     )
                     SELECT
-                        id, user_id, plan_id, order_id, network_key, approve_tx_hash,
+                        id, user_id, plan_id, order_id, order_token, network_key, approve_tx_hash,
                         transfer_tx_hash, amount, deposit_address, state, error_message, sent_at
                     FROM sent_transactions
                 ''')
@@ -2900,15 +2959,17 @@ async def dca_scheduler():
                     
                     try:
                         async with db.execute(
-                            "SELECT order_id, state FROM sent_transactions "
+                            "SELECT order_id, order_token, state FROM sent_transactions "
                             "WHERE plan_id = ? AND state IN ('sending', 'tx_pending', 'pending', 'blocked', 'transfering') "
                             "ORDER BY sent_at DESC LIMIT 1",
                             (plan_id,)
                         ) as inflight_cur:
                             inflight_row = await inflight_cur.fetchone()
                         if inflight_row:
-                            inflight_order_id, inflight_state = inflight_row
-                            inflight_status = await get_fixedfloat_order_status_with_retry(inflight_order_id)
+                            inflight_order_id, inflight_order_token, inflight_state = inflight_row
+                            inflight_status = await get_fixedfloat_order_status_with_retry(
+                                inflight_order_id, inflight_order_token
+                            )
                             if inflight_status in SUCCESS_FIXEDFLOAT_ORDER_STATUSES:
                                 await mark_order_completed(plan_id, inflight_order_id, f"fixedfloat_{inflight_status}")
                                 continue
@@ -2927,18 +2988,26 @@ async def dca_scheduler():
 
                         # Проверяем нет ли уже активного ордера для этого плана
                         async with db.execute(
-                            "SELECT active_order_id, active_order_expires FROM dca_plans WHERE id = ?",
+                            "SELECT active_order_id, active_order_token, active_order_expires FROM dca_plans WHERE id = ?",
                             (plan_id,)
                         ) as cur:
                             order_check = await cur.fetchone()
                         
                         if order_check:
-                            existing_order_id, existing_order_expires = order_check
+                            existing_order_id, existing_order_token, existing_order_expires = order_check
                             if existing_order_id:
+                                if not existing_order_token:
+                                    logger.warning(
+                                        "FixedFloat order token unavailable for order %s; keeping order active",
+                                        existing_order_id,
+                                    )
+                                    continue
                                 if existing_order_expires and now > int(existing_order_expires):
                                     await notify_and_clear_expired_order(plan_id, existing_order_id)
                                     continue
-                                ff_order_status = await get_fixedfloat_order_status_with_retry(existing_order_id)
+                                ff_order_status = await get_fixedfloat_order_status_with_retry(
+                                    existing_order_id, existing_order_token
+                                )
                                 if ff_order_status in SUCCESS_FIXEDFLOAT_ORDER_STATUSES:
                                     await mark_order_completed(plan_id, existing_order_id, f"fixedfloat_{ff_order_status}")
                                     continue
@@ -3097,7 +3166,7 @@ async def dca_scheduler():
                                             # Stale active order marker - clear and skip this cycle to avoid duplicates
                                             logger.warning(f"Active order {existing_order_id} already sent, clearing stale active order")
                                             await db.execute(
-                                                "UPDATE dca_plans SET active_order_id = NULL, active_order_address = NULL, "
+                                                "UPDATE dca_plans SET active_order_id = NULL, active_order_token = NULL, active_order_address = NULL, "
                                                 "active_order_amount = NULL, active_order_expires = NULL, execution_state = 'scheduled' WHERE id = ?",
                                                 (plan_id,)
                                             )
@@ -3114,7 +3183,7 @@ async def dca_scheduler():
                                             # Stale active order marker - clear and skip this cycle to avoid duplicates
                                             logger.warning(f"Active order {existing_order_id} failed, clearing stale active order")
                                             await db.execute(
-                                                "UPDATE dca_plans SET active_order_id = NULL, active_order_address = NULL, "
+                                                "UPDATE dca_plans SET active_order_id = NULL, active_order_token = NULL, active_order_address = NULL, "
                                                 "active_order_amount = NULL, active_order_expires = NULL, execution_state = 'scheduled' WHERE id = ?",
                                                 (plan_id,)
                                             )
@@ -3226,26 +3295,68 @@ async def dca_scheduler():
                             amount,
                             btc_address
                         )
-                        
-                        order_id = order_data.get("id")
+
+                        if not isinstance(order_data, dict):
+                            await release_plan_claim(plan_id)
+                            plan_claimed = False
+                            logger.error(
+                                "FixedFloat create response incomplete for plan_id=%s: invalid response type",
+                                plan_id,
+                            )
+                            await bot.send_message(
+                                user_id,
+                                "❌ FixedFloat вернул неполный ответ при создании ордера. "
+                                "Выполнение остановлено безопасно."
+                            )
+                            continue
+
+                        order_id = str(order_data.get("id") or "").strip()
+                        order_token = str(order_data.get("token") or "").strip() or None
                         from_obj = order_data.get("from", {}) or {}
                         deposit_code = from_obj.get("code")
                         deposit_address = from_obj.get("address")
                         deposit_amount = from_obj.get("amount")
+
+                        if not order_id:
+                            await release_plan_claim(plan_id)
+                            plan_claimed = False
+                            logger.error(
+                                "FixedFloat create response incomplete for plan_id=%s: order id unavailable",
+                                plan_id,
+                            )
+                            await bot.send_message(
+                                user_id,
+                                "❌ FixedFloat вернул неполный ответ без ID ордера. "
+                                "Выполнение остановлено безопасно."
+                            )
+                            continue
                         
                         # Получаем timestamp истечения ордера из ответа FixedFloat.
                         order_expires = extract_order_expires_at(order_data)
                         
                         # ВАЖНО: Сохраняем активный ордер в БД для предотвращения дубликатов
                         await db.execute(
-                            "UPDATE dca_plans SET active_order_id = ?, active_order_address = ?, "
+                            "UPDATE dca_plans SET active_order_id = ?, active_order_token = ?, active_order_address = ?, "
                             "active_order_amount = ?, active_order_expires = ?, order_expired_notified = 0, execution_state = 'scheduled', "
                             "confirmation_message_id = NULL, confirmation_expires_at = NULL, confirmation_scheduled_at = NULL, "
                             "last_execution_attempt_at = ? WHERE id = ?",
-                            (order_id, deposit_address, f"{deposit_amount} {deposit_code}", order_expires, now, plan_id)
+                            (order_id, order_token, deposit_address, f"{deposit_amount} {deposit_code}", order_expires, now, plan_id)
                         )
                         await db.commit()
                         plan_claimed = False
+
+                        if not order_token:
+                            logger.error(
+                                "FixedFloat create response incomplete for plan_id=%s, order_id=%s: security token unavailable; order kept active",
+                                plan_id,
+                                order_id,
+                            )
+                            await bot.send_message(
+                                user_id,
+                                f"❌ FixedFloat создал ордер {escape_html(order_id)}, но не вернул security token. "
+                                "Ордер сохранён и заблокирован для ручной проверки; средства не отправлялись."
+                            )
+                            continue
                         
                         # Проверяем есть ли настроенный кошелёк для автоматической отправки (single wallet)
                         async with db.execute(
@@ -3267,8 +3378,8 @@ async def dca_scheduler():
                             
                             # Create transaction record in 'sending' state BEFORE attempting send
                             await db.execute(
-                                "INSERT INTO sent_transactions (user_id, plan_id, order_id, network_key, amount, deposit_address, state) VALUES (?, ?, ?, ?, ?, ?, 'sending')",
-                                (user_id, plan_id, order_id, from_asset, required_amount, deposit_address)
+                                "INSERT INTO sent_transactions (user_id, plan_id, order_id, order_token, network_key, amount, deposit_address, state) VALUES (?, ?, ?, ?, ?, ?, ?, 'sending')",
+                                (user_id, plan_id, order_id, order_token, from_asset, required_amount, deposit_address)
                             )
                             await db.commit()
                             
@@ -3951,7 +4062,7 @@ async def cmd_execute(message: Message):
     # Получаем конкретный план по ID (только не удаленные)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT from_asset, amount, interval_hours, btc_address, active_order_id, active_order_address, "
+            "SELECT from_asset, amount, interval_hours, btc_address, active_order_id, active_order_token, active_order_address, "
             "active_order_amount, active_order_expires, next_run "
             "FROM dca_plans WHERE id = ? AND user_id = ? AND deleted = 0",
             (plan_id, user_id)
@@ -3962,7 +4073,7 @@ async def cmd_execute(message: Message):
         await message.answer("❌ План не найден или не принадлежит тебе")
         return
     
-    from_asset, amount, interval_hours, btc_address, active_order_id, active_order_address, active_order_amount, active_order_expires, plan_next_run = row
+    from_asset, amount, interval_hours, btc_address, active_order_id, active_order_token, active_order_address, active_order_amount, active_order_expires, plan_next_run = row
     plan_number = await get_plan_display_number(user_id, plan_id)
     plan_claimed = False
 
@@ -3976,15 +4087,17 @@ async def cmd_execute(message: Message):
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT order_id, state FROM sent_transactions "
+            "SELECT order_id, order_token, state FROM sent_transactions "
             "WHERE plan_id = ? AND state IN ('sending', 'tx_pending', 'pending', 'blocked', 'transfering') "
             "ORDER BY sent_at DESC LIMIT 1",
             (plan_id,)
         ) as inflight_cur:
             inflight_row = await inflight_cur.fetchone()
     if inflight_row:
-        inflight_order_id, inflight_state = inflight_row
-        inflight_status = await get_fixedfloat_order_status_with_retry(inflight_order_id)
+        inflight_order_id, inflight_order_token, inflight_state = inflight_row
+        inflight_status = await get_fixedfloat_order_status_with_retry(
+            inflight_order_id, inflight_order_token
+        )
         if inflight_status in SUCCESS_FIXEDFLOAT_ORDER_STATUSES:
             await mark_order_completed(plan_id, inflight_order_id, f"fixedfloat_{inflight_status}")
             active_order_id = None
@@ -4008,7 +4121,16 @@ async def cmd_execute(message: Message):
     # Проверяем есть ли уже активный ордер для ЭТОГО конкретного плана
     now = int(time.time())
     if active_order_id:
-        ff_order_status = await get_fixedfloat_order_status_with_retry(active_order_id)
+        ff_order_status = await get_fixedfloat_order_status_with_retry(
+            active_order_id, active_order_token
+        )
+        if ff_order_status == FIXEDFLOAT_TOKEN_UNAVAILABLE_STATUS:
+            await update_order_progress_message(
+                int(user_id), str(active_order_id),
+                f"⚠️ Для ордера {format_order_link(active_order_id)} недоступен security token. "
+                "Ордер сохранён для ручной проверки."
+            )
+            return
         if ff_order_status in SUCCESS_FIXEDFLOAT_ORDER_STATUSES:
             await mark_order_completed(plan_id, active_order_id, f"fixedfloat_{ff_order_status}")
             active_order_id = None
@@ -4296,17 +4418,33 @@ async def cmd_execute(message: Message):
             await bot.edit_message_text(
                 chat_id=int(user_id),
                 message_id=progress_msg.message_id,
-                text=f"❌ Неожиданный ответ FixedFloat: {escape_html(data)}",
+                text="❌ FixedFloat вернул неполный ответ при создании ордера. Выполнение остановлено безопасно.",
                 parse_mode="HTML",
             )
             return
 
         # Парсим ответ
-        order_id = data.get("id")
+        order_id = str(data.get("id") or "").strip()
+        order_token = str(data.get("token") or "").strip() or None
         from_obj = data.get("from", {}) or {}
         deposit_code = from_obj.get("code")
         deposit_amount = from_obj.get("amount")
         deposit_address = from_obj.get("address")
+        if not order_id:
+            await release_plan_claim(plan_id)
+            plan_claimed = False
+            logger.error(
+                "FixedFloat create response incomplete for user_id=%s, plan_id=%s: order id unavailable",
+                user_id,
+                plan_id,
+            )
+            await bot.edit_message_text(
+                chat_id=int(user_id),
+                message_id=progress_msg.message_id,
+                text="❌ FixedFloat вернул неполный ответ без ID ордера. Выполнение остановлено безопасно.",
+                parse_mode="HTML",
+            )
+            return
         if order_id:
             track_order_progress_message(str(order_id), int(user_id), int(progress_msg.message_id))
         
@@ -4314,14 +4452,32 @@ async def cmd_execute(message: Message):
         order_expires = extract_order_expires_at(data)
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                "UPDATE dca_plans SET active_order_id = ?, active_order_address = ?, "
+                "UPDATE dca_plans SET active_order_id = ?, active_order_token = ?, active_order_address = ?, "
                 "active_order_amount = ?, active_order_expires = ?, order_expired_notified = 0, execution_state = 'scheduled', "
                 "confirmation_message_id = NULL, confirmation_expires_at = NULL, confirmation_scheduled_at = NULL, "
                 "last_execution_attempt_at = ? WHERE id = ?",
-                (order_id, deposit_address, f"{deposit_amount} {deposit_code}", order_expires, int(time.time()), plan_id)
+                (order_id, order_token, deposit_address, f"{deposit_amount} {deposit_code}", order_expires, int(time.time()), plan_id)
             )
             await db.commit()
             plan_claimed = False
+
+            if not order_token:
+                logger.error(
+                    "FixedFloat create response incomplete for user_id=%s, plan_id=%s, order_id=%s: security token unavailable; order kept active",
+                    user_id,
+                    plan_id,
+                    order_id,
+                )
+                await bot.edit_message_text(
+                    chat_id=int(user_id),
+                    message_id=progress_msg.message_id,
+                    text=(
+                        f"❌ FixedFloat создал ордер {escape_html(order_id)}, но не вернул security token. "
+                        "Ордер сохранён и заблокирован для ручной проверки; средства не отправлялись."
+                    ),
+                    parse_mode="HTML",
+                )
+                return
             
             # Проверяем есть ли настроенный кошелёк для автоматической отправки
             async with db.execute(
@@ -4343,9 +4499,9 @@ async def cmd_execute(message: Message):
 
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute(
-                    "INSERT INTO sent_transactions (user_id, plan_id, order_id, network_key, amount, deposit_address, state) "
-                    "VALUES (?, ?, ?, ?, ?, ?, 'sending')",
-                    (user_id, plan_id, order_id, from_asset, required_amount, deposit_address)
+                    "INSERT INTO sent_transactions (user_id, plan_id, order_id, order_token, network_key, amount, deposit_address, state) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'sending')",
+                    (user_id, plan_id, order_id, order_token, from_asset, required_amount, deposit_address)
                 )
                 await db.commit()
             
@@ -4581,7 +4737,7 @@ async def cmd_status(message: Message):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT id, from_asset, amount, interval_hours, btc_address, next_run, active, "
-            "active_order_id, active_order_address, active_order_amount, active_order_expires, "
+            "active_order_id, active_order_token, active_order_address, active_order_amount, active_order_expires, "
             "execution_state, confirmation_expires_at "
             "FROM dca_plans WHERE user_id = ? AND deleted = 0 ORDER BY id", 
             (user_id,)
@@ -4622,7 +4778,7 @@ async def cmd_status(message: Message):
     # Экранные индексы существуют только в mapping последнего /status.
     for index, plan in enumerate(plans, start=1):
         plan_id, from_asset, amount, interval_hours, btc_address, next_run, active, \
-        order_id, order_address, order_amount, order_expires, execution_state, confirmation_expires_at = plan
+        order_id, order_token, order_address, order_amount, order_expires, execution_state, confirmation_expires_at = plan
         _user_plan_mapping[user_id][index] = int(plan_id)
         
         status_emoji = "🟢" if active else "🔴"
@@ -4650,7 +4806,7 @@ async def cmd_status(message: Message):
         
         # Проверяем есть ли активный ордер (и не истёк ли он)
         if active and order_id and order_expires:
-            ff_order_status = await get_fixedfloat_order_status(order_id)
+            ff_order_status = await get_fixedfloat_order_status(order_id, order_token)
             if ff_order_status in SUCCESS_FIXEDFLOAT_ORDER_STATUSES:
                 await mark_order_completed(plan_id, order_id, f"fixedfloat_{ff_order_status}")
                 order_id = None
@@ -5677,16 +5833,22 @@ async def order_monitor():
             # Проверяем активные ордера в dca_plans и корректно завершаем их по фактическому статусу
             async with aiosqlite.connect(DB_PATH) as db:
                 async with db.execute(
-                    "SELECT id, active_order_id, active_order_expires FROM dca_plans "
+                    "SELECT id, active_order_id, active_order_token, active_order_expires FROM dca_plans "
                     "WHERE active_order_id IS NOT NULL"
                 ) as active_cur:
                     active_orders = await active_cur.fetchall()
 
-            for plan_id, order_id, active_order_expires in active_orders:
+            for plan_id, order_id, order_token, active_order_expires in active_orders:
+                if not order_token:
+                    logger.warning(
+                        "FixedFloat order token unavailable for order %s; keeping order active",
+                        order_id,
+                    )
+                    continue
                 if active_order_expires and int(active_order_expires) <= now:
                     await notify_and_clear_expired_order(plan_id, order_id)
                     continue
-                status = await get_fixedfloat_order_status_with_retry(order_id)
+                status = await get_fixedfloat_order_status_with_retry(order_id, order_token)
                 if status in SUCCESS_FIXEDFLOAT_ORDER_STATUSES:
                     await mark_order_completed(plan_id, order_id, f"fixedfloat_{status}")
                     continue
@@ -5701,7 +5863,7 @@ async def order_monitor():
             async with aiosqlite.connect(DB_PATH) as db:
                 # Получаем все отправленные ордера без history-записи
                 async with db.execute(
-                    "SELECT st.order_id, st.user_id, st.plan_id, st.network_key, st.amount, "
+                    "SELECT st.order_id, st.order_token, st.user_id, st.plan_id, st.network_key, st.amount, "
                     "st.transfer_tx_hash, st.sent_at, dp.btc_address, dp.active_order_expires, COALESCE(co.notified, 0) "
                     "FROM sent_transactions st "
                     "JOIN dca_plans dp ON st.plan_id = dp.id "
@@ -5714,17 +5876,17 @@ async def order_monitor():
                 ) as cursor:
                     orders_to_check = await cursor.fetchall()
             
-            for order_id, user_id, plan_id, network_key, amount, transfer_tx_hash, sent_at, btc_address, active_order_expires, notified_stage in orders_to_check:
+            for order_id, order_token, user_id, plan_id, network_key, amount, transfer_tx_hash, sent_at, btc_address, active_order_expires, notified_stage in orders_to_check:
                 try:
                     plan_number = await get_plan_display_number(int(user_id), int(plan_id))
-                    status = await get_fixedfloat_order_status_with_retry(order_id)
+                    status = await get_fixedfloat_order_status_with_retry(order_id, order_token)
                     if status in SUCCESS_FIXEDFLOAT_ORDER_STATUSES:
                         await mark_order_completed(plan_id, order_id, f"fixedfloat_{status}")
                         btc_txid = await fetch_btc_txid(order_id)
                         if btc_txid:
                             tx_observation = await fetch_btc_tx_observation(btc_txid)
                             confirmations = int(tx_observation.get("confirmations", 0) or 0)
-                            order_data = await fetch_fixedfloat_order_details(order_id)
+                            order_data = await fetch_fixedfloat_order_details(order_id, order_token)
                             btc_amount = extract_btc_amount_from_order_data(order_data)
                             if confirmations >= 1:
                                 completion_text = build_purchase_success_notification(
@@ -5757,7 +5919,7 @@ async def order_monitor():
                             else:
                                 logger.info("BTC tx pending confirmations for order %s", order_id)
                         else:
-                            order_data = await fetch_fixedfloat_order_details(order_id)
+                            order_data = await fetch_fixedfloat_order_details(order_id, order_token)
                             if is_requote_order_state(order_data):
                                 await update_order_progress_message(
                                     int(user_id),

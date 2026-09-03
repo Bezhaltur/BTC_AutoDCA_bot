@@ -134,6 +134,7 @@ def harness(tmp_path, monkeypatch):
             sequence = len(fixedfloat_calls)
         return {
             "id": f"fake-order-{sequence}",
+            "token": f"fake-token-{sequence}",
             "from": {
                 "code": "USDTARB",
                 "amount": str(amount),
@@ -276,9 +277,80 @@ def test_double_confirm_claims_once_and_creates_one_fake_order(harness, monkeypa
     assert len(harness.fixedfloat_calls) == 1
     assert harness.claimed_states == ["claiming"]
     assert row["active_order_id"] == "fake-order-1"
+    assert row["active_order_token"] == "fake-token-1"
     assert row["execution_state"] == "scheduled"
     all_answers = [answer[0] for callback in (first, second) for answer in callback.answers]
     assert sorted(all_answers) == sorted(["Запускаю покупку.", "Этот запрос уже обработан."])
+
+
+def test_new_order_without_token_is_blocked_without_send_or_duplicate(harness, monkeypatch):
+    now = 1_700_000_100
+    scheduled_at = 1_700_000_000
+    monkeypatch.setattr(app.time, "time", lambda: now)
+    create_calls = []
+    send_calls = []
+
+    def fake_create_without_token(network_key, amount, btc_address):
+        create_calls.append((network_key, amount, btc_address))
+        return {
+            "id": "created-without-token",
+            "from": {
+                "code": "USDTARB",
+                "amount": str(amount),
+                "address": "0x1111111111111111111111111111111111111111",
+            },
+            "time": {"left": 900},
+        }
+
+    async def fake_auto_send(*args, **kwargs):
+        send_calls.append((args, kwargs))
+        return True, None, "0xtx", ""
+
+    monkeypatch.setattr(app, "create_fixedfloat_order", fake_create_without_token)
+    monkeypatch.setattr(app, "auto_send_usdt", fake_auto_send)
+
+    async def scenario():
+        plan_id = await harness.add_plan(
+            state="awaiting_confirmation",
+            next_run=scheduled_at,
+            message_id=199,
+            expires_at=now + 300,
+            scheduled_at=scheduled_at,
+        )
+        async with app.aiosqlite.connect(harness.db_path) as db:
+            await db.execute(
+                "INSERT INTO wallets (user_id, wallet_address) VALUES (?, ?)",
+                (USER_ID, "0x2222222222222222222222222222222222222222"),
+            )
+            await db.commit()
+        app._wallet_passwords[USER_ID] = "test-password"
+
+        callback = FakeCallback(f"dca_confirm:{plan_id}:{scheduled_at}", message_id=199)
+        await app.cb_dca_confirm(callback)
+
+        class ExecuteMessage:
+            from_user = SimpleNamespace(id=USER_ID)
+            text = "/execute_1"
+
+            async def answer(self, text, **kwargs):
+                return await harness.bot.send_message(USER_ID, text, **kwargs)
+
+        await app.cmd_execute(ExecuteMessage())
+        return plan_id
+
+    plan_id = asyncio.run(scenario())
+    row = harness.plan(plan_id)
+    with sqlite3.connect(harness.db_path) as db:
+        sent_count = db.execute(
+            "SELECT COUNT(*) FROM sent_transactions WHERE plan_id = ?", (plan_id,)
+        ).fetchone()[0]
+
+    assert row["active_order_id"] == "created-without-token"
+    assert row["active_order_token"] is None
+    assert row["execution_state"] == "scheduled"
+    assert len(create_calls) == 1
+    assert send_calls == []
+    assert sent_count == 0
 
 
 def test_restart_recovery_expires_only_due_and_resets_stale_claims(harness, monkeypatch):
