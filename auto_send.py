@@ -11,6 +11,8 @@ from web3 import Web3
 from web3.exceptions import TimeExhausted, TransactionNotFound
 from networks import get_network_config, get_blockchair_url
 from erc20 import (
+    PreparedTransactionConflict,
+    TransactionBroadcastUncertain,
     get_web3_instance,
     get_usdt_balance,
     get_native_balance,
@@ -54,7 +56,8 @@ async def auto_send_usdt(
     required_amount: float,
     btc_address: str,
     order_id: str,
-    dry_run: bool = False
+    dry_run: bool = False,
+    persist_prepared_tx=None,
 ) -> Tuple[bool, Optional[str], Optional[str], str]:
     """
     Automatically send USDT to FixedFloat deposit address.
@@ -232,7 +235,8 @@ async def auto_send_usdt(
                         approve_tx_hash = await asyncio.to_thread(
                             approve_usdt,
                             w3, network_key, private_key,
-                            deposit_address_checksum, required_amount, dry_run
+                            deposit_address_checksum, required_amount, dry_run,
+                            persist_prepared_tx,
                         )
                     
                     if dry_run:
@@ -246,6 +250,12 @@ async def auto_send_usdt(
                         except TimeExhausted:
                             logger.warning(f"Approve tx pending confirmation: {approve_tx_hash}")
                             return (False, approve_tx_hash, None, f"APPROVE_TX_PENDING:{approve_tx_hash}")
+                        except Exception as receipt_err:
+                            logger.warning(
+                                "Approve tx status unknown, keeping pending: %s, err=%s",
+                                approve_tx_hash, receipt_err,
+                            )
+                            return (False, approve_tx_hash, None, f"APPROVE_TX_PENDING:{approve_tx_hash}")
                         if receipt.status != 1:
                             logger.error(f"✗ Approve transaction failed: {approve_tx_hash}")
                             return (False, approve_tx_hash, None, "Approve transaction failed")
@@ -253,6 +263,13 @@ async def auto_send_usdt(
                     else:
                         logger.error(f"✗ Approve transaction returned None")
                         return (False, None, None, "Approve transaction failed")
+                except TransactionBroadcastUncertain as e:
+                    approve_tx_hash = e.tx_hash
+                    logger.warning("Approve broadcast status unknown: %s", approve_tx_hash)
+                    return (False, approve_tx_hash, None, f"APPROVE_TX_PENDING:{approve_tx_hash}")
+                except PreparedTransactionConflict as e:
+                    logger.warning("Approve persistence conflict; keeping order unresolved: %s", e)
+                    return (False, None, None, f"PERSISTENCE_CONFLICT:{e}")
                 except Exception as e:
                     logger.error(f"✗ Approve failed: {e}")
                     return (False, None, None, f"Approve failed: {e}")
@@ -268,7 +285,8 @@ async def auto_send_usdt(
                     transfer_tx_hash = await asyncio.to_thread(
                         transfer_usdt,
                         w3, network_key, private_key,
-                        deposit_address_checksum, required_amount, dry_run
+                        deposit_address_checksum, required_amount, dry_run,
+                        persist_prepared_tx,
                     )
                 
                 if dry_run:
@@ -296,6 +314,9 @@ async def auto_send_usdt(
                     except Exception as receipt_err:
                         logger.warning(f"Transfer tx status unknown, keeping pending: {transfer_tx_hash}, err={receipt_err}")
                         return (False, approve_tx_hash, transfer_tx_hash, f"TX_PENDING:{transfer_tx_hash}")
+                except Exception as receipt_err:
+                    logger.warning(f"Transfer tx status unknown, keeping pending: {transfer_tx_hash}, err={receipt_err}")
+                    return (False, approve_tx_hash, transfer_tx_hash, f"TX_PENDING:{transfer_tx_hash}")
                 if receipt.status != 1:
                     logger.error(f"✗ Transfer transaction failed: {transfer_tx_hash}")
                     return (False, approve_tx_hash, transfer_tx_hash, "Transfer transaction failed")
@@ -309,6 +330,13 @@ async def auto_send_usdt(
                 
                 return (True, approve_tx_hash, transfer_tx_hash, "")
                 
+            except TransactionBroadcastUncertain as e:
+                transfer_tx_hash = e.tx_hash
+                logger.warning("Transfer broadcast status unknown: %s", transfer_tx_hash)
+                return (False, approve_tx_hash, transfer_tx_hash, f"TX_PENDING:{transfer_tx_hash}")
+            except PreparedTransactionConflict as e:
+                logger.warning("Transfer persistence conflict; keeping order unresolved: %s", e)
+                return (False, approve_tx_hash, None, f"PERSISTENCE_CONFLICT:{e}")
             except Exception as e:
                 logger.error(f"✗ Transfer failed: {e}")
                 return (False, approve_tx_hash, transfer_tx_hash, f"Transfer failed: {e}")

@@ -14,6 +14,18 @@ from requests.exceptions import Timeout as RequestsTimeout, ConnectionError as R
 
 logger = logging.getLogger(__name__)
 
+
+class TransactionBroadcastUncertain(RuntimeError):
+    """Broadcast may have reached the network; never replace it with a new nonce."""
+
+    def __init__(self, tx_hash: str, message: str):
+        super().__init__(message)
+        self.tx_hash = tx_hash
+
+
+class PreparedTransactionConflict(RuntimeError):
+    """A different signed intent is already persisted for this logical action."""
+
 ARBITRUM_RPC_URLS = [
     "https://arb1.arbitrum.io/rpc",
     "https://rpc.ankr.com/arbitrum",
@@ -216,47 +228,107 @@ def send_transaction_with_retry(
     tx_builder,
     *,
     network_key: str,
-    action_name: str
+    action_name: str,
+    persist_prepared_tx=None,
 ) -> tuple[str, dict]:
     """
     Send signed transaction with retries for temporary RPC issues.
     Returns (tx_hash_hex, tx_dict_used_for_successful_send).
     """
-    last_error = None
-    provider_url = _get_provider_url(w3)
+    if persist_prepared_tx is None:
+        raise RuntimeError("Prepared transaction persistence is required before broadcast")
 
+    tx = tx_builder()
+    signed_tx = account.sign_transaction(tx)
+    raw_tx = getattr(signed_tx, "rawTransaction", None)
+    if raw_tx is None:
+        raw_tx = signed_tx.raw_transaction
+    tx_hash_hex = Web3.keccak(raw_tx).hex()
+    raw_tx_hex = Web3.to_hex(raw_tx)
+
+    try:
+        persist_prepared_tx(action_name, tx_hash_hex, int(tx["nonce"]), raw_tx_hex)
+    except PreparedTransactionConflict:
+        raise
+    except Exception as e:
+        raise PreparedTransactionConflict(
+            f"Prepared {action_name} transaction persistence did not complete"
+        ) from e
+
+    _broadcast_raw_transaction_with_retry(w3, raw_tx, tx_hash_hex, action_name=action_name)
+    return tx_hash_hex, tx
+
+
+def _broadcast_raw_transaction_with_retry(
+    w3: Web3,
+    raw_tx,
+    tx_hash_hex: str,
+    *,
+    action_name: str,
+) -> str:
+    """Retry broadcast using only one already-signed transaction."""
+    provider_url = _get_provider_url(w3)
+    last_error = None
     for attempt in range(1, TX_SEND_MAX_ATTEMPTS + 1):
         try:
             if not w3.is_connected():
                 raise ConnectionError(f"Web3 provider is not connected: {provider_url}")
-
-            tx = tx_builder()
-            signed_tx = account.sign_transaction(tx)
-            tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
-            tx_hash_hex = tx_hash.hex()
-            logger.info(
-                "%s transaction sent on attempt %s/%s via %s: %s",
-                action_name, attempt, TX_SEND_MAX_ATTEMPTS, provider_url, tx_hash_hex
-            )
-            return tx_hash_hex, tx
+            returned_hash = w3.eth.send_raw_transaction(raw_tx).hex()
+            if returned_hash.lower() != tx_hash_hex.lower():
+                raise TransactionBroadcastUncertain(
+                    tx_hash_hex,
+                    f"{action_name} RPC returned hash {returned_hash}, "
+                    f"local signed hash is {tx_hash_hex}",
+                )
+            return tx_hash_hex
+        except TransactionBroadcastUncertain:
+            raise
         except Exception as e:
             last_error = e
-            retryable = _is_retryable_send_error(e)
-            logger.warning(
-                "%s transaction attempt %s/%s failed via %s: %s",
-                action_name, attempt, TX_SEND_MAX_ATTEMPTS, provider_url, e
-            )
-            if not retryable or attempt >= TX_SEND_MAX_ATTEMPTS:
-                break
+            error_text = str(e).lower()
+            if "already known" in error_text or "known transaction" in error_text:
+                return tx_hash_hex
+            if "nonce too low" in error_text:
+                raise TransactionBroadcastUncertain(
+                    tx_hash_hex,
+                    f"{action_name} transaction broadcast status is uncertain: {e}",
+                ) from e
+            if not _is_retryable_send_error(e) or attempt >= TX_SEND_MAX_ATTEMPTS:
+                raise TransactionBroadcastUncertain(
+                    tx_hash_hex,
+                    f"{action_name} transaction broadcast status is uncertain: {e}",
+                ) from e
             logger.info(
                 "Retrying %s transaction in %.1fs (attempt %s/%s)",
-                action_name, TX_RETRY_DELAY_SECONDS, attempt + 1, TX_SEND_MAX_ATTEMPTS
+                action_name, TX_RETRY_DELAY_SECONDS, attempt + 1, TX_SEND_MAX_ATTEMPTS,
             )
             time.sleep(TX_RETRY_DELAY_SECONDS)
 
-    raise RuntimeError(
-        f"Failed to send {action_name} transaction after {TX_SEND_MAX_ATTEMPTS} attempts: {last_error}"
+    raise TransactionBroadcastUncertain(
+        tx_hash_hex,
+        f"{action_name} transaction broadcast status is uncertain: {last_error}",
     ) from last_error
+
+
+def rebroadcast_raw_transaction(
+    w3: Web3,
+    raw_tx_hex: str,
+    expected_tx_hash: str,
+    *,
+    action_name: str,
+) -> str:
+    """Rebroadcast a persisted signed transaction without rebuilding it or changing nonce."""
+    raw_tx = Web3.to_bytes(hexstr=raw_tx_hex)
+    local_hash = Web3.keccak(raw_tx).hex()
+    if local_hash.lower() != expected_tx_hash.lower():
+        raise ValueError(
+            f"Persisted {action_name} raw transaction hash mismatch: "
+            f"expected {expected_tx_hash}, got {local_hash}"
+        )
+
+    return _broadcast_raw_transaction_with_retry(
+        w3, raw_tx, local_hash, action_name=action_name
+    )
 
 
 def create_web3_client(network_key: str) -> Web3:
@@ -502,7 +574,8 @@ def approve_usdt(
     private_key: str,
     spender_address: str,
     amount: float,
-    dry_run: bool = False
+    dry_run: bool = False,
+    persist_prepared_tx=None,
 ) -> Optional[str]:
     """
     Approve USDT spending (exact amount only).
@@ -541,13 +614,12 @@ def approve_usdt(
                 "chainId": get_network_config(network_key)["chain_id"],
             })
 
-        tx = build_approve_tx()
-        
         masked_from = f"{from_address[:6]}...{from_address[-4:]}" if len(from_address) > 10 else from_address
         masked_spender = f"{spender_address[:6]}...{spender_address[-4:]}" if len(spender_address) > 10 else spender_address
-        gas_label, gas_cost = _format_gas_label_and_cost(w3, tx)
         
         if dry_run:
+            tx = build_approve_tx()
+            gas_label, gas_cost = _format_gas_label_and_cost(w3, tx)
             logger.info(f"[DRY RUN] Approve transaction prepared:")
             logger.info(f"  Network: {network_key}")
             logger.info(f"  From: {masked_from}")
@@ -570,12 +642,15 @@ def approve_usdt(
             tx_builder=build_approve_tx,
             network_key=network_key,
             action_name="approve",
+            persist_prepared_tx=persist_prepared_tx,
         )
         
         tx_gas_label, _ = _format_gas_label_and_cost(w3, tx_used)
         logger.info(f"Approve transaction sent: {tx_hash_hex}, gas={tx_used['gas']}, gas={tx_gas_label}")
         return tx_hash_hex
         
+    except (TransactionBroadcastUncertain, PreparedTransactionConflict):
+        raise
     except Exception as e:
         logger.error(f"Error approving USDT: {e}")
         raise RuntimeError(f"Failed to approve USDT: {e}")
@@ -587,7 +662,8 @@ def transfer_usdt(
     private_key: str,
     to_address: str,
     amount: float,
-    dry_run: bool = False
+    dry_run: bool = False,
+    persist_prepared_tx=None,
 ) -> Optional[str]:
     """
     Transfer USDT to address.
@@ -626,13 +702,12 @@ def transfer_usdt(
                 "chainId": get_network_config(network_key)["chain_id"],
             })
 
-        tx = build_transfer_tx()
-        
         masked_from = f"{from_address[:6]}...{from_address[-4:]}" if len(from_address) > 10 else from_address
         masked_to = f"{to_address[:6]}...{to_address[-4:]}" if len(to_address) > 10 else to_address
-        gas_label, gas_cost = _format_gas_label_and_cost(w3, tx)
         
         if dry_run:
+            tx = build_transfer_tx()
+            gas_label, gas_cost = _format_gas_label_and_cost(w3, tx)
             logger.info(f"[DRY RUN] Transfer transaction prepared:")
             logger.info(f"  Network: {network_key}")
             logger.info(f"  From: {masked_from}")
@@ -655,12 +730,15 @@ def transfer_usdt(
             tx_builder=build_transfer_tx,
             network_key=network_key,
             action_name="transfer",
+            persist_prepared_tx=persist_prepared_tx,
         )
         
         tx_gas_label, _ = _format_gas_label_and_cost(w3, tx_used)
         logger.info(f"Transfer transaction sent: {tx_hash_hex}, gas={tx_used['gas']}, gas={tx_gas_label}")
         return tx_hash_hex
         
+    except (TransactionBroadcastUncertain, PreparedTransactionConflict):
+        raise
     except Exception as e:
         logger.error(f"Error transferring USDT: {e}")
         raise RuntimeError(f"Failed to transfer USDT: {e}")
