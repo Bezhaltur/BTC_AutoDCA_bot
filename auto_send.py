@@ -1,6 +1,6 @@
 """
 Automatic USDT sending to FixedFloat deposit addresses.
-Handles all checks, approvals, and transfers.
+Handles all checks and direct transfers.
 """
 
 import asyncio
@@ -16,12 +16,9 @@ from erc20 import (
     get_web3_instance,
     get_usdt_balance,
     get_native_balance,
-    approve_usdt,
     transfer_usdt,
-    estimate_gas_for_approve,
     estimate_gas_for_transfer,
     build_gas_params,
-    check_allowance,
 )
 from wallet import load_keystore, decrypt_private_key
 
@@ -67,8 +64,7 @@ async def auto_send_usdt(
     - BTC address validation
     - USDT balance check
     - Native token balance check
-    - Approval (if needed)
-    - Transfer
+    - Direct transfer
     
     Args:
         network_key: Network key (e.g., "USDT-ARB")
@@ -83,7 +79,7 @@ async def auto_send_usdt(
     Returns:
         Tuple of (success, approve_tx_hash, transfer_tx_hash, error_message)
         - success: True if transfer succeeded
-        - approve_tx_hash: Transaction hash for approve (None if not needed)
+        - approve_tx_hash: Always None for new direct transfers
         - transfer_tx_hash: Transaction hash for transfer
         - error_message: Error message if failed
     """
@@ -162,16 +158,13 @@ async def auto_send_usdt(
             )
         logger.info(f"✓ USDT balance sufficient")
         
-        # Check 4: Estimate gas for both transactions
-        logger.info(f"Check 4: Estimating gas for transactions...")
+        # Check 4: Estimate gas for the direct transfer
+        logger.info(f"Check 4: Estimating gas for transfer...")
         try:
-            approve_gas = await asyncio.to_thread(
-                estimate_gas_for_approve, w3, network_key, wallet_address, deposit_address_checksum, required_amount
-            )
             transfer_gas = await asyncio.to_thread(
                 estimate_gas_for_transfer, w3, network_key, wallet_address, deposit_address_checksum, required_amount
             )
-            total_gas = approve_gas + transfer_gas
+            total_gas = transfer_gas
             
             gas_params = await asyncio.to_thread(build_gas_params, w3, network_key)
             if "gasPrice" in gas_params:
@@ -189,7 +182,6 @@ async def auto_send_usdt(
             min_native_required = float(total_gas_cost) * MIN_NATIVE_MULTIPLIER
             
             logger.info(f"✓ Gas estimation complete:")
-            logger.info(f"  Approve gas: {approve_gas}")
             logger.info(f"  Transfer gas: {transfer_gas}")
             logger.info(f"  Total gas: {total_gas}")
             logger.info(f"  Gas params: {gas_label}")
@@ -218,66 +210,7 @@ async def auto_send_usdt(
         transfer_tx_hash = None
         send_lock = await _get_wallet_send_lock(network_key, wallet_address)
         async with send_lock:
-            # Check current allowance
-            logger.info(f"Checking current USDT allowance...")
-            current_allowance = await asyncio.to_thread(
-                check_allowance, w3, network_key, wallet_address, deposit_address_checksum
-            )
-            logger.info(f"Current allowance: {current_allowance:.6f} USDT")
-            
-            if current_allowance < required_amount:
-                # Need to approve
-                logger.info(f"Step 1: Approving {required_amount:.6f} USDT to {masked_deposit}")
-                try:
-                    if approve_tx_hash:
-                        logger.info(f"Approve tx already exists, skip new approve: {approve_tx_hash}")
-                    else:
-                        approve_tx_hash = await asyncio.to_thread(
-                            approve_usdt,
-                            w3, network_key, private_key,
-                            deposit_address_checksum, required_amount, dry_run,
-                            persist_prepared_tx,
-                        )
-                    
-                    if dry_run:
-                        logger.info(f"[DRY RUN] Approve step completed (no transaction sent)")
-                    elif approve_tx_hash:
-                        logger.info(f"Waiting for approve transaction confirmation...")
-                        try:
-                            receipt = await asyncio.to_thread(
-                                w3.eth.wait_for_transaction_receipt, approve_tx_hash, timeout=120
-                            )
-                        except TimeExhausted:
-                            logger.warning(f"Approve tx pending confirmation: {approve_tx_hash}")
-                            return (False, approve_tx_hash, None, f"APPROVE_TX_PENDING:{approve_tx_hash}")
-                        except Exception as receipt_err:
-                            logger.warning(
-                                "Approve tx status unknown, keeping pending: %s, err=%s",
-                                approve_tx_hash, receipt_err,
-                            )
-                            return (False, approve_tx_hash, None, f"APPROVE_TX_PENDING:{approve_tx_hash}")
-                        if receipt.status != 1:
-                            logger.error(f"✗ Approve transaction failed: {approve_tx_hash}")
-                            return (False, approve_tx_hash, None, "Approve transaction failed")
-                        logger.info(f"✓ Approve transaction confirmed: {approve_tx_hash}, block={receipt.blockNumber}")
-                    else:
-                        logger.error(f"✗ Approve transaction returned None")
-                        return (False, None, None, "Approve transaction failed")
-                except TransactionBroadcastUncertain as e:
-                    approve_tx_hash = e.tx_hash
-                    logger.warning("Approve broadcast status unknown: %s", approve_tx_hash)
-                    return (False, approve_tx_hash, None, f"APPROVE_TX_PENDING:{approve_tx_hash}")
-                except PreparedTransactionConflict as e:
-                    logger.warning("Approve persistence conflict; keeping order unresolved: %s", e)
-                    return (False, None, None, f"PERSISTENCE_CONFLICT:{e}")
-                except Exception as e:
-                    logger.error(f"✗ Approve failed: {e}")
-                    return (False, None, None, f"Approve failed: {e}")
-            else:
-                logger.info(f"✓ Sufficient allowance already exists: {current_allowance:.6f} USDT (no approve needed)")
-            
-            # Transfer USDT
-            logger.info(f"Step 2: Transferring {required_amount:.6f} USDT to {masked_deposit}")
+            logger.info(f"Transferring {required_amount:.6f} USDT to {masked_deposit}")
             try:
                 if transfer_tx_hash:
                     logger.info(f"Transfer tx already exists, skip new transfer: {transfer_tx_hash}")

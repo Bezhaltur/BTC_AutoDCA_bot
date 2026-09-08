@@ -233,10 +233,8 @@ def test_unknown_receipt_error_keeps_transfer_pending(monkeypatch):
     monkeypatch.setattr(sender, "get_network_config", lambda _network: {"native_token": "ETH"})
     monkeypatch.setattr(sender, "get_usdt_balance", lambda *_args: 100.0)
     monkeypatch.setattr(sender, "get_native_balance", lambda *_args: 10.0)
-    monkeypatch.setattr(sender, "estimate_gas_for_approve", lambda *_args: 50_000)
     monkeypatch.setattr(sender, "estimate_gas_for_transfer", lambda *_args: 75_000)
     monkeypatch.setattr(sender, "build_gas_params", lambda *_args: {"gasPrice": 1})
-    monkeypatch.setattr(sender, "check_allowance", lambda *_args: 100.0)
 
     def fake_transfer(*args):
         persist = args[-1]
@@ -261,6 +259,282 @@ def test_unknown_receipt_error_keeps_transfer_pending(monkeypatch):
 
     assert result == (False, None, transfer_hash, f"TX_PENDING:{transfer_hash}")
     assert persisted == [("transfer", transfer_hash, 9, "0xdeadbeef")]
+
+
+def configure_direct_send(monkeypatch, *, receipt_status=1, native_balance=2e-13):
+    class ReceiptEth:
+        def wait_for_transaction_receipt(self, _tx_hash, timeout):
+            assert timeout == 120
+            return SimpleNamespace(status=receipt_status, blockNumber=123)
+
+    class FakeWeb3:
+        eth = ReceiptEth()
+
+        @staticmethod
+        def from_wei(value, _unit):
+            return value / 10**18
+
+    monkeypatch.setattr(sender, "load_keystore", lambda _user_id: {"crypto": {}})
+    monkeypatch.setattr(sender, "decrypt_private_key", lambda _keystore, _password: "1" * 64)
+    monkeypatch.setattr(sender, "get_web3_instance", lambda _network: FakeWeb3())
+    monkeypatch.setattr(sender, "get_network_config", lambda _network: {"native_token": "ETH"})
+    monkeypatch.setattr(sender, "get_usdt_balance", lambda *_args: 100.0)
+    monkeypatch.setattr(sender, "get_native_balance", lambda *_args: native_balance)
+    monkeypatch.setattr(sender, "estimate_gas_for_transfer", lambda *_args: 75_000)
+    monkeypatch.setattr(sender, "build_gas_params", lambda *_args: {"gasPrice": 1})
+    sender._SEND_LOCKS.clear()
+
+
+def test_new_direct_flow_skips_zero_allowance_and_approve(monkeypatch):
+    configure_direct_send(monkeypatch)
+    transfer_hash = "0x" + "34" * 32
+    deposit_address = "0x1111111111111111111111111111111111111111"
+    allowance_calls = []
+    approve_calls = []
+    transfer_calls = []
+    persisted = []
+
+    def zero_allowance(*args):
+        allowance_calls.append(args)
+        return 0.0
+
+    def forbidden_approve(*args):
+        approve_calls.append(args)
+        raise AssertionError("new direct flow must not approve")
+
+    def direct_transfer(*args):
+        transfer_calls.append(args)
+        args[-1]("transfer", transfer_hash, 9, "0xdeadbeef")
+        return transfer_hash
+
+    monkeypatch.setattr(erc20, "check_allowance", zero_allowance)
+    monkeypatch.setattr(erc20, "approve_usdt", forbidden_approve)
+    monkeypatch.setattr(sender, "transfer_usdt", direct_transfer)
+
+    result = asyncio.run(
+        sender.auto_send_usdt(
+            network_key="USDT-ARB",
+            user_id=10001,
+            wallet_password="test-password",
+            deposit_address=deposit_address,
+            required_amount=25.0,
+            btc_address="bc1unused",
+            order_id="direct-order",
+            persist_prepared_tx=lambda *values: persisted.append(values),
+        )
+    )
+
+    assert result == (True, None, transfer_hash, "")
+    assert allowance_calls == []
+    assert approve_calls == []
+    assert len(transfer_calls) == 1
+    assert transfer_calls[0][3] == Web3.to_checksum_address(deposit_address)
+    assert transfer_calls[0][4] == 25.0
+    assert transfer_calls[0][5] is False
+    assert persisted == [("transfer", transfer_hash, 9, "0xdeadbeef")]
+
+
+def test_new_direct_flow_gas_check_and_dry_run_use_only_transfer(monkeypatch):
+    configure_direct_send(monkeypatch)
+    gas_calls = []
+    transfer_calls = []
+
+    def transfer_gas(*args):
+        gas_calls.append(args)
+        return 75_000
+
+    def dry_run_transfer(*args):
+        transfer_calls.append(args)
+        return None
+
+    monkeypatch.setattr(sender, "estimate_gas_for_transfer", transfer_gas)
+    monkeypatch.setattr(sender, "transfer_usdt", dry_run_transfer)
+    monkeypatch.setattr(
+        erc20,
+        "approve_usdt",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("dry-run must not approve")),
+    )
+    monkeypatch.setattr(
+        erc20,
+        "check_allowance",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("dry-run must not check allowance")),
+    )
+    persisted = []
+
+    result = asyncio.run(
+        sender.auto_send_usdt(
+            network_key="USDT-ARB",
+            user_id=10001,
+            wallet_password="test-password",
+            deposit_address="0x1111111111111111111111111111111111111111",
+            required_amount=25.0,
+            btc_address="bc1unused",
+            order_id="dry-run-order",
+            dry_run=True,
+            persist_prepared_tx=lambda *values: persisted.append(values),
+        )
+    )
+
+    assert result == (True, None, None, "DRY RUN: Would transfer USDT")
+    assert len(gas_calls) == 1
+    assert len(transfer_calls) == 1
+    assert transfer_calls[0][5] is True
+    assert persisted == []
+
+
+def seed_legacy_approve(db_path, *, state="tx_pending"):
+    approve_raw = Web3.to_hex(b"legacy-approve-intent")
+    approve_hash = Web3.keccak(b"legacy-approve-intent").hex()
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "INSERT INTO dca_plans "
+            "(id, user_id, from_asset, amount, interval_hours, btc_address, next_run, active, deleted, "
+            "execution_state, active_order_id, active_order_token, active_order_address, "
+            "active_order_amount, active_order_expires) "
+            "VALUES (7, 10001, 'USDT-ARB', 25, 24, 'bc1unused', 1700000000, 1, 0, "
+            "'scheduled', 'legacy-approve-order', 'order-token', "
+            "'0x1111111111111111111111111111111111111111', '25 USDT', 4000000000)"
+        )
+        db.execute(
+            "INSERT INTO sent_transactions "
+            "(user_id, plan_id, order_id, order_token, network_key, approve_tx_hash, approve_tx_nonce, "
+            "approve_raw_tx, amount, deposit_address, state, error_message) "
+            "VALUES (10001, 7, 'legacy-approve-order', 'order-token', 'USDT-ARB', ?, 8, ?, "
+            "25, '0x1111111111111111111111111111111111111111', ?, ?)",
+            (approve_hash, approve_raw, state, f"APPROVE_TX_PENDING:{approve_hash}"),
+        )
+    return approve_hash, approve_raw
+
+
+def test_legacy_pending_approve_rebroadcasts_only_saved_raw(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "legacy-approve-pending.sqlite3")
+    monkeypatch.setattr(app, "DB_PATH", db_path)
+    asyncio.run(app.init_db())
+    approve_hash, approve_raw = seed_legacy_approve(db_path)
+    rebroadcasts = []
+
+    async def pending_status(_network_key, candidate_hash):
+        assert candidate_hash == approve_hash
+        return "pending"
+
+    async def capture_rebroadcast(network_key, raw_tx, tx_hash, action_name):
+        rebroadcasts.append((network_key, raw_tx, tx_hash, action_name))
+
+    monkeypatch.setattr(app, "get_transfer_tx_status", pending_status)
+    monkeypatch.setattr(app, "rebroadcast_persisted_erc20_transaction", capture_rebroadcast)
+    monkeypatch.setattr(
+        app,
+        "resume_transfer_after_approve",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("pending approve must not start transfer")),
+    )
+
+    asyncio.run(app.recovery_scan_pending_transactions())
+
+    assert rebroadcasts == [("USDT-ARB", approve_raw, approve_hash, "approve")]
+    with sqlite3.connect(db_path) as db:
+        row = db.execute(
+            "SELECT state, approve_tx_hash, approve_tx_nonce, approve_raw_tx, transfer_tx_hash "
+            "FROM sent_transactions WHERE order_id = 'legacy-approve-order'"
+        ).fetchone()
+    assert row == ("tx_pending", approve_hash, 8, approve_raw, None)
+
+
+def test_legacy_confirmed_approve_resumes_one_direct_transfer(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "legacy-approve-confirmed.sqlite3")
+    monkeypatch.setattr(app, "DB_PATH", db_path)
+    asyncio.run(app.init_db())
+    approve_hash, approve_raw = seed_legacy_approve(db_path)
+    transfer_raw = Web3.to_hex(b"legacy-transfer-intent")
+    transfer_hash = Web3.keccak(b"legacy-transfer-intent").hex()
+    sends = []
+    monkeypatch.setitem(app._wallet_passwords, 10001, "test-password")
+    configure_direct_send(monkeypatch)
+
+    async def confirmed_status(_network_key, candidate_hash):
+        assert candidate_hash == approve_hash
+        return "confirmed"
+
+    def direct_transfer(*args):
+        sends.append(args)
+        args[-1]("transfer", transfer_hash, 9, transfer_raw)
+        return transfer_hash
+
+    monkeypatch.setattr(app, "get_transfer_tx_status", confirmed_status)
+    monkeypatch.setattr(sender, "transfer_usdt", direct_transfer)
+
+    asyncio.run(app.recovery_scan_pending_transactions())
+
+    assert len(sends) == 1
+    assert sends[0][3] == Web3.to_checksum_address(
+        "0x1111111111111111111111111111111111111111"
+    )
+    assert callable(sends[0][-1])
+    with sqlite3.connect(db_path) as db:
+        row = db.execute(
+            "SELECT state, approve_tx_hash, approve_tx_nonce, approve_raw_tx, transfer_tx_hash "
+            "FROM sent_transactions WHERE order_id = 'legacy-approve-order'"
+        ).fetchone()
+    assert row == ("confirmed", approve_hash, 8, approve_raw, transfer_hash)
+
+
+def test_legacy_approve_failure_never_confirms_transfer(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "legacy-approve-failed.sqlite3")
+    monkeypatch.setattr(app, "DB_PATH", db_path)
+    asyncio.run(app.init_db())
+    approve_hash, approve_raw = seed_legacy_approve(db_path)
+
+    async def failed_status(_network_key, candidate_hash):
+        assert candidate_hash == approve_hash
+        return "failed"
+
+    monkeypatch.setattr(app, "get_transfer_tx_status", failed_status)
+    asyncio.run(app.recovery_scan_pending_transactions())
+
+    with sqlite3.connect(db_path) as db:
+        tx_row = db.execute(
+            "SELECT state, approve_tx_hash, approve_raw_tx, transfer_tx_hash "
+            "FROM sent_transactions WHERE order_id = 'legacy-approve-order'"
+        ).fetchone()
+        active_order_id = db.execute(
+            "SELECT active_order_id FROM dca_plans WHERE id = 7"
+        ).fetchone()[0]
+    assert tx_row == ("failed", approve_hash, approve_raw, None)
+    assert active_order_id is None
+
+
+def test_transfer_artifacts_take_priority_over_legacy_approve(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "legacy-transfer-priority.sqlite3")
+    monkeypatch.setattr(app, "DB_PATH", db_path)
+    asyncio.run(app.init_db())
+    approve_hash, approve_raw = seed_legacy_approve(db_path)
+    transfer_raw = Web3.to_hex(b"persisted-transfer-intent")
+    transfer_hash = Web3.keccak(b"persisted-transfer-intent").hex()
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "UPDATE sent_transactions SET transfer_tx_hash = ?, transfer_tx_nonce = 9, transfer_raw_tx = ? "
+            "WHERE order_id = 'legacy-approve-order'",
+            (transfer_hash, transfer_raw),
+        )
+    checked_hashes = []
+
+    async def confirmed_status(_network_key, candidate_hash):
+        checked_hashes.append(candidate_hash)
+        return "confirmed"
+
+    async def forbidden_resume(**_kwargs):
+        raise AssertionError("transfer artifacts must not resume approve")
+
+    monkeypatch.setattr(app, "get_transfer_tx_status", confirmed_status)
+    monkeypatch.setattr(app, "resume_transfer_after_approve", forbidden_resume)
+    asyncio.run(app.recovery_scan_pending_transactions())
+
+    assert checked_hashes == [transfer_hash]
+    with sqlite3.connect(db_path) as db:
+        row = db.execute(
+            "SELECT state, approve_tx_hash, approve_raw_tx, transfer_tx_hash, transfer_raw_tx "
+            "FROM sent_transactions WHERE order_id = 'legacy-approve-order'"
+        ).fetchone()
+    assert row == ("confirmed", approve_hash, approve_raw, transfer_hash, transfer_raw)
 
 
 def test_prepared_transaction_is_committed_before_broadcast(tmp_path, monkeypatch):
