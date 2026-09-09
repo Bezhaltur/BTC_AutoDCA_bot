@@ -3177,6 +3177,481 @@ def ensure_runtime_directories() -> None:
         os.makedirs(last_seen_dir, exist_ok=True)
 
 
+_SENT_TRANSACTION_REQUIRED_LEGACY_COLUMNS = frozenset(
+    {
+        "id",
+        "user_id",
+        "plan_id",
+        "order_id",
+        "network_key",
+        "approve_tx_hash",
+        "transfer_tx_hash",
+        "amount",
+        "deposit_address",
+        "sent_at",
+    }
+)
+_SENT_TRANSACTION_STATE_COLUMNS = frozenset({"state", "error_message"})
+_SENT_TRANSACTION_TOKEN_COLUMNS = frozenset({"order_token"})
+_SENT_TRANSACTION_INTENT_COLUMNS = frozenset(
+    {
+        "approve_tx_nonce",
+        "approve_raw_tx",
+        "transfer_tx_nonce",
+        "transfer_raw_tx",
+    }
+)
+_SENT_TRANSACTION_EXACT_AMOUNT_COLUMNS = frozenset(
+    {"amount_units", "token_decimals"}
+)
+_SUPPORTED_SENT_TRANSACTION_REBUILD_COLUMNS = frozenset(
+    _SENT_TRANSACTION_REQUIRED_LEGACY_COLUMNS
+    | state_columns
+    | token_columns
+    | intent_columns
+    | exact_amount_columns
+    for state_columns in (frozenset(), _SENT_TRANSACTION_STATE_COLUMNS)
+    for token_columns in (frozenset(), _SENT_TRANSACTION_TOKEN_COLUMNS)
+    for intent_columns, exact_amount_columns in (
+        (frozenset(), frozenset()),
+        (_SENT_TRANSACTION_INTENT_COLUMNS, frozenset()),
+        (_SENT_TRANSACTION_INTENT_COLUMNS, _SENT_TRANSACTION_EXACT_AMOUNT_COLUMNS),
+    )
+)
+_SENT_TRANSACTION_COLUMN_ORDER = (
+    "id",
+    "user_id",
+    "plan_id",
+    "order_id",
+    "order_token",
+    "network_key",
+    "approve_tx_hash",
+    "approve_tx_nonce",
+    "approve_raw_tx",
+    "transfer_tx_hash",
+    "transfer_tx_nonce",
+    "transfer_raw_tx",
+    "amount",
+    "amount_units",
+    "token_decimals",
+    "deposit_address",
+    "state",
+    "error_message",
+    "sent_at",
+)
+_SENT_TRANSACTION_COLUMN_SHAPES = {
+    "id": ("INTEGER", 0, 1),
+    "user_id": ("INTEGER", 1, 0),
+    "plan_id": ("INTEGER", 0, 0),
+    "order_id": ("TEXT", 1, 0),
+    "order_token": ("TEXT", 0, 0),
+    "network_key": ("TEXT", 1, 0),
+    "approve_tx_hash": ("TEXT", 0, 0),
+    "approve_tx_nonce": ("INTEGER", 0, 0),
+    "approve_raw_tx": ("TEXT", 0, 0),
+    "transfer_tx_hash": ("TEXT", 1, 0),
+    "transfer_tx_nonce": ("INTEGER", 0, 0),
+    "transfer_raw_tx": ("TEXT", 0, 0),
+    "amount": ("REAL", 1, 0),
+    "amount_units": ("TEXT", 0, 0),
+    "token_decimals": ("INTEGER", 0, 0),
+    "deposit_address": ("TEXT", 1, 0),
+    "state": ("TEXT", 0, 0),
+    "error_message": ("TEXT", 0, 0),
+    "sent_at": ("INTEGER", 0, 0),
+}
+
+
+def _normalize_sqlite_default(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = "".join(str(value).split()).lower()
+    while normalized.startswith("(") and normalized.endswith(")"):
+        normalized = normalized[1:-1]
+    return normalized
+
+
+def _split_sqlite_table_clauses(create_sql: str) -> list[str]:
+    """Split CREATE TABLE body without treating nested expressions as clauses."""
+    match = re.match(
+        r"^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?sent_transactions\s*\(",
+        create_sql,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        raise RuntimeError(
+            "Unsupported sent_transactions CREATE TABLE statement; "
+            "refusing destructive rebuild"
+        )
+
+    body_start = match.end()
+    clauses = []
+    clause_start = body_start
+    depth = 1
+    quote = None
+    index = body_start
+    while index < len(create_sql):
+        char = create_sql[index]
+        if quote:
+            if quote == "]":
+                if char == "]":
+                    quote = None
+            elif char == quote:
+                if index + 1 < len(create_sql) and create_sql[index + 1] == quote:
+                    index += 1
+                else:
+                    quote = None
+        elif char in ("'", '"', "`"):
+            quote = char
+        elif char == "[":
+            quote = "]"
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                clauses.append(create_sql[clause_start:index].strip())
+                tail = create_sql[index + 1 :].strip().rstrip(";").strip()
+                if tail:
+                    raise RuntimeError(
+                        "Unsupported sent_transactions table options; "
+                        "refusing destructive rebuild"
+                    )
+                return clauses
+        elif char == "," and depth == 1:
+            clauses.append(create_sql[clause_start:index].strip())
+            clause_start = index + 1
+        index += 1
+
+    raise RuntimeError(
+        "Malformed sent_transactions CREATE TABLE statement; "
+        "refusing destructive rebuild"
+    )
+
+
+def _assert_supported_sent_transactions_table_sql(
+    create_sql: str, expected_columns: frozenset[str], expect_foreign_key: bool
+) -> None:
+    simple_columns = {
+        "user_id": r"INTEGER\s+NOT\s+NULL",
+        "plan_id": r"INTEGER",
+        "order_id": r"TEXT\s+NOT\s+NULL",
+        "order_token": r"TEXT",
+        "network_key": r"TEXT\s+NOT\s+NULL",
+        "approve_tx_hash": r"TEXT",
+        "approve_tx_nonce": r"INTEGER",
+        "approve_raw_tx": r"TEXT",
+        "transfer_tx_hash": r"TEXT\s+NOT\s+NULL",
+        "transfer_tx_nonce": r"INTEGER",
+        "transfer_raw_tx": r"TEXT",
+        "amount": r"REAL\s+NOT\s+NULL",
+        "amount_units": r"TEXT",
+        "token_decimals": r"INTEGER",
+        "deposit_address": r"TEXT\s+NOT\s+NULL",
+        "error_message": r"TEXT",
+    }
+    column_patterns = {
+        "id": r"INTEGER\s+PRIMARY\s+KEY(?:\s+AUTOINCREMENT)?",
+        **simple_columns,
+        "state": r"TEXT(?:\s+DEFAULT\s+'scheduled')?",
+        "sent_at": (
+            r"INTEGER(?:\s+DEFAULT\s+\(?\s*strftime\s*"
+            r"\(\s*'%s'\s*,\s*'now'\s*\)\s*\)?)?"
+        ),
+    }
+    foreign_key_pattern = (
+        r"FOREIGN\s+KEY\s*\(\s*plan_id\s*\)\s*"
+        r"REFERENCES\s+dca_plans\s*\(\s*id\s*\)"
+    )
+
+    seen_columns = set()
+    foreign_key_count = 0
+    for clause in _split_sqlite_table_clauses(create_sql):
+        if re.fullmatch(foreign_key_pattern, clause, flags=re.IGNORECASE):
+            foreign_key_count += 1
+            continue
+        name_match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\b", clause)
+        column_name = name_match.group(1).lower() if name_match else ""
+        pattern = column_patterns.get(column_name)
+        if not pattern or not re.fullmatch(
+            rf"{re.escape(column_name)}\s+{pattern}",
+            clause,
+            flags=re.IGNORECASE,
+        ):
+            raise RuntimeError(
+                "Unsupported sent_transactions table-level or column semantics; "
+                "refusing destructive rebuild"
+            )
+        if column_name in seen_columns:
+            raise RuntimeError(
+                "Duplicate sent_transactions column definition; "
+                "refusing destructive rebuild"
+            )
+        seen_columns.add(column_name)
+
+    if seen_columns != set(expected_columns):
+        raise RuntimeError(
+            "sent_transactions CREATE TABLE columns do not match table_xinfo; "
+            "refusing destructive rebuild"
+        )
+    if foreign_key_count != int(expect_foreign_key):
+        raise RuntimeError(
+            "sent_transactions CREATE TABLE foreign key does not match fingerprint; "
+            "refusing destructive rebuild"
+        )
+
+
+async def _inspect_supported_sent_transactions_rebuild_schema(db, tx_columns):
+    """Validate the complete legacy table shape before any destructive DDL."""
+    hidden_columns = [str(column[1]) for column in tx_columns if int(column[6]) != 0]
+    if hidden_columns:
+        raise RuntimeError(
+            "Unsupported hidden/generated sent_transactions columns; "
+            f"refusing destructive rebuild (columns={hidden_columns!r})"
+        )
+    columns_by_name = {str(column[1]): column for column in tx_columns}
+    column_names = frozenset(columns_by_name)
+    if column_names not in _SUPPORTED_SENT_TRANSACTION_REBUILD_COLUMNS:
+        unknown = sorted(column_names - set(_SENT_TRANSACTION_COLUMN_ORDER))
+        missing = sorted(_SENT_TRANSACTION_REQUIRED_LEGACY_COLUMNS - column_names)
+        raise RuntimeError(
+            "Unsupported sent_transactions schema; refusing destructive rebuild "
+            f"(unknown_columns={unknown}, missing_columns={missing})"
+        )
+
+    for column_name, column in columns_by_name.items():
+        expected_type, expected_notnull, expected_pk = _SENT_TRANSACTION_COLUMN_SHAPES[
+            column_name
+        ]
+        actual_shape = (str(column[2]).upper(), int(column[3]), int(column[5]))
+        if actual_shape != (expected_type, expected_notnull, expected_pk):
+            raise RuntimeError(
+                "Conflicting sent_transactions column definition; refusing destructive "
+                f"rebuild (column={column_name!r}, actual={actual_shape!r}, "
+                f"expected={(expected_type, expected_notnull, expected_pk)!r})"
+            )
+
+        default = _normalize_sqlite_default(column[4])
+        allowed_defaults = {None}
+        if column_name == "state":
+            allowed_defaults.add("'scheduled'")
+        elif column_name == "sent_at":
+            allowed_defaults.add("strftime('%s','now')")
+        if default not in allowed_defaults:
+            raise RuntimeError(
+                "Conflicting sent_transactions column default; refusing destructive "
+                f"rebuild (column={column_name!r}, default={column[4]!r})"
+            )
+
+    async with db.execute("PRAGMA foreign_key_list(sent_transactions)") as cursor:
+        foreign_keys = await cursor.fetchall()
+    normalized_foreign_keys = [
+        (
+            str(row[2]),
+            str(row[3]),
+            str(row[4]),
+            str(row[5]).upper(),
+            str(row[6]).upper(),
+            str(row[7]).upper(),
+        )
+        for row in foreign_keys
+    ]
+    supported_foreign_key = (
+        "dca_plans",
+        "plan_id",
+        "id",
+        "NO ACTION",
+        "NO ACTION",
+        "NONE",
+    )
+    if normalized_foreign_keys not in ([], [supported_foreign_key]):
+        raise RuntimeError(
+            "Unsupported sent_transactions foreign keys; refusing destructive rebuild"
+        )
+
+    async with db.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("sent_transactions",),
+    ) as cursor:
+        table_sql_rows = await cursor.fetchall()
+    if len(table_sql_rows) != 1 or not table_sql_rows[0][0]:
+        raise RuntimeError(
+            "Missing sent_transactions CREATE TABLE definition; "
+            "refusing destructive rebuild"
+        )
+    _assert_supported_sent_transactions_table_sql(
+        str(table_sql_rows[0][0]),
+        column_names,
+        bool(normalized_foreign_keys),
+    )
+
+    async with db.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
+        ("sent_transactions",),
+    ) as cursor:
+        triggers = await cursor.fetchall()
+    if triggers:
+        raise RuntimeError(
+            "Unsupported sent_transactions triggers; refusing destructive rebuild"
+        )
+
+    async with db.execute("PRAGMA index_list(sent_transactions)") as cursor:
+        indexes = await cursor.fetchall()
+    preserve_order_id_index = False
+    for index in indexes:
+        index_name = str(index[1])
+        is_unique = int(index[2]) == 1
+        origin = str(index[3]) if len(index) > 3 else ""
+        is_partial = int(index[4]) == 1 if len(index) > 4 else False
+        async with db.execute(
+            "SELECT seqno, cid, name, desc, coll, key "
+            "FROM pragma_index_xinfo(?) ORDER BY seqno",
+            (index_name,),
+        ) as cursor:
+            index_xinfo = await cursor.fetchall()
+        key_columns = [row for row in index_xinfo if int(row[5]) == 1]
+        auxiliary_columns = [row for row in index_xinfo if int(row[5]) == 0]
+        key_is_supported = (
+            len(key_columns) == 1
+            and int(key_columns[0][1]) >= 0
+            and str(key_columns[0][2]) == "order_id"
+            and int(key_columns[0][3]) == 0
+            and str(key_columns[0][4]).upper() == "BINARY"
+        )
+        auxiliary_is_supported = (
+            len(auxiliary_columns) == 1
+            and int(auxiliary_columns[0][1]) == -1
+            and auxiliary_columns[0][2] is None
+        )
+        if (
+            index_name == "idx_sent_transactions_order_id"
+            and is_unique
+            and origin == "c"
+            and not is_partial
+            and key_is_supported
+            and auxiliary_is_supported
+        ):
+            preserve_order_id_index = True
+            continue
+        raise RuntimeError(
+            "Unsupported sent_transactions index; refusing destructive rebuild "
+            f"(index={index_name!r})"
+        )
+
+    return column_names, preserve_order_id_index
+
+
+async def _assert_sent_transactions_copy_preserved(
+    db, source_columns, expected_row_count
+):
+    async with db.execute("SELECT COUNT(*) FROM sent_transactions_new") as cursor:
+        copied_row_count = int((await cursor.fetchone())[0])
+    if copied_row_count != expected_row_count:
+        raise RuntimeError(
+            "sent_transactions rebuild row-count mismatch before DROP TABLE"
+        )
+
+    comparisons = " OR ".join(
+        f'NOT (new."{column_name}" IS old."{column_name}")'
+        for column_name in source_columns
+    )
+    async with db.execute(
+        "SELECT COUNT(*) FROM sent_transactions AS old "
+        "LEFT JOIN sent_transactions_new AS new ON new.id = old.id "
+        f"WHERE new.id IS NULL OR {comparisons}"
+    ) as cursor:
+        mismatched_rows = int((await cursor.fetchone())[0])
+    if mismatched_rows:
+        raise RuntimeError(
+            "sent_transactions rebuild value mismatch before DROP TABLE"
+        )
+
+
+async def _assert_rebuilt_sent_transactions_schema(
+    db, expected_row_count, expect_order_id_index
+):
+    async with db.execute("PRAGMA table_info(sent_transactions)") as cursor:
+        rebuilt_columns = await cursor.fetchall()
+    rebuilt_by_name = {str(column[1]): column for column in rebuilt_columns}
+    rebuilt_names = set(rebuilt_by_name)
+    if rebuilt_names != set(_SENT_TRANSACTION_COLUMN_ORDER):
+        raise RuntimeError("sent_transactions rebuild produced an unexpected column set")
+    for column_name, column in rebuilt_by_name.items():
+        expected_type, expected_notnull, expected_pk = _SENT_TRANSACTION_COLUMN_SHAPES[
+            column_name
+        ]
+        if column_name == "transfer_tx_hash":
+            expected_notnull = 0
+        actual_shape = (str(column[2]).upper(), int(column[3]), int(column[5]))
+        if actual_shape != (expected_type, expected_notnull, expected_pk):
+            raise RuntimeError(
+                "sent_transactions rebuild produced an unexpected column definition"
+            )
+        expected_default = None
+        if column_name == "state":
+            expected_default = "'scheduled'"
+        elif column_name == "sent_at":
+            expected_default = "strftime('%s','now')"
+        if _normalize_sqlite_default(column[4]) != expected_default:
+            raise RuntimeError(
+                "sent_transactions rebuild produced an unexpected column default"
+            )
+
+    async with db.execute("PRAGMA foreign_key_list(sent_transactions)") as cursor:
+        rebuilt_foreign_keys = await cursor.fetchall()
+    if len(rebuilt_foreign_keys) != 1:
+        raise RuntimeError("sent_transactions rebuild produced unexpected foreign keys")
+    rebuilt_fk = rebuilt_foreign_keys[0]
+    if (
+        str(rebuilt_fk[2]),
+        str(rebuilt_fk[3]),
+        str(rebuilt_fk[4]),
+        str(rebuilt_fk[5]).upper(),
+        str(rebuilt_fk[6]).upper(),
+        str(rebuilt_fk[7]).upper(),
+    ) != ("dca_plans", "plan_id", "id", "NO ACTION", "NO ACTION", "NONE"):
+        raise RuntimeError("sent_transactions rebuild produced an unexpected foreign key")
+
+    async with db.execute("PRAGMA index_list(sent_transactions)") as cursor:
+        rebuilt_indexes = await cursor.fetchall()
+    rebuilt_index_names = {str(index[1]) for index in rebuilt_indexes}
+    expected_indexes = (
+        {"idx_sent_transactions_order_id"} if expect_order_id_index else set()
+    )
+    if rebuilt_index_names != expected_indexes:
+        raise RuntimeError("sent_transactions rebuild produced unexpected indexes")
+
+    async with db.execute("SELECT COUNT(*) FROM sent_transactions") as cursor:
+        rebuilt_row_count = int((await cursor.fetchone())[0])
+    if rebuilt_row_count != expected_row_count:
+        raise RuntimeError("sent_transactions rebuild row-count mismatch after rename")
+
+
+async def _execute_sqlite_control_statement_to_completion(
+    db, statement, *, check_pending_cancellation=False
+):
+    """Finish COMMIT/ROLLBACK even if the awaiting task is cancelled."""
+
+    if check_pending_cancellation:
+        # Give an already-requested cancellation a checkpoint before COMMIT is
+        # represented by a task and can be queued on aiosqlite's worker.
+        await asyncio.sleep(0)
+
+    async def execute_statement():
+        await db.execute(statement)
+
+    operation = asyncio.create_task(execute_statement())
+    pending_cancellation = None
+    while not operation.done():
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError as cancellation:
+            pending_cancellation = cancellation
+
+    operation.result()
+    return pending_cancellation
+
+
 async def init_db():
     """
     Инициализация SQLite базы данных.
@@ -3317,12 +3792,15 @@ async def init_db():
             columns = await cursor.fetchall()
             existing_columns = [col[1] for col in columns]
         
-        if "state" not in existing_columns:
-            await db.execute("ALTER TABLE sent_transactions ADD COLUMN state TEXT DEFAULT 'scheduled'")
-        if "error_message" not in existing_columns:
-            await db.execute("ALTER TABLE sent_transactions ADD COLUMN error_message TEXT")
-        if "order_token" not in existing_columns:
-            await db.execute("ALTER TABLE sent_transactions ADD COLUMN order_token TEXT")
+        transfer_col = next((col for col in columns if col[1] == "transfer_tx_hash"), None)
+        transfer_notnull = bool(transfer_col and transfer_col[3] == 1)
+        if not transfer_notnull:
+            if "state" not in existing_columns:
+                await db.execute("ALTER TABLE sent_transactions ADD COLUMN state TEXT DEFAULT 'scheduled'")
+            if "error_message" not in existing_columns:
+                await db.execute("ALTER TABLE sent_transactions ADD COLUMN error_message TEXT")
+            if "order_token" not in existing_columns:
+                await db.execute("ALTER TABLE sent_transactions ADD COLUMN order_token TEXT")
 
         # Safe migration: ensure transfer_tx_hash is nullable for pre-send records
         async with db.execute("PRAGMA table_info(sent_transactions)") as cursor:
@@ -3332,8 +3810,26 @@ async def init_db():
         if transfer_notnull:
             logger.info("Migrating sent_transactions: transfer_tx_hash NOT NULL -> NULL")
             await db.execute("PRAGMA foreign_keys=off;")
+            transaction_started = False
+            commit_cancellation = None
             try:
                 await db.execute("BEGIN IMMEDIATE;")
+                transaction_started = True
+                async with db.execute("PRAGMA table_xinfo(sent_transactions)") as cursor:
+                    locked_tx_columns = await cursor.fetchall()
+                source_columns, preserve_order_id_index = (
+                    await _inspect_supported_sent_transactions_rebuild_schema(
+                        db, locked_tx_columns
+                    )
+                )
+                ordered_source_columns = [
+                    column_name
+                    for column_name in _SENT_TRANSACTION_COLUMN_ORDER
+                    if column_name in source_columns
+                ]
+                copy_columns_sql = ", ".join(
+                    f'"{column_name}"' for column_name in ordered_source_columns
+                )
                 await db.execute('''
                     CREATE TABLE sent_transactions_new (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3343,8 +3839,14 @@ async def init_db():
                         order_token TEXT,
                         network_key TEXT NOT NULL,
                         approve_tx_hash TEXT,
+                        approve_tx_nonce INTEGER,
+                        approve_raw_tx TEXT,
                         transfer_tx_hash TEXT,
+                        transfer_tx_nonce INTEGER,
+                        transfer_raw_tx TEXT,
                         amount REAL NOT NULL,
+                        amount_units TEXT,
+                        token_decimals INTEGER,
                         deposit_address TEXT NOT NULL,
                         state TEXT DEFAULT 'scheduled',
                         error_message TEXT,
@@ -3352,24 +3854,52 @@ async def init_db():
                         FOREIGN KEY(plan_id) REFERENCES dca_plans(id)
                     )
                 ''')
-                await db.execute('''
-                    INSERT INTO sent_transactions_new (
-                        id, user_id, plan_id, order_id, order_token, network_key, approve_tx_hash,
-                        transfer_tx_hash, amount, deposit_address, state, error_message, sent_at
-                    )
-                    SELECT
-                        id, user_id, plan_id, order_id, order_token, network_key, approve_tx_hash,
-                        transfer_tx_hash, amount, deposit_address, state, error_message, sent_at
-                    FROM sent_transactions
-                ''')
+                async with db.execute("SELECT COUNT(*) FROM sent_transactions") as cursor:
+                    source_row_count = int((await cursor.fetchone())[0])
+                await db.execute(
+                    f"INSERT INTO sent_transactions_new ({copy_columns_sql}) "
+                    f"SELECT {copy_columns_sql} FROM sent_transactions"
+                )
+                await _assert_sent_transactions_copy_preserved(
+                    db, ordered_source_columns, source_row_count
+                )
                 await db.execute("DROP TABLE sent_transactions")
                 await db.execute("ALTER TABLE sent_transactions_new RENAME TO sent_transactions")
-                await db.execute("COMMIT;")
-            except Exception:
-                await db.execute("ROLLBACK;")
+                if preserve_order_id_index:
+                    await db.execute(
+                        "CREATE UNIQUE INDEX idx_sent_transactions_order_id "
+                        "ON sent_transactions(order_id)"
+                    )
+                await _assert_rebuilt_sent_transactions_schema(
+                    db, source_row_count, preserve_order_id_index
+                )
+                commit_cancellation = (
+                    await _execute_sqlite_control_statement_to_completion(
+                        db, "COMMIT;", check_pending_cancellation=True
+                    )
+                )
+                transaction_started = False
+            except BaseException as rebuild_error:
+                if transaction_started and db.in_transaction:
+                    try:
+                        rollback_cancellation = (
+                            await _execute_sqlite_control_statement_to_completion(
+                                db, "ROLLBACK;"
+                            )
+                        )
+                    except BaseException as rollback_error:
+                        rebuild_error.sent_transactions_rollback_error = rollback_error
+                        raise rebuild_error from rollback_error
+                    transaction_started = False
+                    if rollback_cancellation is not None:
+                        rebuild_error.sent_transactions_rollback_cancellation = (
+                            rollback_cancellation
+                        )
                 raise
             finally:
                 await db.execute("PRAGMA foreign_keys=on;")
+            if commit_cancellation is not None:
+                raise commit_cancellation
 
         async with db.execute("PRAGMA table_info(sent_transactions)") as cursor:
             tx_columns = await cursor.fetchall()
