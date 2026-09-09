@@ -6,6 +6,7 @@ Handles all checks and direct transfers.
 import asyncio
 import logging
 import re
+from decimal import Decimal
 from typing import Optional, Tuple
 from web3 import Web3
 from web3.exceptions import TimeExhausted, TransactionNotFound
@@ -14,8 +15,12 @@ from erc20 import (
     PreparedTransactionConflict,
     TransactionBroadcastUncertain,
     get_web3_instance,
-    get_usdt_balance,
+    decimal_amount_to_units,
+    get_usdt_balance_units,
+    get_usdt_token_decimals,
     get_native_balance,
+    has_sufficient_token_balance,
+    validate_decimal_amount_text,
     transfer_usdt,
     estimate_gas_for_transfer,
     build_gas_params,
@@ -50,11 +55,14 @@ async def auto_send_usdt(
     user_id: int,
     wallet_password: str,
     deposit_address: str,
-    required_amount: float,
+    required_amount,
     btc_address: str,
     order_id: str,
     dry_run: bool = False,
     persist_prepared_tx=None,
+    amount_units: Optional[int] = None,
+    token_decimals: Optional[int] = None,
+    persist_payment_intent=None,
 ) -> Tuple[bool, Optional[str], Optional[str], str]:
     """
     Automatically send USDT to FixedFloat deposit address.
@@ -84,6 +92,37 @@ async def auto_send_usdt(
         - error_message: Error message if failed
     """
     try:
+        try:
+            has_persisted_units = amount_units is not None or token_decimals is not None
+            if has_persisted_units:
+                if amount_units is None or token_decimals is None:
+                    raise ValueError("incomplete persisted exact payment intent")
+                if (
+                    isinstance(amount_units, bool)
+                    or not isinstance(amount_units, int)
+                    or amount_units <= 0
+                ):
+                    raise ValueError("persisted amount units must be a positive integer")
+                if (
+                    isinstance(token_decimals, bool)
+                    or not isinstance(token_decimals, int)
+                    or token_decimals < 0
+                    or token_decimals > 255
+                ):
+                    raise ValueError("persisted token decimals must be an integer from 0 to 255")
+                # Recovery must never reconstruct an exact intent from legacy REAL.
+                amount_text = format(
+                    Decimal(str(amount_units)).scaleb(-token_decimals), "f"
+                )
+            elif isinstance(required_amount, str):
+                # Validate syntax/finite/positive before any wallet or RPC work;
+                # units are resolved exactly once after reading token decimals.
+                amount_text = validate_decimal_amount_text(required_amount)
+            else:
+                raise ValueError("amount must be an exact positive decimal string")
+        except (TypeError, ValueError) as e:
+            return (False, None, None, f"INVALID_PAYMENT_AMOUNT:{e}")
+
         # Load keystore (single wallet for all networks)
         keystore = load_keystore(user_id)
         if not keystore:
@@ -118,7 +157,7 @@ async def auto_send_usdt(
         logger.info(f"Network: {network_key}")
         logger.info(f"Wallet: {masked_wallet}")
         logger.info(f"Deposit: {masked_deposit}")
-        logger.info(f"Amount: {required_amount:.6f} USDT")
+        logger.info(f"Amount: {amount_text} USDT")
         logger.info(f"Dry-run: {dry_run}")
         
         # Initialize Web3
@@ -137,24 +176,54 @@ async def auto_send_usdt(
         # Check 2: Get balances
         logger.info(f"Check 2: Checking balances...")
         try:
-            usdt_balance = await asyncio.to_thread(get_usdt_balance, w3, network_key, wallet_address)
+            observed_decimals = await asyncio.to_thread(
+                get_usdt_token_decimals, w3, network_key
+            )
+            if token_decimals is not None and int(token_decimals) != observed_decimals:
+                raise ValueError(
+                    f"persisted token decimals {token_decimals} do not match contract decimals {observed_decimals}"
+                )
+            if amount_units is None:
+                resolved_amount_units = decimal_amount_to_units(
+                    amount_text, observed_decimals
+                )
+            else:
+                resolved_amount_units = amount_units
+            balance_units = await asyncio.to_thread(
+                get_usdt_balance_units, w3, network_key, wallet_address
+            )
+            token_decimals = observed_decimals
+            if persist_payment_intent is not None:
+                persist_payment_intent(resolved_amount_units, token_decimals)
+            amount_decimal = Decimal(str(resolved_amount_units)) / (
+                Decimal("10") ** token_decimals
+            )
+            usdt_balance = Decimal(str(balance_units)) / (
+                Decimal("10") ** token_decimals
+            )
             native_balance = await asyncio.to_thread(get_native_balance, w3, wallet_address)
             logger.info(f"✓ USDT balance: {usdt_balance:.6f} USDT")
             logger.info(f"✓ Native balance: {native_balance:.6f} {config['native_token']}")
+        except PreparedTransactionConflict as e:
+            logger.warning("Payment intent persistence conflict: %s", e)
+            return (False, None, None, f"PERSISTENCE_CONFLICT:{e}")
+        except (TypeError, ValueError) as e:
+            logger.error("Invalid exact payment amount: %s", e)
+            return (False, None, None, f"INVALID_PAYMENT_AMOUNT:{e}")
         except Exception as e:
             logger.error(f"✗ Failed to check balances: {e}")
             return (False, None, None, f"Failed to check balances: {e}")
         
         # Check 3: USDT balance sufficient
         logger.info(f"Check 3: Verifying USDT balance sufficient...")
-        if usdt_balance < required_amount:
-            logger.error(f"✗ Insufficient USDT: required={required_amount:.6f}, available={usdt_balance:.6f}")
+        if not has_sufficient_token_balance(balance_units, resolved_amount_units):
+            logger.error(f"✗ Insufficient USDT: required={amount_decimal:.6f}, available={usdt_balance:.6f}")
             return (
                 False, None, None,
                 f"Insufficient USDT balance.\n"
-                f"Required: {required_amount:.6f} USDT\n"
+                f"Required: {amount_decimal:.6f} USDT\n"
                 f"Available: {usdt_balance:.6f} USDT\n"
-                f"Shortage: {required_amount - usdt_balance:.6f} USDT"
+                f"Shortage: {amount_decimal - usdt_balance:.6f} USDT"
             )
         logger.info(f"✓ USDT balance sufficient")
         
@@ -162,7 +231,12 @@ async def auto_send_usdt(
         logger.info(f"Check 4: Estimating gas for transfer...")
         try:
             transfer_gas = await asyncio.to_thread(
-                estimate_gas_for_transfer, w3, network_key, wallet_address, deposit_address_checksum, required_amount
+                estimate_gas_for_transfer,
+                w3,
+                network_key,
+                wallet_address,
+                deposit_address_checksum,
+                resolved_amount_units,
             )
             total_gas = transfer_gas
             
@@ -210,7 +284,7 @@ async def auto_send_usdt(
         transfer_tx_hash = None
         send_lock = await _get_wallet_send_lock(network_key, wallet_address)
         async with send_lock:
-            logger.info(f"Transferring {required_amount:.6f} USDT to {masked_deposit}")
+            logger.info(f"Transferring {amount_decimal:.6f} USDT to {masked_deposit}")
             try:
                 if transfer_tx_hash:
                     logger.info(f"Transfer tx already exists, skip new transfer: {transfer_tx_hash}")
@@ -218,7 +292,7 @@ async def auto_send_usdt(
                     transfer_tx_hash = await asyncio.to_thread(
                         transfer_usdt,
                         w3, network_key, private_key,
-                        deposit_address_checksum, required_amount, dry_run,
+                        deposit_address_checksum, resolved_amount_units, dry_run,
                         persist_prepared_tx,
                     )
                 
