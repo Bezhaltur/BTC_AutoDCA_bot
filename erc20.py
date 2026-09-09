@@ -5,6 +5,7 @@ Handles balance checks, approvals, and transfers.
 
 import logging
 import time
+from decimal import Decimal, InvalidOperation, localcontext
 from typing import Optional, Tuple
 from web3 import Web3
 from web3.exceptions import ContractLogicError, TransactionNotFound
@@ -55,6 +56,67 @@ TX_SEND_MAX_ATTEMPTS = 3
 TX_RETRY_DELAY_SECONDS = 2.5
 GAS_FALLBACK_TRANSFER = 200000
 GAS_FALLBACK_APPROVE = 200000
+
+
+def _parse_decimal_amount_text(amount_text: str) -> Decimal:
+    if not isinstance(amount_text, str):
+        raise TypeError("amount must be an exact decimal string, not float")
+    normalized_text = amount_text.strip()
+    if not normalized_text or normalized_text != amount_text:
+        raise ValueError("amount must be a canonical decimal string")
+    try:
+        amount = Decimal(normalized_text)
+    except InvalidOperation as exc:
+        raise ValueError("amount must be a valid decimal string") from exc
+    if not amount.is_finite():
+        raise ValueError("amount must be finite")
+    if amount <= 0:
+        raise ValueError("amount must be positive")
+    return amount
+
+
+def validate_decimal_amount_text(amount_text: str) -> str:
+    """Validate an authoritative decimal amount without resolving token units."""
+    _parse_decimal_amount_text(amount_text)
+    return amount_text
+
+
+def decimal_amount_to_units(amount_text: str, token_decimals: int) -> int:
+    """Convert an exact positive decimal string to ERC20 integer units."""
+    amount = _parse_decimal_amount_text(amount_text)
+    if not isinstance(token_decimals, int) or isinstance(token_decimals, bool):
+        raise TypeError("token decimals must be an integer")
+    if token_decimals < 0 or token_decimals > 255:
+        raise ValueError("token decimals must be between 0 and 255")
+
+    digits = len(amount.as_tuple().digits)
+    with localcontext() as context:
+        context.prec = max(64, digits + token_decimals + 2)
+        scaled = amount * (Decimal(10) ** token_decimals)
+        integral = scaled.to_integral_value()
+    if scaled != integral:
+        raise ValueError(
+            f"amount precision is not representable with {token_decimals} token decimals"
+        )
+    return int(integral)
+
+
+def has_sufficient_token_balance(balance_units: int, amount_units: int) -> bool:
+    """Compare an ERC20 balance and payment amount in their native units."""
+    if isinstance(balance_units, bool) or not isinstance(balance_units, int):
+        raise TypeError("balance units must be an integer")
+    if isinstance(amount_units, bool) or not isinstance(amount_units, int):
+        raise TypeError("amount units must be an integer")
+    return balance_units >= amount_units
+
+
+def _require_positive_amount_units(amount_units: int) -> None:
+    if (
+        isinstance(amount_units, bool)
+        or not isinstance(amount_units, int)
+        or amount_units <= 0
+    ):
+        raise ValueError("amount units must be a positive integer")
 
 # ERC20 ABI (minimal - only functions we need)
 ERC20_ABI = [
@@ -465,6 +527,35 @@ def get_usdt_balance(w3: Web3, network_key: str, address: str) -> float:
         raise RuntimeError(f"Failed to get USDT balance: {e}")
 
 
+def get_usdt_token_decimals(w3: Web3, network_key: str) -> int:
+    """Return ERC20 decimals without reading an account balance."""
+    try:
+        contract = get_usdt_contract(w3, network_key)
+        return int(contract.functions.decimals().call())
+    except Exception as e:
+        logger.error("Error getting USDT decimals on %s: %s", network_key, e)
+        raise RuntimeError(f"Failed to get USDT decimals: {e}")
+
+
+def get_usdt_balance_units(w3: Web3, network_key: str, address: str) -> int:
+    """Return the raw ERC20 balance without float conversion."""
+    try:
+        contract = get_usdt_contract(w3, network_key)
+        balance_units = int(
+            contract.functions.balanceOf(Web3.to_checksum_address(address)).call()
+        )
+        return balance_units
+    except Exception as e:
+        masked_addr = f"{address[:6]}...{address[-4:]}" if len(address) > 10 else address
+        logger.error(
+            "Error getting raw USDT balance for %s on %s: %s",
+            masked_addr,
+            network_key,
+            e,
+        )
+        raise RuntimeError(f"Failed to get USDT balance units: {e}")
+
+
 def get_native_balance(w3: Web3, address: str) -> float:
     """
     Get native token balance (ETH/BNB/POLYGON).
@@ -528,7 +619,13 @@ def estimate_gas_for_approve(w3: Web3, network_key: str, from_address: str, spen
         return GAS_FALLBACK_APPROVE
 
 
-def estimate_gas_for_transfer(w3: Web3, network_key: str, from_address: str, to_address: str, amount: float) -> int:
+def estimate_gas_for_transfer(
+    w3: Web3,
+    network_key: str,
+    from_address: str,
+    to_address: str,
+    amount_units: int,
+) -> int:
     """
     Estimate gas for transfer transaction.
     
@@ -537,19 +634,17 @@ def estimate_gas_for_transfer(w3: Web3, network_key: str, from_address: str, to_
         network_key: Network key
         from_address: Sender address
         to_address: Recipient address
-        amount: Amount to transfer
+        amount_units: Exact amount to transfer in token units
     
     Returns:
         Estimated gas (int)
     """
+    _require_positive_amount_units(amount_units)
     try:
         contract = get_usdt_contract(w3, network_key)
-        decimals = contract.functions.decimals().call()
-        amount_wei = int(amount * (10 ** decimals))
-        
         tx = contract.functions.transfer(
             Web3.to_checksum_address(to_address),
-            amount_wei
+            amount_units
         ).build_transaction({
             "from": Web3.to_checksum_address(from_address),
             "nonce": w3.eth.get_transaction_count(Web3.to_checksum_address(from_address), "pending"),
@@ -558,7 +653,10 @@ def estimate_gas_for_transfer(w3: Web3, network_key: str, from_address: str, to_
         estimated_gas = w3.eth.estimate_gas(tx)
         masked_from = f"{from_address[:6]}...{from_address[-4:]}" if len(from_address) > 10 else from_address
         masked_to = f"{to_address[:6]}...{to_address[-4:]}" if len(to_address) > 10 else to_address
-        logger.info(f"Gas estimation (transfer): {network_key}, from={masked_from}, to={masked_to}, amount={amount:.6f} USDT, gas={estimated_gas}")
+        logger.info(
+            "Gas estimation (transfer): %s, from=%s, to=%s, amount_units=%s, gas=%s",
+            network_key, masked_from, masked_to, amount_units, estimated_gas,
+        )
         return estimated_gas
     except Exception as e:
         logger.warning(
@@ -661,7 +759,7 @@ def transfer_usdt(
     network_key: str,
     private_key: str,
     to_address: str,
-    amount: float,
+    amount_units: int,
     dry_run: bool = False,
     persist_prepared_tx=None,
 ) -> Optional[str]:
@@ -673,7 +771,7 @@ def transfer_usdt(
         network_key: Network key
         private_key: Private key (hex with 0x)
         to_address: Recipient address
-        amount: Amount to transfer
+        amount_units: Exact amount to transfer in token units
         dry_run: If True, don't broadcast transaction
     
     Returns:
@@ -683,21 +781,21 @@ def transfer_usdt(
         RuntimeError: If transfer fails
     """
     try:
+        _require_positive_amount_units(amount_units)
         account = Account.from_key(private_key)
         from_address = account.address
         
         contract = get_usdt_contract(w3, network_key)
-        decimals = contract.functions.decimals().call()
-        amount_wei = int(amount * (10 ** decimals))
-        
         def build_transfer_tx() -> dict:
             return contract.functions.transfer(
                 Web3.to_checksum_address(to_address),
-                amount_wei
+                amount_units
             ).build_transaction({
                 "from": from_address,
                 "nonce": w3.eth.get_transaction_count(from_address, "pending"),
-                "gas": estimate_gas_for_transfer(w3, network_key, from_address, to_address, amount),
+                "gas": estimate_gas_for_transfer(
+                    w3, network_key, from_address, to_address, amount_units
+                ),
                 **build_gas_params(w3, network_key),
                 "chainId": get_network_config(network_key)["chain_id"],
             })
@@ -712,17 +810,17 @@ def transfer_usdt(
             logger.info(f"  Network: {network_key}")
             logger.info(f"  From: {masked_from}")
             logger.info(f"  To: {masked_to}")
-            logger.info(f"  Amount: {amount:.6f} USDT")
+            logger.info(f"  Amount units: {amount_units}")
             logger.info(f"  Gas: {tx['gas']}")
             logger.info(f"  Gas Params: {gas_label}")
             logger.info(f"  Estimated Cost: {gas_cost:.6f} {get_network_config(network_key)['native_token']}")
-            logger.info(f"  [DRY RUN] Transaction NOT sent - would transfer {amount:.6f} USDT")
+            logger.info(f"  [DRY RUN] Transaction NOT sent - would transfer {amount_units} token units")
             return None
         
         # Sign and send with retries
         logger.info(
-            "Signing transfer transaction: %s -> %s, amount=%.6f USDT, rpc=%s",
-            masked_from, masked_to, amount, _get_provider_url(w3)
+            "Signing transfer transaction: %s -> %s, amount_units=%s, rpc=%s",
+            masked_from, masked_to, amount_units, _get_provider_url(w3)
         )
         tx_hash_hex, tx_used = send_transaction_with_retry(
             w3=w3,

@@ -65,6 +65,7 @@ from auto_send import auto_send_usdt
 from erc20 import (
     PreparedTransactionConflict,
     TransactionBroadcastUncertain,
+    validate_decimal_amount_text,
     get_web3_instance,
     get_usdt_balance,
     get_native_balance,
@@ -606,7 +607,7 @@ def build_auto_send_failed_notification(
     order_id: str,
     plan_number: Optional[int],
     network_key: str,
-    required_amount: float,
+    required_amount: Any,
     btc_address: str,
     deposit_address: str,
     order_expires: Optional[int],
@@ -1383,7 +1384,7 @@ async def mark_order_expired_before_send(
 
 
 UNRESOLVED_ERC20_TRANSFER_STATES = (
-    "sending", "blocked", "transfering", "tx_pending", "pending", "failed", "expired"
+    "sending", "blocked", "approve_confirmed", "transfering", "tx_pending", "pending", "failed", "expired"
 )
 
 
@@ -1433,8 +1434,6 @@ async def _active_order_gate_can_be_released(
             and approve_hash is None and approve_nonce is None and approve_raw is None
             and transfer_hash is None and transfer_nonce is None and transfer_raw is None
         )
-    if _state not in UNRESOLVED_ERC20_TRANSFER_STATES:
-        return True
     if _persisted_intent_matches(
         proven_transfer_failure_hash, transfer_hash, transfer_nonce, transfer_raw
     ):
@@ -1445,6 +1444,16 @@ async def _active_order_gate_can_be_released(
             proven_approve_failure_hash, approve_hash, approve_nonce, approve_raw
         )
     ):
+        return True
+    if any(
+        artifact is not None
+        for artifact in (
+            approve_hash, approve_nonce, approve_raw,
+            transfer_hash, transfer_nonce, transfer_raw,
+        )
+    ):
+        return False
+    if _state not in UNRESOLVED_ERC20_TRANSFER_STATES:
         return True
     return False
 
@@ -1631,6 +1640,68 @@ def persist_prepared_erc20_transaction(
         db.commit()
 
 
+def persist_exact_payment_intent(
+    plan_id: int,
+    order_id: str,
+    amount_units: int,
+    token_decimals: int,
+) -> None:
+    """Persist resolved token units before a transfer transaction is prepared."""
+    amount_units_text = str(amount_units)
+    with sqlite3.connect(DB_PATH) as db:
+        cur = db.execute(
+            "UPDATE sent_transactions SET amount_units = ?, token_decimals = ? "
+            "WHERE plan_id = ? AND order_id = ? AND state = 'transfering' "
+            "AND transfer_tx_hash IS NULL AND transfer_tx_nonce IS NULL AND transfer_raw_tx IS NULL "
+            "AND ((amount_units IS NULL AND token_decimals IS NULL) "
+            "OR (amount_units = ? AND token_decimals = ?))",
+            (
+                amount_units_text,
+                int(token_decimals),
+                plan_id,
+                order_id,
+                amount_units_text,
+                int(token_decimals),
+            ),
+        )
+        if cur.rowcount != 1:
+            raise PreparedTransactionConflict(
+                f"Cannot persist exact payment intent for plan={plan_id}, order={order_id}"
+            )
+        db.commit()
+
+
+def make_payment_intent_persister(plan_id: Optional[int], order_id: str):
+    if plan_id is None:
+        return None
+
+    def persist(amount_units: int, token_decimals: int) -> None:
+        persist_exact_payment_intent(
+            plan_id, order_id, amount_units, token_decimals
+        )
+
+    return persist
+
+
+def parse_persisted_payment_intent(
+    amount_units: Optional[str], token_decimals: Optional[int]
+) -> tuple[int, int]:
+    """Require an exact persisted payment intent without consulting legacy REAL."""
+    if amount_units is None and token_decimals is None:
+        raise ValueError("missing persisted exact payment intent")
+    if amount_units is None or token_decimals is None:
+        raise ValueError("incomplete persisted exact payment intent")
+    amount_units_text = str(amount_units)
+    if not amount_units_text.isdigit() or int(amount_units_text) <= 0:
+        raise ValueError("invalid persisted amount units")
+    if isinstance(token_decimals, bool) or not isinstance(token_decimals, int):
+        raise ValueError("invalid persisted token decimals")
+    decimals = token_decimals
+    if decimals < 0 or decimals > 255:
+        raise ValueError("invalid persisted token decimals")
+    return int(amount_units_text), decimals
+
+
 def select_persisted_erc20_transaction(
     approve_tx_hash: Optional[str],
     transfer_tx_hash: Optional[str],
@@ -1643,6 +1714,21 @@ def select_persisted_erc20_transaction(
     if approve_tx_hash or approve_raw_tx:
         return "approve", approve_tx_hash, approve_raw_tx
     return None, None, None
+
+
+def resolve_persisted_erc20_transaction(
+    approve_tx_hash: Optional[str],
+    transfer_tx_hash: Optional[str],
+    approve_raw_tx: Optional[str] = None,
+    transfer_raw_tx: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Select the authoritative persisted phase and derive a missing hash from raw bytes."""
+    action_name, tx_hash, raw_tx = select_persisted_erc20_transaction(
+        approve_tx_hash, transfer_tx_hash, approve_raw_tx, transfer_raw_tx
+    )
+    if raw_tx and not tx_hash:
+        tx_hash = Web3.keccak(Web3.to_bytes(hexstr=raw_tx)).hex()
+    return action_name, tx_hash, raw_tx
 
 
 def make_prepared_tx_persister(plan_id: Optional[int], order_id: str):
@@ -2075,8 +2161,10 @@ async def resume_transfer_after_approve(
     btc_address: str,
     order_id: str,
     deposit_address: str,
-    required_amount: float,
+    required_amount: Any,
     existing_approve_tx: Optional[str],
+    amount_units: Optional[int] = None,
+    token_decimals: Optional[int] = None,
     plan_id: Optional[int] = None,
     order_expires: Optional[int] = None,
     scheduled_time: Optional[int] = None,
@@ -2111,6 +2199,9 @@ async def resume_transfer_after_approve(
         order_id=order_id,
         dry_run=DRY_RUN,
         persist_prepared_tx=make_prepared_tx_persister(plan_id, order_id),
+        amount_units=amount_units,
+        token_decimals=token_decimals,
+        persist_payment_intent=make_payment_intent_persister(plan_id, order_id),
     )
     if approve_tx or transfer_tx:
         _balances_cache.clear()
@@ -2132,7 +2223,8 @@ async def recovery_scan_pending_transactions() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT id, plan_id, user_id, order_id, network_key, approve_tx_hash, transfer_tx_hash, "
-            "error_message, state, amount, deposit_address, approve_raw_tx, transfer_raw_tx "
+            "error_message, state, amount, deposit_address, approve_raw_tx, transfer_raw_tx, "
+            "amount_units, token_decimals "
             "FROM sent_transactions WHERE state IN ('sending', 'transfering', 'tx_pending', 'pending', 'blocked')"
         ) as cur:
             rows = await cur.fetchall()
@@ -2144,19 +2236,91 @@ async def recovery_scan_pending_transactions() -> None:
     for (
         tx_id, plan_id, tx_user_id, order_id, network_key, approve_tx, transfer_tx,
         error_message, current_state, tx_amount, tx_deposit_address,
-        approve_raw_tx, transfer_raw_tx,
+        approve_raw_tx, transfer_raw_tx, persisted_amount_units, persisted_token_decimals,
     ) in rows:
-        action_name, tx_hash, raw_tx = select_persisted_erc20_transaction(
-            approve_tx, transfer_tx, approve_raw_tx, transfer_raw_tx
-        )
-
-        if not tx_hash:
+        try:
+            action_name, tx_hash, raw_tx = resolve_persisted_erc20_transaction(
+                approve_tx, transfer_tx, approve_raw_tx, transfer_raw_tx
+            )
+        except Exception as e:
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute(
-                    "UPDATE sent_transactions SET error_message = "
-                    "COALESCE(NULLIF(error_message, ''), ?) WHERE id = ?",
-                    ("ERC20 recovery blocked: no persisted transaction hash/raw; manual review required", tx_id),
+                    "UPDATE sent_transactions SET error_message = ? WHERE id = ?",
+                    (f"ERC20 recovery blocked: invalid persisted raw transaction: {e}", tx_id),
                 )
+                await db.commit()
+            continue
+
+        if not tx_hash:
+            try:
+                exact_amount_units, exact_token_decimals = parse_persisted_payment_intent(
+                    persisted_amount_units, persisted_token_decimals
+                )
+            except (TypeError, ValueError) as e:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "UPDATE sent_transactions SET error_message = ? WHERE id = ?",
+                        (f"INVALID_PAYMENT_AMOUNT:{e}; manual review required", tx_id),
+                    )
+                    await db.commit()
+                continue
+
+            wallet_password = _wallet_passwords.get(tx_user_id)
+            if plan_id is None or not wallet_password:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "UPDATE sent_transactions SET error_message = "
+                        "COALESCE(NULLIF(error_message, ''), ?) WHERE id = ?",
+                        ("ERC20 recovery blocked: wallet unlock or plan context unavailable", tx_id),
+                    )
+                    await db.commit()
+                continue
+
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute(
+                    "SELECT btc_address, active_order_expires, next_run, interval_hours "
+                    "FROM dca_plans WHERE id = ?",
+                    (plan_id,),
+                ) as plan_cur:
+                    plan_row = await plan_cur.fetchone()
+            if not plan_row:
+                continue
+
+            resume_state, resume_approve_tx, resume_transfer_tx, resume_error = (
+                await resume_transfer_after_approve(
+                    network_key=network_key,
+                    user_id=tx_user_id,
+                    btc_address=plan_row[0] or "",
+                    order_id=order_id,
+                    deposit_address=tx_deposit_address or "",
+                    required_amount=tx_amount,
+                    existing_approve_tx=approve_tx,
+                    amount_units=exact_amount_units,
+                    token_decimals=exact_token_decimals,
+                    plan_id=plan_id,
+                    order_expires=plan_row[1],
+                    scheduled_time=plan_row[2],
+                    interval_hours=plan_row[3],
+                )
+            )
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE sent_transactions SET state = ?, approve_tx_hash = ?, "
+                    "transfer_tx_hash = ?, error_message = ? WHERE id = ?",
+                    (
+                        resume_state,
+                        resume_approve_tx,
+                        resume_transfer_tx,
+                        None if resume_state == "confirmed" else resume_error,
+                        tx_id,
+                    ),
+                )
+                if resume_state == "confirmed":
+                    new_next_run = now + (plan_row[3] * 3600)
+                    await db.execute(
+                        "UPDATE dca_plans SET next_run = ?, missed_count = 0 WHERE id = ?",
+                        (new_next_run, plan_id),
+                    )
                 await db.commit()
             continue
 
@@ -2166,6 +2330,17 @@ async def recovery_scan_pending_transactions() -> None:
         async with aiosqlite.connect(DB_PATH) as db:
             if tx_status == "confirmed":
                 if action_name == "approve":
+                    try:
+                        exact_amount_units, exact_token_decimals = parse_persisted_payment_intent(
+                            persisted_amount_units, persisted_token_decimals
+                        )
+                    except (TypeError, ValueError) as e:
+                        await db.execute(
+                            "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE id = ?",
+                            (f"INVALID_PAYMENT_AMOUNT:{e}", tx_id),
+                        )
+                        await db.commit()
+                        continue
                     if plan_id is None or not await claim_transfer_after_approve(
                         tx_id,
                         plan_id,
@@ -2200,8 +2375,10 @@ async def recovery_scan_pending_transactions() -> None:
                         btc_address=btc_address,
                         order_id=order_id,
                         deposit_address=tx_deposit_address or "",
-                        required_amount=float(tx_amount or 0.0),
+                        required_amount=tx_amount,
                         existing_approve_tx=approve_tx,
+                        amount_units=exact_amount_units,
+                        token_decimals=exact_token_decimals,
                         plan_id=plan_id,
                         order_expires=active_order_expires,
                         scheduled_time=plan_next_run,
@@ -2933,6 +3110,13 @@ def create_fixedfloat_order(network_key: str, amount_usdt: float, btc_address: s
     return ff_request("create", params)
 
 
+def require_exact_fixedfloat_amount(amount: Any) -> str:
+    """Accept FixedFloat's authoritative payment amount only as an exact string."""
+    if not isinstance(amount, str):
+        raise ValueError("FixedFloat from.amount must be an exact decimal string")
+    return validate_decimal_amount_text(amount)
+
+
 # ============================================================================
 # ИНИЦИАЛИЗАЦИЯ БОТА И БД
 # ============================================================================
@@ -3118,6 +3302,8 @@ async def init_db():
                 transfer_tx_nonce INTEGER,
                 transfer_raw_tx TEXT,
                 amount REAL NOT NULL,
+                amount_units TEXT,
+                token_decimals INTEGER,
                 deposit_address TEXT NOT NULL,
                 state TEXT DEFAULT 'scheduled',
                 error_message TEXT,
@@ -3193,6 +3379,8 @@ async def init_db():
             ("approve_raw_tx", "TEXT"),
             ("transfer_tx_nonce", "INTEGER"),
             ("transfer_raw_tx", "TEXT"),
+            ("amount_units", "TEXT"),
+            ("token_decimals", "INTEGER"),
         ):
             if column_name not in tx_column_names:
                 await db.execute(
@@ -3363,7 +3551,9 @@ async def dca_scheduler():
                                     existing_order_expires = None
                             if existing_order_id:
                                 async with db.execute(
-                                    "SELECT id, state, sent_at, approve_tx_hash, transfer_tx_hash, error_message, amount, deposit_address "
+                                    "SELECT id, state, sent_at, approve_tx_hash, transfer_tx_hash, error_message, "
+                                    "amount, deposit_address, amount_units, token_decimals, "
+                                    "approve_raw_tx, transfer_raw_tx "
                                     "FROM sent_transactions "
                                     "WHERE order_id = ? AND plan_id = ? ORDER BY sent_at DESC LIMIT 1",
                                     (existing_order_id, plan_id)
@@ -3371,8 +3561,40 @@ async def dca_scheduler():
                                     state_row = await state_cur.fetchone()
 
                                 if state_row:
-                                    existing_tx_id, existing_state, last_attempt_time, existing_approve_tx, existing_transfer_tx, existing_error, existing_amount, existing_deposit_address = state_row
-                                    if existing_state == 'approve_confirmed':
+                                    (
+                                        existing_tx_id, existing_state, last_attempt_time,
+                                        existing_approve_tx, existing_transfer_tx, existing_error,
+                                        existing_amount, existing_deposit_address,
+                                        existing_amount_units, existing_token_decimals,
+                                        existing_approve_raw, existing_transfer_raw,
+                                    ) = state_row
+                                    try:
+                                        pending_action, pending_tx_hash, pending_raw_tx = resolve_persisted_erc20_transaction(
+                                            existing_approve_tx,
+                                            existing_transfer_tx,
+                                            existing_approve_raw,
+                                            existing_transfer_raw,
+                                        )
+                                    except Exception as e:
+                                        await db.execute(
+                                            "UPDATE sent_transactions SET error_message = ? WHERE id = ?",
+                                            (f"ERC20 recovery blocked: invalid persisted raw transaction: {e}", existing_tx_id),
+                                        )
+                                        await db.commit()
+                                        continue
+
+                                    if existing_state == 'approve_confirmed' and pending_action != "transfer":
+                                        try:
+                                            exact_amount_units, exact_token_decimals = parse_persisted_payment_intent(
+                                                existing_amount_units, existing_token_decimals
+                                            )
+                                        except (TypeError, ValueError) as e:
+                                            await db.execute(
+                                                "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE id = ?",
+                                                (f"INVALID_PAYMENT_AMOUNT:{e}", existing_tx_id),
+                                            )
+                                            await db.commit()
+                                            continue
                                         if not await claim_transfer_after_approve(
                                             existing_tx_id, plan_id, existing_order_id, existing_approve_tx
                                         ):
@@ -3385,8 +3607,10 @@ async def dca_scheduler():
                                             btc_address=btc_address,
                                             order_id=existing_order_id,
                                             deposit_address=existing_deposit_address or "",
-                                            required_amount=float(existing_amount or amount),
+                                            required_amount=existing_amount,
                                             existing_approve_tx=existing_approve_tx,
+                                            amount_units=exact_amount_units,
+                                            token_decimals=exact_token_decimals,
                                             plan_id=plan_id,
                                             order_expires=existing_order_expires,
                                             scheduled_time=scheduled_time_for_cycle,
@@ -3419,10 +3643,9 @@ async def dca_scheduler():
                                                 )
                                         await db.commit()
                                         continue
-                                    if existing_state in ('pending', 'tx_pending', 'blocked', 'transfering'):
-                                        pending_action, pending_tx_hash, _ = select_persisted_erc20_transaction(
-                                            existing_approve_tx, existing_transfer_tx
-                                        )
+                                    if existing_state in ('pending', 'tx_pending', 'blocked', 'transfering') or (
+                                        existing_state == 'approve_confirmed' and pending_action == "transfer"
+                                    ):
                                         if not pending_tx_hash:
                                             await db.execute(
                                                 "UPDATE sent_transactions SET error_message = "
@@ -3436,6 +3659,17 @@ async def dca_scheduler():
                                         tx_status = await get_transfer_tx_status(from_asset, pending_tx_hash)
                                         if tx_status == "confirmed":
                                             if pending_action == "approve":
+                                                try:
+                                                    exact_amount_units, exact_token_decimals = parse_persisted_payment_intent(
+                                                        existing_amount_units, existing_token_decimals
+                                                    )
+                                                except (TypeError, ValueError) as e:
+                                                    await db.execute(
+                                                        "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE id = ?",
+                                                        (f"INVALID_PAYMENT_AMOUNT:{e}", existing_tx_id),
+                                                    )
+                                                    await db.commit()
+                                                    continue
                                                 if not await claim_transfer_after_approve(
                                                     existing_tx_id,
                                                     plan_id,
@@ -3451,8 +3685,10 @@ async def dca_scheduler():
                                                     btc_address=btc_address,
                                                     order_id=existing_order_id,
                                                     deposit_address=existing_deposit_address or "",
-                                                    required_amount=float(existing_amount or amount),
+                                                    required_amount=existing_amount,
                                                     existing_approve_tx=existing_approve_tx,
+                                                    amount_units=exact_amount_units,
+                                                    token_decimals=exact_token_decimals,
                                                     plan_id=plan_id,
                                                     order_expires=existing_order_expires,
                                                     scheduled_time=scheduled_time_for_cycle,
@@ -3512,6 +3748,13 @@ async def dca_scheduler():
                                             )
                                             logger.warning(f"Pending tx failed for order {existing_order_id}")
                                             continue
+                                        if pending_raw_tx:
+                                            await rebroadcast_persisted_erc20_transaction(
+                                                from_asset,
+                                                pending_raw_tx,
+                                                pending_tx_hash,
+                                                pending_action,
+                                            )
                                         await db.execute(
                                             "UPDATE sent_transactions SET state = 'tx_pending' WHERE order_id = ? AND plan_id = ?",
                                             (existing_order_id, plan_id)
@@ -3739,6 +3982,20 @@ async def dca_scheduler():
                                 "Ордер сохранён и заблокирован для ручной проверки; средства не отправлялись."
                             )
                             continue
+
+                        try:
+                            required_amount = require_exact_fixedfloat_amount(deposit_amount)
+                        except (TypeError, ValueError) as e:
+                            logger.error(
+                                "FixedFloat order %s has invalid authoritative amount: %s",
+                                order_id,
+                                e,
+                            )
+                            await bot.send_message(
+                                user_id,
+                                f"❌ INVALID_PAYMENT_AMOUNT:{escape_html(e)}. Средства не отправлялись.",
+                            )
+                            continue
                         
                         # Проверяем есть ли настроенный кошелёк для автоматической отправки (single wallet)
                         async with db.execute(
@@ -3751,13 +4008,6 @@ async def dca_scheduler():
                         wallet_password = _wallet_passwords.get(user_id)
                         
                         if wallet_row and wallet_password:
-                            
-                            # Парсим сумму из строки "amount code"
-                            try:
-                                required_amount = float(deposit_amount)
-                            except:
-                                required_amount = amount  # Fallback to plan amount
-                            
                             # Create transaction record in 'sending' state BEFORE attempting send
                             await db.execute(
                                 "INSERT INTO sent_transactions (user_id, plan_id, order_id, order_token, network_key, amount, deposit_address, state) VALUES (?, ?, ?, ?, ?, ?, ?, 'sending')",
@@ -3805,6 +4055,7 @@ async def dca_scheduler():
                                     order_id=order_id,
                                     dry_run=DRY_RUN,
                                     persist_prepared_tx=make_prepared_tx_persister(plan_id, order_id),
+                                    persist_payment_intent=make_payment_intent_persister(plan_id, order_id),
                                 )
                                 if approve_tx or transfer_tx:
                                     _balances_cache.clear()
@@ -4574,7 +4825,9 @@ async def cmd_execute(message: Message):
     if active_order_id:
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute(
-                "SELECT id, state, approve_tx_hash, transfer_tx_hash, error_message, amount, deposit_address FROM sent_transactions "
+                "SELECT id, state, approve_tx_hash, transfer_tx_hash, error_message, amount, "
+                "deposit_address, amount_units, token_decimals, approve_raw_tx, transfer_raw_tx "
+                "FROM sent_transactions "
                 "WHERE order_id = ? AND plan_id = ? ORDER BY sent_at DESC LIMIT 1",
                 (active_order_id, plan_id)
             ) as cur:
@@ -4587,8 +4840,40 @@ async def cmd_execute(message: Message):
             tx_error = tx_state_row[4]
             tx_amount = tx_state_row[5]
             tx_deposit_address = tx_state_row[6]
+            persisted_amount_units = tx_state_row[7]
+            persisted_token_decimals = tx_state_row[8]
+            approve_raw_tx = tx_state_row[9]
+            transfer_raw_tx = tx_state_row[10]
 
-            if tx_state == "approve_confirmed":
+            try:
+                pending_action, pending_tx_hash, pending_raw_tx = resolve_persisted_erc20_transaction(
+                    approve_tx_hash,
+                    transfer_tx_hash,
+                    approve_raw_tx,
+                    transfer_raw_tx,
+                )
+            except Exception as e:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "UPDATE sent_transactions SET error_message = ? WHERE id = ?",
+                        (f"ERC20 recovery blocked: invalid persisted raw transaction: {e}", tx_id),
+                    )
+                    await db.commit()
+                return
+
+            if tx_state == "approve_confirmed" and pending_action != "transfer":
+                try:
+                    exact_amount_units, exact_token_decimals = parse_persisted_payment_intent(
+                        persisted_amount_units, persisted_token_decimals
+                    )
+                except (TypeError, ValueError) as e:
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        await db.execute(
+                            "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE id = ?",
+                            (f"INVALID_PAYMENT_AMOUNT:{e}", tx_id),
+                        )
+                        await db.commit()
+                    return
                 if not await claim_transfer_after_approve(
                     tx_id, plan_id, active_order_id, approve_tx_hash
                 ):
@@ -4603,8 +4888,10 @@ async def cmd_execute(message: Message):
                     btc_address=btc_address,
                     order_id=active_order_id,
                     deposit_address=tx_deposit_address or "",
-                    required_amount=float(tx_amount or amount),
+                    required_amount=tx_amount,
                     existing_approve_tx=approve_tx_hash,
+                    amount_units=exact_amount_units,
+                    token_decimals=exact_token_decimals,
                     plan_id=plan_id,
                     order_expires=active_order_expires,
                     scheduled_time=plan_next_run,
@@ -4648,9 +4935,6 @@ async def cmd_execute(message: Message):
                     )
                 return
 
-            pending_action, pending_tx_hash, _ = select_persisted_erc20_transaction(
-                approve_tx_hash, transfer_tx_hash
-            )
             if not pending_tx_hash:
                 async with aiosqlite.connect(DB_PATH) as db:
                     await db.execute(
@@ -4666,6 +4950,13 @@ async def cmd_execute(message: Message):
                 return
             tx_status = await get_transfer_tx_status(from_asset, pending_tx_hash)
             if tx_status == "pending":
+                if pending_raw_tx:
+                    await rebroadcast_persisted_erc20_transaction(
+                        from_asset,
+                        pending_raw_tx,
+                        pending_tx_hash,
+                        pending_action,
+                    )
                 async with aiosqlite.connect(DB_PATH) as db:
                     await db.execute(
                         "UPDATE sent_transactions SET state = 'tx_pending' WHERE order_id = ? AND plan_id = ?",
@@ -4679,6 +4970,18 @@ async def cmd_execute(message: Message):
                 return
             if tx_status == "confirmed":
                 if pending_action == "approve":
+                    try:
+                        exact_amount_units, exact_token_decimals = parse_persisted_payment_intent(
+                            persisted_amount_units, persisted_token_decimals
+                        )
+                    except (TypeError, ValueError) as e:
+                        async with aiosqlite.connect(DB_PATH) as db:
+                            await db.execute(
+                                "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE id = ?",
+                                (f"INVALID_PAYMENT_AMOUNT:{e}", tx_id),
+                            )
+                            await db.commit()
+                        return
                     if not await claim_transfer_after_approve(
                         tx_id, plan_id, active_order_id, approve_tx_hash
                     ):
@@ -4693,8 +4996,10 @@ async def cmd_execute(message: Message):
                         btc_address=btc_address,
                         order_id=active_order_id,
                         deposit_address=tx_deposit_address or "",
-                        required_amount=float(tx_amount or amount),
+                        required_amount=tx_amount,
                         existing_approve_tx=approve_tx_hash,
+                        amount_units=exact_amount_units,
+                        token_decimals=exact_token_decimals,
                         plan_id=plan_id,
                         order_expires=active_order_expires,
                         scheduled_time=plan_next_run,
@@ -4913,6 +5218,27 @@ async def cmd_execute(message: Message):
                     parse_mode="HTML",
                 )
                 return
+
+            try:
+                required_amount = require_exact_fixedfloat_amount(deposit_amount)
+            except (TypeError, ValueError) as e:
+                error_msg = f"INVALID_PAYMENT_AMOUNT:{e}"
+                logger.error(
+                    "FixedFloat order %s has invalid authoritative amount: %s",
+                    order_id,
+                    e,
+                )
+                await bot.edit_message_text(
+                    chat_id=int(user_id),
+                    message_id=progress_msg.message_id,
+                    text=(
+                        f"❌ Ордер {format_order_link(order_id)} сохранён, но сумма оплаты некорректна. "
+                        f"Средства не отправлялись.\n\n<code>{escape_html(error_msg)}</code>"
+                    ),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+                return
             
             # Проверяем есть ли настроенный кошелёк для автоматической отправки
             async with db.execute(
@@ -4925,12 +5251,6 @@ async def cmd_execute(message: Message):
             wallet_password = _wallet_passwords.get(user_id)
         
         if wallet_row and wallet_password:
-            
-            # Парсим сумму из строки "amount code"
-            try:
-                required_amount = float(deposit_amount)
-            except:
-                required_amount = amount  # Fallback to plan amount
 
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute(
@@ -4980,6 +5300,7 @@ async def cmd_execute(message: Message):
                 order_id=order_id,
                 dry_run=DRY_RUN,
                 persist_prepared_tx=make_prepared_tx_persister(plan_id, order_id),
+                persist_payment_intent=make_payment_intent_persister(plan_id, order_id),
             )
             if approve_tx or transfer_tx:
                 _balances_cache.clear()
