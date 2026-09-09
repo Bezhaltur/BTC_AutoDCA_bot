@@ -3400,20 +3400,44 @@ async def init_db():
             )
         ''')
 
-        await db.execute(
-            "DELETE FROM sent_transactions "
-            "WHERE order_id IS NOT NULL AND id NOT IN ("
-            "  SELECT MAX(id) FROM sent_transactions WHERE order_id IS NOT NULL GROUP BY order_id"
-            ")"
-        )
+        # Finish any transaction opened by preceding schema migrations before
+        # taking the write lock that protects duplicate detection and indexing.
         await db.commit()
-        await db.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sent_transactions_order_id "
-            "ON sent_transactions(order_id)"
-        )
-        await db.commit()
-        
-        await db.commit()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT order_id, COUNT(*) FROM sent_transactions "
+                "WHERE order_id IS NOT NULL GROUP BY order_id HAVING COUNT(*) > 1 "
+                "ORDER BY order_id"
+            ) as duplicate_cur:
+                duplicate_orders = await duplicate_cur.fetchall()
+
+            if duplicate_orders:
+                conflicts = []
+                for duplicate_order_id, duplicate_count in duplicate_orders:
+                    async with db.execute(
+                        "SELECT id FROM sent_transactions WHERE order_id = ? ORDER BY id",
+                        (duplicate_order_id,),
+                    ) as row_id_cur:
+                        row_ids = [int(row[0]) for row in await row_id_cur.fetchall()]
+                    conflicts.append(
+                        f"order_id={duplicate_order_id!r} count={int(duplicate_count)} "
+                        f"row_ids={row_ids}"
+                    )
+                raise RuntimeError(
+                    "Duplicate sent_transactions rows prevent safe startup; no rows were deleted. "
+                    "Resolve the conflicts manually before restarting. Conflicts: "
+                    + "; ".join(conflicts)
+                )
+
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_sent_transactions_order_id "
+                "ON sent_transactions(order_id)"
+            )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
     logger.info("База данных инициализирована")
 
 
