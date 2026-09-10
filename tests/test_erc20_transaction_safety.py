@@ -1441,7 +1441,10 @@ def test_proven_single_persisted_transfer_revert_can_release_gate(tmp_path, monk
 
 def test_init_db_preserves_legacy_row_and_adds_nullable_intent_columns(tmp_path, monkeypatch):
     db_path = str(tmp_path / "legacy-intent-migration.sqlite3")
+    monkeypatch.setattr(app, "DB_PATH", db_path)
+    asyncio.run(app.init_db())
     with sqlite3.connect(db_path) as db:
+        db.execute("DROP TABLE sent_transactions")
         db.execute(
             "CREATE TABLE sent_transactions ("
             "id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, plan_id INTEGER, "
@@ -1454,8 +1457,8 @@ def test_init_db_preserves_legacy_row_and_adds_nullable_intent_columns(tmp_path,
             "(1, 10001, NULL, 'legacy-order', 'USDT-ARB', '0xapprove', '0xtransfer', "
             "25.0, '0xdeposit', 'sent', NULL, 1700000000)"
         )
+        db.execute("PRAGMA user_version = 0")
 
-    monkeypatch.setattr(app, "DB_PATH", db_path)
     asyncio.run(app.init_db())
     asyncio.run(app.init_db())
 

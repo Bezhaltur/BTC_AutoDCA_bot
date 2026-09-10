@@ -18,6 +18,7 @@ def init_current_db(db_path, monkeypatch):
 def remove_unique_index(db_path):
     with sqlite3.connect(db_path) as db:
         db.execute(f"DROP INDEX {INDEX_NAME}")
+        db.execute("PRAGMA user_version = 0")
 
 
 def insert_transaction(
@@ -297,7 +298,7 @@ def test_index_creation_error_does_not_modify_transaction_rows(tmp_path, monkeyp
         db.execute(f"CREATE TABLE {INDEX_NAME} (marker INTEGER)")
     before = snapshot_transactions_and_gate(db_path)
 
-    with pytest.raises(sqlite3.OperationalError, match="already a table"):
+    with pytest.raises(RuntimeError, match="Unknown or missing SQLite schema objects"):
         asyncio.run(app.init_db())
 
     assert snapshot_transactions_and_gate(db_path) == before
