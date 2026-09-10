@@ -1444,6 +1444,14 @@ def test_init_db_preserves_legacy_row_and_adds_nullable_intent_columns(tmp_path,
     monkeypatch.setattr(app, "DB_PATH", db_path)
     asyncio.run(app.init_db())
     with sqlite3.connect(db_path) as db:
+        db.execute("DROP TABLE completed_orders")
+        db.execute(
+            "CREATE TABLE completed_orders ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,"
+            "order_id TEXT NOT NULL UNIQUE,btc_txid TEXT,"
+            "notified INTEGER DEFAULT 0,completed_at INTEGER,"
+            "FOREIGN KEY(user_id) REFERENCES dca_plans(user_id))"
+        )
         db.execute("DROP TABLE sent_transactions")
         db.execute(
             "CREATE TABLE sent_transactions ("

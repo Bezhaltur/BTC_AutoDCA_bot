@@ -68,7 +68,7 @@ def test_sync_factory_applies_only_busy_timeout(tmp_path, monkeypatch):
         assert verify.execute("PRAGMA journal_mode").fetchone()[0] == journal_mode_before
 
 
-def test_init_db_uses_factory_for_exact_v1_validation(tmp_path, monkeypatch):
+def test_init_db_uses_factory_for_exact_v2_validation(tmp_path, monkeypatch):
     db_path = tmp_path / "init-policy.sqlite3"
     monkeypatch.setattr(app, "DB_PATH", str(db_path))
 
