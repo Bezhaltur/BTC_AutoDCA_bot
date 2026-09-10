@@ -6925,13 +6925,14 @@ async def cmd_pause(message: Message):
             if not plan_row:
                 await message.answer(f"❌ План не найден.\n\n{build_status_hint()}")
                 return
-            
+
+            plan_number = await get_plan_display_number(user_id, plan_id)
+
             # Приостанавливаем по ID
             await db.execute(
                 "UPDATE dca_plans SET active = 0 WHERE id = ? AND user_id = ? AND deleted = 0",
                 (plan_id, user_id)
             )
-            plan_number = await get_plan_display_number(user_id, plan_id)
             msg = f"⏸ План #{plan_number} приостановлен"
         else:
             # Приостанавливаем все планы пользователя (только не удаленные)
@@ -6992,13 +6993,14 @@ async def cmd_resume(message: Message):
             if not plan_row:
                 await message.answer(f"❌ План не найден.\n\n{build_status_hint()}")
                 return
-            
+
+            plan_number = await get_plan_display_number(user_id, plan_id)
+
             # Возобновляем по ID
             await db.execute(
                 "UPDATE dca_plans SET active = 1 WHERE id = ? AND user_id = ? AND deleted = 0",
                 (plan_id, user_id)
             )
-            plan_number = await get_plan_display_number(user_id, plan_id)
             msg = f"▶️ План #{plan_number} возобновлён"
         else:
             # Возобновляем все планы пользователя (только не удаленные)
