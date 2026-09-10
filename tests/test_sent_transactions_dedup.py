@@ -17,6 +17,14 @@ def init_current_db(db_path, monkeypatch):
 
 def remove_unique_index(db_path):
     with sqlite3.connect(db_path) as db:
+        db.execute("DROP TABLE completed_orders")
+        db.execute(
+            "CREATE TABLE completed_orders ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,"
+            "order_id TEXT NOT NULL UNIQUE,btc_txid TEXT,"
+            "notified INTEGER DEFAULT 0,completed_at INTEGER,"
+            "FOREIGN KEY(user_id) REFERENCES dca_plans(user_id))"
+        )
         db.execute(f"DROP INDEX {INDEX_NAME}")
         db.execute("PRAGMA user_version = 0")
 

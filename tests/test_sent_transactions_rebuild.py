@@ -742,7 +742,7 @@ def test_cancellation_while_queued_commit_finishes_with_known_commit(
     assert submitted.count("COMMIT;") == 1
     assert "ROLLBACK;" not in submitted
     with sqlite3.connect(db_path) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
         assert db.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'index' "
             "AND name = 'idx_sent_transactions_order_id'"

@@ -283,7 +283,7 @@ bot = Bot(
 )
 dp = Dispatcher(storage=MemoryStorage())
 DB_PATH = resolve_project_path(os.getenv("DATABASE_PATH", ""), DEFAULT_DB_PATH)
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 DB_BUSY_TIMEOUT_MS = 5000
 
 
@@ -3393,49 +3393,52 @@ _NOTNULL_SENT_GENERATIONS = {
     | _SENT_TRANSACTION_EXACT_AMOUNT_COLUMNS: "sent_notnull_state_token_intent_exact",
 }
 
-# Every entry is a complete user_version=0 database fingerprint. Wallets and
-# completed_orders have one exact supported shape; the final two fields name
-# those shapes explicitly so adding another generation cannot widen this list.
+# Every entry is a complete user_version=0 database fingerprint. The final two
+# fields name the exact wallets and completed_orders generations so adding a
+# new generation cannot create a Cartesian product of independently supported
+# component shapes.
 _SUPPORTED_UNVERSIONED_DATABASE_FINGERPRINTS = frozenset(
     {
-        ("dca_base", "sent_nullable_state", False, "wallets_current", "completed_current"),
-        ("dca_confirmation", "sent_nullable_state", False, "wallets_current", "completed_current"),
-        ("dca_confirmation", "sent_nullable_state", True, "wallets_current", "completed_current"),
-        ("dca_current", "sent_nullable_token", True, "wallets_current", "completed_current"),
-        ("dca_current", "sent_nullable_intent", True, "wallets_current", "completed_current"),
-        ("dca_current", "sent_nullable_exact", False, "wallets_current", "completed_current"),
-        ("dca_current", "sent_nullable_exact", True, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_core", False, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_core", True, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_state", False, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_state", True, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_token", False, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_token", True, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_state_token", False, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_state_token", True, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_intent", False, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_intent", True, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_state_intent", False, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_state_intent", True, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_token_intent", False, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_token_intent", True, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_state_token_intent", False, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_state_token_intent", True, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_intent_exact", False, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_intent_exact", True, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_state_intent_exact", False, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_state_intent_exact", True, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_token_intent_exact", False, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_token_intent_exact", True, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_state_token_intent_exact", False, "wallets_current", "completed_current"),
-        ("dca_current", "sent_notnull_state_token_intent_exact", True, "wallets_current", "completed_current"),
+        ("dca_base", "sent_nullable_state", False, "wallets_current", "completed_v1"),
+        ("dca_confirmation", "sent_nullable_state", False, "wallets_current", "completed_v1"),
+        ("dca_confirmation", "sent_nullable_state", True, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_nullable_token", True, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_nullable_intent", True, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_nullable_exact", False, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_nullable_exact", True, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_core", False, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_core", True, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_state", False, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_state", True, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_token", False, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_token", True, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_state_token", False, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_state_token", True, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_intent", False, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_intent", True, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_state_intent", False, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_state_intent", True, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_token_intent", False, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_token_intent", True, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_state_token_intent", False, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_state_token_intent", True, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_intent_exact", False, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_intent_exact", True, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_state_intent_exact", False, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_state_intent_exact", True, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_token_intent_exact", False, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_token_intent_exact", True, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_state_token_intent_exact", False, "wallets_current", "completed_v1"),
+        ("dca_current", "sent_notnull_state_token_intent_exact", True, "wallets_current", "completed_v1"),
         (
             "dca_current",
             "sent_notnull_canonical",
             True,
             "wallets_current",
-            "completed_current",
+            "completed_v1",
         ),
+        # The only unstamped v2 shape is the exact current whole database.
+        ("dca_current", "sent_nullable_exact", True, "wallets_current", "completed_v2"),
     }
 )
 
@@ -3444,6 +3447,9 @@ _WALLET_COLUMNS = frozenset(
 )
 _COMPLETED_ORDER_COLUMNS = frozenset(
     {"id", "user_id", "order_id", "btc_txid", "notified", "completed_at"}
+)
+_COMPLETED_ORDER_COLUMN_ORDER = (
+    "id", "user_id", "order_id", "btc_txid", "notified", "completed_at"
 )
 
 _DCA_PLAN_COLUMN_SHAPES = {
@@ -4102,10 +4108,14 @@ async def _assert_wallets_schema(db) -> None:
     await _assert_no_table_triggers(db, "wallets")
 
 
-async def _assert_completed_orders_schema(db) -> None:
-    columns = await _read_table_xinfo(db, "completed_orders")
+async def _assert_completed_orders_schema(
+    db, *, version: int, table_name: str = "completed_orders"
+) -> None:
+    if version not in {1, 2}:
+        raise RuntimeError(f"Unsupported completed_orders schema version {version}")
+    columns = await _read_table_xinfo(db, table_name)
     _assert_column_shapes(
-        "completed_orders",
+        table_name,
         columns,
         _COMPLETED_ORDER_COLUMNS,
         _COMPLETED_ORDER_COLUMN_SHAPES,
@@ -4115,25 +4125,52 @@ async def _assert_completed_orders_schema(db) -> None:
         r"REFERENCES\s+dca_plans\s*\(\s*user_id\s*\)"
     )
     _assert_exact_table_sql(
-        await _read_table_sql(db, "completed_orders"),
-        "completed_orders",
+        await _read_table_sql(db, table_name),
+        table_name,
         _COMPLETED_ORDER_COLUMNS,
         _COMPLETED_ORDER_COLUMN_SQL,
-        foreign_key_pattern=foreign_key_sql,
+        foreign_key_pattern=foreign_key_sql if version == 1 else None,
+        allow_quoted_table_name=(version == 2),
     )
     await _assert_foreign_keys(
         db,
-        "completed_orders",
-        [("dca_plans", "user_id", "user_id", "NO ACTION", "NO ACTION", "NONE")],
+        table_name,
+        (
+            [("dca_plans", "user_id", "user_id", "NO ACTION", "NO ACTION", "NONE")]
+            if version == 1
+            else []
+        ),
     )
     await _assert_single_column_unique_index(
         db,
-        "completed_orders",
-        "sqlite_autoindex_completed_orders_1",
+        table_name,
+        f"sqlite_autoindex_{table_name}_1",
         "order_id",
         origin="u",
     )
-    await _assert_no_table_triggers(db, "completed_orders")
+    await _assert_no_table_triggers(db, table_name)
+
+
+async def _classify_completed_orders_schema(db) -> str:
+    async with db.execute('PRAGMA foreign_key_list("completed_orders")') as cursor:
+        foreign_keys = await cursor.fetchall()
+    normalized = [
+        (
+            str(row[2]), str(row[3]), str(row[4]), str(row[5]).upper(),
+            str(row[6]).upper(), str(row[7]).upper(),
+        )
+        for row in foreign_keys
+    ]
+    v1_foreign_key = [
+        ("dca_plans", "user_id", "user_id", "NO ACTION", "NO ACTION", "NONE")
+    ]
+    if normalized == v1_foreign_key:
+        await _assert_completed_orders_schema(db, version=1)
+        return "completed_v1"
+    if normalized == []:
+        await _assert_completed_orders_schema(db, version=2)
+        return "completed_v2"
+    raise RuntimeError("Unsupported completed_orders foreign keys")
 
 
 _NULLABLE_SENT_COLUMN_SQL = {
@@ -4315,7 +4352,7 @@ async def _classify_unversioned_schema(db):
     await _assert_expected_database_objects(db, allow_missing_sent_index=True)
     dca_columns = await _assert_dca_plans_source(db)
     await _assert_wallets_schema(db)
-    await _assert_completed_orders_schema(db)
+    completed_generation = await _classify_completed_orders_schema(db)
     sent_columns = await _read_table_xinfo(db, "sent_transactions")
     transfer_column = next(
         (column for column in sent_columns if str(column[1]) == "transfer_tx_hash"),
@@ -4343,7 +4380,7 @@ async def _classify_unversioned_schema(db):
         sent_generation,
         has_index,
         "wallets_current",
-        "completed_current",
+        completed_generation,
     )
     if database_fingerprint not in _SUPPORTED_UNVERSIONED_DATABASE_FINGERPRINTS:
         raise RuntimeError(
@@ -4355,8 +4392,8 @@ async def _classify_unversioned_schema(db):
         and names == _CURRENT_SENT_TRANSACTION_COLUMNS
         and has_index
     ):
-        return "current", dca_columns, names, has_index
-    return sent_kind, dca_columns, names, has_index
+        return "current", dca_columns, names, has_index, completed_generation
+    return sent_kind, dca_columns, names, has_index, completed_generation
 
 
 async def _assert_v1_schema(db) -> None:
@@ -4365,13 +4402,29 @@ async def _assert_v1_schema(db) -> None:
     if dca_columns != _CURRENT_DCA_PLAN_COLUMNS:
         raise RuntimeError("Schema version 1 requires the current dca_plans generation")
     await _assert_wallets_schema(db)
-    await _assert_completed_orders_schema(db)
+    await _assert_completed_orders_schema(db, version=1)
     sent_columns = await _read_table_xinfo(db, "sent_transactions")
     names, has_index = await _inspect_supported_nullable_sent_transactions(
         db, sent_columns
     )
     if names != _CURRENT_SENT_TRANSACTION_COLUMNS or not has_index:
         raise RuntimeError("Schema version 1 requires the current sent_transactions generation")
+    await _assert_no_duplicate_orders(db)
+
+
+async def _assert_v2_schema(db) -> None:
+    await _assert_expected_database_objects(db, allow_missing_sent_index=False)
+    dca_columns = await _assert_dca_plans_source(db)
+    if dca_columns != _CURRENT_DCA_PLAN_COLUMNS:
+        raise RuntimeError("Schema version 2 requires the current dca_plans generation")
+    await _assert_wallets_schema(db)
+    await _assert_completed_orders_schema(db, version=2)
+    sent_columns = await _read_table_xinfo(db, "sent_transactions")
+    names, has_index = await _inspect_supported_nullable_sent_transactions(
+        db, sent_columns
+    )
+    if names != _CURRENT_SENT_TRANSACTION_COLUMNS or not has_index:
+        raise RuntimeError("Schema version 2 requires the current sent_transactions generation")
     await _assert_no_duplicate_orders(db)
 
 
@@ -4382,7 +4435,7 @@ async def _database_has_user_objects(db) -> bool:
         return await cursor.fetchone() is not None
 
 
-async def _create_fresh_v1_schema(db) -> None:
+async def _create_fresh_v2_schema(db) -> None:
     await db.execute('''
         CREATE TABLE dca_plans (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4452,8 +4505,7 @@ async def _create_fresh_v1_schema(db) -> None:
             order_id TEXT NOT NULL UNIQUE,
             btc_txid TEXT,
             notified INTEGER DEFAULT 0,
-            completed_at INTEGER,
-            FOREIGN KEY(user_id) REFERENCES dca_plans(user_id)
+            completed_at INTEGER
         )
     ''')
     await db.execute(
@@ -4551,24 +4603,135 @@ async def _rebuild_legacy_sent_transactions_in_transaction(
     )
 
 
-async def _migrate_unversioned_schema(db, classification) -> None:
-    kind, dca_columns, sent_columns, has_sent_index = classification
-    if kind == "current":
-        return
-    await _migrate_dca_plans_to_current(db, dca_columns)
-    if kind == "notnull":
-        logger.info("Migrating sent_transactions: transfer_tx_hash NOT NULL -> NULL")
-        await _rebuild_legacy_sent_transactions_in_transaction(
-            db, sent_columns, has_sent_index
-        )
-    elif kind == "nullable":
-        await _migrate_nullable_sent_transactions_to_current(db, sent_columns)
-    else:
-        raise RuntimeError(f"Unsupported unversioned schema classification: {kind}")
-    if not has_sent_index:
+async def _read_completed_orders_rows_and_types(db, table_name: str):
+    columns_sql = ", ".join(f'"{name}"' for name in _COMPLETED_ORDER_COLUMN_ORDER)
+    types_sql = ", ".join(
+        f'typeof("{name}")' for name in _COMPLETED_ORDER_COLUMN_ORDER
+    )
+    async with db.execute(
+        f'SELECT {columns_sql}, {types_sql} FROM "{table_name}" ORDER BY "id"'
+    ) as cursor:
+        rows = await cursor.fetchall()
+    width = len(_COMPLETED_ORDER_COLUMN_ORDER)
+    return [
+        (tuple(row[:width]), tuple(str(value) for value in row[width:]))
+        for row in rows
+    ]
+
+
+def _assert_completed_orders_rows_preserved(expected_rows, actual_rows) -> None:
+    if len(actual_rows) != len(expected_rows):
+        raise RuntimeError("completed_orders rebuild row-count mismatch")
+    if actual_rows != expected_rows:
+        raise RuntimeError("completed_orders rebuild value or storage-type mismatch")
+    ids = [row[0][0] for row in actual_rows]
+    order_ids = [row[0][2] for row in actual_rows]
+    if len(set(ids)) != len(ids) or len(set(order_ids)) != len(order_ids):
+        raise RuntimeError("completed_orders rebuild lost primary or unique identity")
+
+
+async def _read_completed_orders_sequence(db):
+    async with db.execute(
+        "SELECT seq, typeof(seq) FROM sqlite_sequence WHERE name = ?",
+        ("completed_orders",),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    if not rows:
+        return None
+    if len(rows) != 1 or str(rows[0][1]) != "integer":
+        raise RuntimeError("Unsupported completed_orders sqlite_sequence state")
+    sequence = int(rows[0][0])
+    async with db.execute("SELECT MAX(id) FROM completed_orders") as cursor:
+        max_id_row = await cursor.fetchone()
+    max_id = int(max_id_row[0]) if max_id_row and max_id_row[0] is not None else 0
+    if sequence < max(0, max_id):
+        raise RuntimeError("Invalid completed_orders sqlite_sequence high-water mark")
+    return sequence
+
+
+async def _restore_completed_orders_sequence(db, expected_sequence) -> None:
+    await db.execute(
+        "DELETE FROM sqlite_sequence WHERE name = ?", ("completed_orders",)
+    )
+    if expected_sequence is not None:
         await db.execute(
-            "CREATE UNIQUE INDEX idx_sent_transactions_order_id "
-            "ON sent_transactions(order_id)"
+            "INSERT INTO sqlite_sequence(name, seq) VALUES (?, ?)",
+            ("completed_orders", expected_sequence),
+        )
+    actual_sequence = await _read_completed_orders_sequence(db)
+    if actual_sequence != expected_sequence:
+        raise RuntimeError("completed_orders sqlite_sequence was not preserved")
+
+
+async def _migrate_v1_to_v2(db) -> None:
+    # This assertion is the complete source fingerprint and must precede DDL.
+    await _assert_v1_schema(db)
+    source_rows = await _read_completed_orders_rows_and_types(
+        db, "completed_orders"
+    )
+    source_sequence = await _read_completed_orders_sequence(db)
+
+    await db.execute('''
+        CREATE TABLE completed_orders_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            order_id TEXT NOT NULL UNIQUE,
+            btc_txid TEXT,
+            notified INTEGER DEFAULT 0,
+            completed_at INTEGER
+        )
+    ''')
+    copy_columns = ", ".join(
+        f'"{name}"' for name in _COMPLETED_ORDER_COLUMN_ORDER
+    )
+    await db.execute(
+        f"INSERT INTO completed_orders_new ({copy_columns}) "
+        f"SELECT {copy_columns} FROM completed_orders"
+    )
+    await _assert_completed_orders_schema(
+        db, version=2, table_name="completed_orders_new"
+    )
+    copied_rows = await _read_completed_orders_rows_and_types(
+        db, "completed_orders_new"
+    )
+    _assert_completed_orders_rows_preserved(source_rows, copied_rows)
+    del copied_rows
+
+    await db.execute("DROP TABLE completed_orders")
+    await db.execute(
+        "ALTER TABLE completed_orders_new RENAME TO completed_orders"
+    )
+    await _restore_completed_orders_sequence(db, source_sequence)
+    await _assert_completed_orders_schema(db, version=2)
+    rebuilt_rows = await _read_completed_orders_rows_and_types(
+        db, "completed_orders"
+    )
+    _assert_completed_orders_rows_preserved(source_rows, rebuilt_rows)
+
+
+async def _migrate_unversioned_schema(db, classification) -> None:
+    kind, dca_columns, sent_columns, has_sent_index, completed_generation = classification
+    if kind != "current":
+        await _migrate_dca_plans_to_current(db, dca_columns)
+        if kind == "notnull":
+            logger.info("Migrating sent_transactions: transfer_tx_hash NOT NULL -> NULL")
+            await _rebuild_legacy_sent_transactions_in_transaction(
+                db, sent_columns, has_sent_index
+            )
+        elif kind == "nullable":
+            await _migrate_nullable_sent_transactions_to_current(db, sent_columns)
+        else:
+            raise RuntimeError(f"Unsupported unversioned schema classification: {kind}")
+        if not has_sent_index:
+            await db.execute(
+                "CREATE UNIQUE INDEX idx_sent_transactions_order_id "
+                "ON sent_transactions(order_id)"
+            )
+    if completed_generation == "completed_v1":
+        await _migrate_v1_to_v2(db)
+    elif completed_generation != "completed_v2":
+        raise RuntimeError(
+            f"Unsupported completed_orders generation: {completed_generation}"
         )
 
 
@@ -4623,14 +4786,20 @@ async def init_db():
                 raise RuntimeError(f"Invalid database schema version {schema_version}")
 
             if schema_version == CURRENT_SCHEMA_VERSION:
-                await _assert_v1_schema(db)
+                await _assert_v2_schema(db)
+            elif schema_version == 1:
+                await _migrate_v1_to_v2(db)
+                await _assert_v2_schema(db)
+                await db.execute(
+                    f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"
+                )
             elif schema_version == 0:
                 if await _database_has_user_objects(db):
                     classification = await _classify_unversioned_schema(db)
                     await _migrate_unversioned_schema(db, classification)
                 else:
-                    await _create_fresh_v1_schema(db)
-                await _assert_v1_schema(db)
+                    await _create_fresh_v2_schema(db)
+                await _assert_v2_schema(db)
                 await db.execute(
                     f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"
                 )
