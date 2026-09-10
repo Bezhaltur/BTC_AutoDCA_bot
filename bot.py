@@ -13,6 +13,7 @@ import math
 import time
 import re
 import sqlite3
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -283,6 +284,36 @@ bot = Bot(
 dp = Dispatcher(storage=MemoryStorage())
 DB_PATH = resolve_project_path(os.getenv("DATABASE_PATH", ""), DEFAULT_DB_PATH)
 CURRENT_SCHEMA_VERSION = 1
+DB_BUSY_TIMEOUT_MS = 5000
+
+
+@asynccontextmanager
+async def open_db():
+    """Open the application database with the shared connection policy."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"PRAGMA busy_timeout = {DB_BUSY_TIMEOUT_MS}")
+        async with db.execute("PRAGMA busy_timeout") as cursor:
+            busy_timeout = int((await cursor.fetchone())[0])
+        if busy_timeout != DB_BUSY_TIMEOUT_MS:
+            raise RuntimeError(
+                f"SQLite busy_timeout mismatch: expected {DB_BUSY_TIMEOUT_MS}, "
+                f"got {busy_timeout}"
+            )
+        yield db
+
+
+@contextmanager
+def open_db_sync():
+    """Open the application database synchronously with the shared policy."""
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute(f"PRAGMA busy_timeout = {DB_BUSY_TIMEOUT_MS}")
+        busy_timeout = int(db.execute("PRAGMA busy_timeout").fetchone()[0])
+        if busy_timeout != DB_BUSY_TIMEOUT_MS:
+            raise RuntimeError(
+                f"SQLite busy_timeout mismatch: expected {DB_BUSY_TIMEOUT_MS}, "
+                f"got {busy_timeout}"
+            )
+        yield db
 
 
 # ============================================================================
@@ -753,7 +784,7 @@ async def get_execute_command_hint(user_id: int, plan_id: int) -> str:
 
 async def get_plan_display_number(user_id: int, plan_id: int) -> Optional[int]:
     """Return a user-facing plan number without exposing the database ID."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         async with db.execute(
             "SELECT id FROM dca_plans WHERE user_id = ? AND deleted = 0 ORDER BY id",
             (user_id,)
@@ -769,7 +800,7 @@ async def resolve_display_plan_id(message: Message, display_index: int) -> Optio
     """Resolve a user-facing plan index from the current database state."""
     user_id = int(message.from_user.id)
     if int(display_index) > 0:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with open_db() as db:
             async with db.execute(
                 "SELECT id FROM dca_plans WHERE user_id = ? AND deleted = 0 "
                 "ORDER BY id LIMIT 1 OFFSET ?",
@@ -944,7 +975,7 @@ async def create_dca_confirmation_request(
 ) -> bool:
     now = int(time.time())
     expires_at = now + DCA_CONFIRMATION_TIMEOUT_SECONDS
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         async with db.execute(
             "SELECT execution_state, confirmation_expires_at FROM dca_plans "
@@ -985,7 +1016,7 @@ async def create_dca_confirmation_request(
         )
     except Exception as e:
         logger.warning("Failed to send DCA confirmation for plan %s: %s", plan_id, e)
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with open_db() as db:
             await db.execute(
                 "UPDATE dca_plans SET execution_state = 'scheduled', confirmation_message_id = NULL, "
                 "confirmation_expires_at = NULL, confirmation_scheduled_at = NULL "
@@ -995,7 +1026,7 @@ async def create_dca_confirmation_request(
             await db.commit()
         return False
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         await db.execute(
             "UPDATE dca_plans SET confirmation_message_id = ? "
             "WHERE id = ? AND execution_state = 'awaiting_confirmation' AND confirmation_scheduled_at = ?",
@@ -1008,7 +1039,7 @@ async def create_dca_confirmation_request(
 
 async def expire_dca_confirmation(plan_id: int, now_ts: Optional[int] = None) -> bool:
     now = int(now_ts or time.time())
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         async with db.execute(
             "SELECT user_id, interval_hours, next_run, confirmation_message_id, confirmation_scheduled_at, confirmation_expires_at "
@@ -1044,7 +1075,7 @@ async def expire_dca_confirmation(plan_id: int, now_ts: Optional[int] = None) ->
 async def recover_dca_confirmations() -> None:
     """Expire pending DCA confirmations after restart without creating orders."""
     now = int(time.time())
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         await db.execute(
             "UPDATE dca_plans SET confirmation_expires_at = ? "
             "WHERE execution_state = 'awaiting_confirmation' "
@@ -1202,7 +1233,7 @@ async def record_plan_skip_metadata(plan_id: int, reason_code: str, missed_at: O
     """Persist skip metadata without changing scheduler ownership of execution_state."""
     if missed_at is None:
         missed_at = int(time.time())
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         await db.execute(
             "UPDATE dca_plans SET skip_reason = COALESCE(skip_reason, ?), "
             "missed_count = COALESCE(missed_count, 0) + 1, last_missed_at = ?, "
@@ -1224,7 +1255,7 @@ async def skip_missed_dca_cycle(
     """Mark overdue cycle as skipped and notify user."""
     now_ts = int(time.time())
     new_next_run = calculate_next_run_preserving_schedule(scheduled_time, interval_hours, now_ts)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         await db.execute(
             "UPDATE dca_plans SET next_run = ?, execution_state = 'skipped', "
             "skip_notified = 0, skip_reason = COALESCE(skip_reason, ?), "
@@ -1240,7 +1271,7 @@ async def skip_missed_dca_cycle(
     )
     execute_command = await get_execute_command_hint(user_id, plan_id)
     plan_number = await get_plan_display_number(user_id, plan_id)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         async with db.execute(
             "SELECT from_asset, amount, btc_address FROM dca_plans WHERE id = ?",
             (plan_id,)
@@ -1266,7 +1297,7 @@ async def skip_missed_dca_cycle(
         logger.warning("Failed to send missed cycle notification to user %s: %s", user_id, e)
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         await db.execute(
             "UPDATE dca_plans SET skip_notified = 1 WHERE id = ?",
             (plan_id,)
@@ -1288,7 +1319,7 @@ async def mark_order_expired_before_send(
     manual_send_blocked is kept for call compatibility; expired orders always use the same UX-safe text.
     """
     now_ts = int(time.time())
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         async with db.execute(
             "SELECT next_run, interval_hours, from_asset, amount, btc_address, active_order_token "
@@ -1466,7 +1497,7 @@ async def notify_and_clear_expired_order(plan_id: int, order_id: str) -> bool:
     amount = 0
     should_notify = False
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         if not await _active_order_gate_can_be_released(db, plan_id, order_id):
             await db.rollback()
@@ -1527,7 +1558,7 @@ async def notify_and_clear_expired_order(plan_id: int, order_id: str) -> bool:
 
 async def claim_plan_execution(plan_id: int, user_id: Optional[int] = None) -> bool:
     """Atomically claim plan execution to avoid duplicate order creation."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         if user_id is None:
             cur = await db.execute(
@@ -1552,7 +1583,7 @@ async def claim_plan_execution(plan_id: int, user_id: Optional[int] = None) -> b
 
 async def release_plan_claim(plan_id: int) -> None:
     """Release execution claim if order was not created."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         await db.execute(
             "UPDATE dca_plans SET execution_state = 'scheduled' "
             "WHERE id = ? AND execution_state = 'claiming' AND active_order_id IS NULL",
@@ -1566,7 +1597,7 @@ async def claim_auto_send_execution(plan_id: int, order_id: str) -> bool:
     Atomically claim right to run auto_send_usdt for a plan/order pair.
     Uses sent_transactions state transition sending -> transfering as lock.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         async with db.execute(
             "SELECT active_order_id FROM dca_plans WHERE id = ?",
             (plan_id,)
@@ -1626,7 +1657,7 @@ def persist_prepared_erc20_transaction(
         f"({hash_column} = ? AND ({nonce_column} IS NULL OR {nonce_column} = ?) "
         f"AND ({raw_column} IS NULL OR {raw_column} = ?)))"
     )
-    with sqlite3.connect(DB_PATH) as db:
+    with open_db_sync() as db:
         cur = db.execute(
             query,
             (
@@ -1649,7 +1680,7 @@ def persist_exact_payment_intent(
 ) -> None:
     """Persist resolved token units before a transfer transaction is prepared."""
     amount_units_text = str(amount_units)
-    with sqlite3.connect(DB_PATH) as db:
+    with open_db_sync() as db:
         cur = db.execute(
             "UPDATE sent_transactions SET amount_units = ?, token_decimals = ? "
             "WHERE plan_id = ? AND order_id = ? AND state = 'transfering' "
@@ -1746,7 +1777,7 @@ def make_prepared_tx_persister(plan_id: Optional[int], order_id: str):
 
 async def can_resume_auto_send(plan_id: int, order_id: str) -> bool:
     """Guard resume path from duplicate transfer attempts."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         async with db.execute(
             "SELECT active_order_id FROM dca_plans WHERE id = ?",
             (plan_id,)
@@ -1783,7 +1814,7 @@ async def claim_transfer_after_approve(
     if allow_startup_transfering:
         expected_states.append("transfering")
     placeholders = ", ".join("?" for _ in expected_states)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         cur = await db.execute(
             "UPDATE sent_transactions SET state = 'transfering' "
@@ -1876,7 +1907,7 @@ async def fetch_btc_txid(order_id: str) -> str:
     """Fetch btc_txid from completed_orders with short retries."""
     for attempt in range(3):
         try:
-            async with aiosqlite.connect(DB_PATH) as tx_db:
+            async with open_db() as tx_db:
                 async with tx_db.execute(
                     "SELECT btc_txid FROM completed_orders WHERE order_id = ? LIMIT 1",
                     (order_id,)
@@ -2030,7 +2061,7 @@ async def update_status_message(user_id: int, text: str) -> None:
 async def mark_order_completed(plan_id: int, order_id: str, reason: str) -> bool:
     """Mark order as completed, clear active marker, and write history entry."""
     completed_at = int(time.time())
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         clear_cur = await db.execute(
             "UPDATE dca_plans SET active_order_id = NULL, active_order_token = NULL, active_order_address = NULL, "
@@ -2079,7 +2110,7 @@ async def mark_order_failed(
     proven_pre_broadcast: bool = False,
 ) -> bool:
     """Mark order as failed and clear active marker."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         if not await _active_order_gate_can_be_released(
             db,
@@ -2125,7 +2156,7 @@ async def finalize_expired_unavailable_order(plan_id: int, order_id: str, local_
     if not local_expires or now_ts <= local_expires:
         return "not_expired"
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         async with db.execute(
             "SELECT network_key, transfer_tx_hash FROM sent_transactions "
             "WHERE plan_id = ? AND order_id = ? ORDER BY sent_at DESC LIMIT 1",
@@ -2221,7 +2252,7 @@ async def resume_transfer_after_approve(
 
 async def recovery_scan_pending_transactions() -> None:
     """Recover in-flight transactions after bot restart."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         async with db.execute(
             "SELECT id, plan_id, user_id, order_id, network_key, approve_tx_hash, transfer_tx_hash, "
             "error_message, state, amount, deposit_address, approve_raw_tx, transfer_raw_tx, "
@@ -2244,7 +2275,7 @@ async def recovery_scan_pending_transactions() -> None:
                 approve_tx, transfer_tx, approve_raw_tx, transfer_raw_tx
             )
         except Exception as e:
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with open_db() as db:
                 await db.execute(
                     "UPDATE sent_transactions SET error_message = ? WHERE id = ?",
                     (f"ERC20 recovery blocked: invalid persisted raw transaction: {e}", tx_id),
@@ -2258,7 +2289,7 @@ async def recovery_scan_pending_transactions() -> None:
                     persisted_amount_units, persisted_token_decimals
                 )
             except (TypeError, ValueError) as e:
-                async with aiosqlite.connect(DB_PATH) as db:
+                async with open_db() as db:
                     await db.execute(
                         "UPDATE sent_transactions SET error_message = ? WHERE id = ?",
                         (f"INVALID_PAYMENT_AMOUNT:{e}; manual review required", tx_id),
@@ -2268,7 +2299,7 @@ async def recovery_scan_pending_transactions() -> None:
 
             wallet_password = _wallet_passwords.get(tx_user_id)
             if plan_id is None or not wallet_password:
-                async with aiosqlite.connect(DB_PATH) as db:
+                async with open_db() as db:
                     await db.execute(
                         "UPDATE sent_transactions SET error_message = "
                         "COALESCE(NULLIF(error_message, ''), ?) WHERE id = ?",
@@ -2277,7 +2308,7 @@ async def recovery_scan_pending_transactions() -> None:
                     await db.commit()
                 continue
 
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with open_db() as db:
                 async with db.execute(
                     "SELECT btc_address, active_order_expires, next_run, interval_hours "
                     "FROM dca_plans WHERE id = ?",
@@ -2304,7 +2335,7 @@ async def recovery_scan_pending_transactions() -> None:
                     interval_hours=plan_row[3],
                 )
             )
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with open_db() as db:
                 await db.execute(
                     "UPDATE sent_transactions SET state = ?, approve_tx_hash = ?, "
                     "transfer_tx_hash = ?, error_message = ? WHERE id = ?",
@@ -2328,7 +2359,7 @@ async def recovery_scan_pending_transactions() -> None:
         logger.info("Recovery: checking pending transaction %s", tx_hash)
         tx_status = await get_transfer_tx_status(network_key, tx_hash)
 
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with open_db() as db:
             if tx_status == "confirmed":
                 if action_name == "approve":
                     try:
@@ -2467,7 +2498,7 @@ async def recover_stale_plan_claims() -> None:
     Clear stale transient execution states left after unexpected restart/crash.
     Safe because only rows without active_order_id are reset.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         cur = await db.execute(
             "UPDATE dca_plans SET execution_state = 'scheduled' "
             "WHERE execution_state IN ('claiming', 'confirming') AND active_order_id IS NULL"
@@ -2541,7 +2572,7 @@ async def cb_dca_skip(callback: CallbackQuery):
     user_id = int(callback.from_user.id)
     now = int(time.time())
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         async with db.execute(
             "SELECT interval_hours, next_run, confirmation_message_id "
@@ -2588,7 +2619,7 @@ async def cb_dca_confirm(callback: CallbackQuery):
     user_id = int(callback.from_user.id)
     now = int(time.time())
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         async with db.execute(
             "SELECT from_asset, amount, interval_hours, next_run, confirmation_message_id, confirmation_expires_at "
@@ -2636,7 +2667,7 @@ async def cb_dca_confirm(callback: CallbackQuery):
     try:
         await cmd_execute(execute_message)  # type: ignore[arg-type]
     finally:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with open_db() as db:
             await db.execute(
                 "UPDATE dca_plans SET execution_state = 'scheduled' "
                 "WHERE id = ? AND user_id = ? AND execution_state = 'confirming' AND active_order_id IS NULL",
@@ -2685,7 +2716,7 @@ async def notify_offline_startup_status() -> None:
     offline_detected = bool(last_seen_ts and downtime is not None and downtime > DCA_EXECUTION_WINDOW_SECONDS)
 
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with open_db() as db:
             async with db.execute(
                 "SELECT user_id, id, from_asset, amount, btc_address, next_run, skip_reason, missed_count, last_missed_at "
                 "FROM dca_plans "
@@ -2765,7 +2796,7 @@ async def notify_offline_startup_status() -> None:
                 offline_updates.append((offline_count, last_offline_missed_at, plan_id))
 
     if offline_updates:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with open_db() as db:
             for offline_count, last_offline_missed_at, plan_id in offline_updates:
                 await db.execute(
                     "UPDATE dca_plans SET skip_notified = 0, skip_reason = COALESCE(skip_reason, ?), "
@@ -2807,7 +2838,7 @@ async def notify_offline_startup_status() -> None:
 
         if notified_plan_ids:
             try:
-                async with aiosqlite.connect(DB_PATH) as db:
+                async with open_db() as db:
                     placeholders = ",".join("?" for _ in notified_plan_ids)
                     await db.execute(
                         f"UPDATE dca_plans SET execution_state = 'scheduled' "
@@ -4568,7 +4599,7 @@ async def _execute_sqlite_control_statement_to_completion(
 
 async def init_db():
     """Validate or atomically migrate the SQLite schema to the current version."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         transaction_started = False
         commit_cancellation = None
         try:
@@ -4654,7 +4685,7 @@ async def dca_scheduler():
         try:
             now = int(time.time())
             
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with open_db() as db:
                 async with db.execute(
                     "SELECT id FROM dca_plans WHERE execution_state = 'awaiting_confirmation' "
                     "AND confirmation_expires_at IS NOT NULL AND confirmation_expires_at <= ?",
@@ -5704,7 +5735,7 @@ async def cmd_history(message: Message):
     """
     user_id = message.from_user.id
     
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         async with db.execute(
             "SELECT st.plan_id, st.order_id, st.network_key, st.amount, "
             "COALESCE(dp.btc_address, '') AS btc_address, "
@@ -5903,7 +5934,7 @@ async def cmd_execute(message: Message):
             pass
     
     # Получаем список всех планов пользователя (в том же порядке что и в /status)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         async with db.execute(
             "SELECT id, from_asset, amount, interval_hours FROM dca_plans WHERE user_id = ? AND deleted = 0 ORDER BY id",
             (user_id,),
@@ -5934,7 +5965,7 @@ async def cmd_execute(message: Message):
         plan_id = mapped_plan_id
     
     # Получаем конкретный план по ID (только не удаленные)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         async with db.execute(
             "SELECT from_asset, amount, interval_hours, btc_address, active_order_id, active_order_token, active_order_address, "
             "active_order_amount, active_order_expires, next_run "
@@ -5959,7 +5990,7 @@ async def cmd_execute(message: Message):
         await update_order_progress_message(int(user_id), str(active_order_id), existing_text)
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         async with db.execute(
             "SELECT order_id, order_token, state FROM sent_transactions "
             "WHERE plan_id = ? AND state IN ('sending', 'tx_pending', 'pending', 'blocked', 'transfering') "
@@ -6044,7 +6075,7 @@ async def cmd_execute(message: Message):
             active_order_expires = None
 
     if active_order_id:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with open_db() as db:
             async with db.execute(
                 "SELECT id, state, approve_tx_hash, transfer_tx_hash, error_message, amount, "
                 "deposit_address, amount_units, token_decimals, approve_raw_tx, transfer_raw_tx "
@@ -6074,7 +6105,7 @@ async def cmd_execute(message: Message):
                     transfer_raw_tx,
                 )
             except Exception as e:
-                async with aiosqlite.connect(DB_PATH) as db:
+                async with open_db() as db:
                     await db.execute(
                         "UPDATE sent_transactions SET error_message = ? WHERE id = ?",
                         (f"ERC20 recovery blocked: invalid persisted raw transaction: {e}", tx_id),
@@ -6088,7 +6119,7 @@ async def cmd_execute(message: Message):
                         persisted_amount_units, persisted_token_decimals
                     )
                 except (TypeError, ValueError) as e:
-                    async with aiosqlite.connect(DB_PATH) as db:
+                    async with open_db() as db:
                         await db.execute(
                             "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE id = ?",
                             (f"INVALID_PAYMENT_AMOUNT:{e}", tx_id),
@@ -6118,7 +6149,7 @@ async def cmd_execute(message: Message):
                     scheduled_time=plan_next_run,
                     interval_hours=interval_hours,
                 )
-                async with aiosqlite.connect(DB_PATH) as db:
+                async with open_db() as db:
                     if resume_state == "confirmed":
                         await db.execute(
                             "UPDATE sent_transactions SET state = 'confirmed', approve_tx_hash = ?, transfer_tx_hash = ?, error_message = NULL WHERE order_id = ? AND plan_id = ?",
@@ -6157,7 +6188,7 @@ async def cmd_execute(message: Message):
                 return
 
             if not pending_tx_hash:
-                async with aiosqlite.connect(DB_PATH) as db:
+                async with open_db() as db:
                     await db.execute(
                         "UPDATE sent_transactions SET error_message = "
                         "COALESCE(NULLIF(error_message, ''), ?) WHERE order_id = ? AND plan_id = ?",
@@ -6178,7 +6209,7 @@ async def cmd_execute(message: Message):
                         pending_tx_hash,
                         pending_action,
                     )
-                async with aiosqlite.connect(DB_PATH) as db:
+                async with open_db() as db:
                     await db.execute(
                         "UPDATE sent_transactions SET state = 'tx_pending' WHERE order_id = ? AND plan_id = ?",
                         (active_order_id, plan_id)
@@ -6196,7 +6227,7 @@ async def cmd_execute(message: Message):
                             persisted_amount_units, persisted_token_decimals
                         )
                     except (TypeError, ValueError) as e:
-                        async with aiosqlite.connect(DB_PATH) as db:
+                        async with open_db() as db:
                             await db.execute(
                                 "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE id = ?",
                                 (f"INVALID_PAYMENT_AMOUNT:{e}", tx_id),
@@ -6226,7 +6257,7 @@ async def cmd_execute(message: Message):
                         scheduled_time=plan_next_run,
                         interval_hours=interval_hours,
                     )
-                    async with aiosqlite.connect(DB_PATH) as db:
+                    async with open_db() as db:
                         if resume_state == "confirmed":
                             await db.execute(
                                 "UPDATE sent_transactions SET state = 'confirmed', approve_tx_hash = ?, transfer_tx_hash = ?, error_message = NULL WHERE order_id = ? AND plan_id = ?",
@@ -6263,7 +6294,7 @@ async def cmd_execute(message: Message):
                             f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} требует проверки."
                         )
                     return
-                async with aiosqlite.connect(DB_PATH) as db:
+                async with open_db() as db:
                     await db.execute(
                         "UPDATE sent_transactions SET state = 'confirmed', error_message = NULL WHERE order_id = ? AND plan_id = ?",
                         (active_order_id, plan_id)
@@ -6411,7 +6442,7 @@ async def cmd_execute(message: Message):
         
         # Сохраняем информацию об активном ордере в БД
         order_expires = extract_order_expires_at(data)
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with open_db() as db:
             await db.execute(
                 "UPDATE dca_plans SET active_order_id = ?, active_order_token = ?, active_order_address = ?, "
                 "active_order_amount = ?, active_order_expires = ?, order_expired_notified = 0, execution_state = 'scheduled', "
@@ -6473,7 +6504,7 @@ async def cmd_execute(message: Message):
         
         if wallet_row and wallet_password:
 
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with open_db() as db:
                 await db.execute(
                     "INSERT INTO sent_transactions (user_id, plan_id, order_id, order_token, network_key, amount, deposit_address, state) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, 'sending')",
@@ -6528,7 +6559,7 @@ async def cmd_execute(message: Message):
             
             if success:
                 # Сохраняем информацию о транзакции
-                async with aiosqlite.connect(DB_PATH) as db:
+                async with open_db() as db:
                     await db.execute(
                         "UPDATE sent_transactions SET approve_tx_hash = ?, transfer_tx_hash = ?, state = 'sent', error_message = NULL "
                         "WHERE order_id = ? AND plan_id = ?",
@@ -6560,7 +6591,7 @@ async def cmd_execute(message: Message):
                 
                 logger.info(f"Auto-send successful: order_id={order_id}, approve_tx={approve_tx}, transfer_tx={transfer_tx}")
             else:
-                async with aiosqlite.connect(DB_PATH) as db:
+                async with open_db() as db:
                     if is_persistence_conflict_error(error_msg):
                         await db.execute(
                             "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? "
@@ -6692,7 +6723,7 @@ async def cmd_execute(message: Message):
                     action_text="Оплатите ордер на указанный адрес.",
                 ),
             )
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with open_db() as db:
                 await db.execute(
                     "UPDATE dca_plans SET missed_count = 0 WHERE id = ?",
                     (plan_id,)
@@ -6731,7 +6762,7 @@ async def cmd_status(message: Message):
     """
     user_id = message.from_user.id
     
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         async with db.execute(
             "SELECT id, from_asset, amount, interval_hours, btc_address, next_run, active, "
             "active_order_id, active_order_token, active_order_address, active_order_amount, active_order_expires, "
@@ -6755,7 +6786,7 @@ async def cmd_status(message: Message):
     transfer_hash_by_order = {}
     state_by_order = {}
     error_by_order = {}
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         async with db.execute(
             "SELECT plan_id, order_id, transfer_tx_hash, state, error_message "
             "FROM sent_transactions WHERE user_id = ? ORDER BY sent_at DESC",
@@ -6883,7 +6914,7 @@ async def cmd_pause(message: Message):
         if plan_id is None:
             return
     
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         if plan_id:
             async with db.execute(
                 "SELECT id FROM dca_plans WHERE id = ? AND user_id = ? AND deleted = 0",
@@ -6950,7 +6981,7 @@ async def cmd_resume(message: Message):
         if plan_id is None:
             return
     
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         if plan_id:
             async with db.execute(
                 "SELECT id FROM dca_plans WHERE id = ? AND user_id = ? AND deleted = 0",
@@ -7023,7 +7054,7 @@ async def cmd_delete(message: Message):
         )
         return
     
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         # Проверяем что план существует и принадлежит пользователю (только не удаленные)
         async with db.execute(
             "SELECT from_asset, active_order_id, active_order_expires FROM dca_plans WHERE id = ? AND user_id = ? AND deleted = 0",
@@ -7171,7 +7202,7 @@ async def cmd_setwallet(message: Message):
             json.dump({"keystore": keystore}, f, indent=2)
         
         # Save wallet address to database
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with open_db() as db:
             await db.execute('''
                 INSERT OR REPLACE INTO wallets (user_id, wallet_address)
                 VALUES (?, ?)
@@ -7380,7 +7411,7 @@ async def cmd_walletstatus(message: Message):
     """
     user_id = message.from_user.id
     
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         async with db.execute(
             "SELECT wallet_address FROM wallets WHERE user_id = ?",
             (user_id,)
@@ -7513,7 +7544,7 @@ async def cmd_deletewallet(message: Message):
     user_id = message.from_user.id
     
     # Удаляем из БД и файловой системы
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         await db.execute(
             "DELETE FROM wallets WHERE user_id = ?",
             (user_id,)
@@ -7676,7 +7707,7 @@ async def cmd_setdca(message: Message):
         next_run = int(time.time()) + (interval * 3600)
         now = int(time.time())
         
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with open_db() as db:
             new_plan_id = None
             # Проверяем сколько НЕ удаленных планов уже есть для этой сети
             async with db.execute(
@@ -7828,7 +7859,7 @@ async def order_monitor():
             now = int(time.time())
 
             # Проверяем активные ордера в dca_plans и корректно завершаем их по фактическому статусу
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with open_db() as db:
                 async with db.execute(
                     "SELECT id, active_order_id, active_order_token, active_order_expires FROM dca_plans "
                     "WHERE active_order_id IS NOT NULL"
@@ -7857,7 +7888,7 @@ async def order_monitor():
                     logger.info("Order %s status unavailable after retries; keeping order active", order_id)
                     continue
             
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with open_db() as db:
                 # Получаем все отправленные ордера без history-записи
                 async with db.execute(
                     "SELECT st.order_id, st.order_token, st.user_id, st.plan_id, st.network_key, st.amount, "
@@ -7897,7 +7928,7 @@ async def order_monitor():
                                     btc_amount=btc_amount,
                                 )
                                 await update_order_progress_message(int(user_id), str(order_id), completion_text)
-                                async with aiosqlite.connect(DB_PATH) as ndb:
+                                async with open_db() as ndb:
                                     await ndb.execute("UPDATE completed_orders SET notified = 2 WHERE order_id = ?", (order_id,))
                                     await ndb.commit()
                                 _order_progress_messages.pop(str(order_id), None)
@@ -7911,7 +7942,7 @@ async def order_monitor():
                                     btc_txid=btc_txid,
                                 )
                                 await update_order_progress_message(int(user_id), str(order_id), sent_text)
-                                async with aiosqlite.connect(DB_PATH) as ndb:
+                                async with open_db() as ndb:
                                     await ndb.execute("UPDATE completed_orders SET notified = 1 WHERE order_id = ?", (order_id,))
                                     await ndb.commit()
                             else:
@@ -7961,7 +7992,7 @@ async def load_passwords_at_startup():
     """
     logger.info("Loading wallet passwords from keyring...")
     
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with open_db() as db:
         async with db.execute("SELECT user_id FROM wallets") as cursor:
             users = await cursor.fetchall()
     
