@@ -72,17 +72,35 @@ def test_fixedfloat_request_logging_masks_order_token(monkeypatch, caplog):
 
 def test_dca_token_survives_init_db_migration_and_restart(tmp_path, monkeypatch):
     db_path = tmp_path / "dca-migration.sqlite3"
+    monkeypatch.setattr(app, "DB_PATH", str(db_path))
+    asyncio.run(app.init_db())
     with sqlite3.connect(db_path) as db:
+        db.execute("DROP TABLE dca_plans")
+        db.execute("DROP TABLE sent_transactions")
         db.execute(
             "CREATE TABLE dca_plans ("
-            "id INTEGER PRIMARY KEY, user_id INTEGER, active_order_id TEXT"
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, from_asset TEXT, "
+            "amount REAL, interval_hours INTEGER, btc_address TEXT, next_run INTEGER, "
+            "active BOOLEAN DEFAULT 1, created_at INTEGER DEFAULT (strftime('%s','now')), "
+            "active_order_id TEXT, active_order_address TEXT, active_order_amount TEXT, "
+            "active_order_expires INTEGER, deleted BOOLEAN DEFAULT 0, "
+            "execution_state TEXT DEFAULT 'scheduled', last_tx_hash TEXT"
             ")"
+        )
+        db.execute(
+            "CREATE TABLE sent_transactions ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, "
+            "plan_id INTEGER, order_id TEXT NOT NULL, network_key TEXT NOT NULL, "
+            "approve_tx_hash TEXT, transfer_tx_hash TEXT, amount REAL NOT NULL, "
+            "deposit_address TEXT NOT NULL, state TEXT DEFAULT 'scheduled', "
+            "error_message TEXT, sent_at INTEGER DEFAULT (strftime('%s','now')), "
+            "FOREIGN KEY(plan_id) REFERENCES dca_plans(id))"
         )
         db.execute(
             "INSERT INTO dca_plans (id, user_id, active_order_id) VALUES (1, 10001, 'order-1')"
         )
+        db.execute("PRAGMA user_version = 0")
 
-    monkeypatch.setattr(app, "DB_PATH", str(db_path))
     asyncio.run(app.init_db())
     with sqlite3.connect(db_path) as db:
         db.execute(
@@ -99,7 +117,10 @@ def test_dca_token_survives_init_db_migration_and_restart(tmp_path, monkeypatch)
 
 def test_sent_transactions_rebuild_preserves_order_token(tmp_path, monkeypatch):
     db_path = tmp_path / "sent-migration.sqlite3"
+    monkeypatch.setattr(app, "DB_PATH", str(db_path))
+    asyncio.run(app.init_db())
     with sqlite3.connect(db_path) as db:
+        db.execute("DROP TABLE sent_transactions")
         db.execute(
             "CREATE TABLE sent_transactions ("
             "id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, plan_id INTEGER, "
@@ -114,8 +135,8 @@ def test_sent_transactions_rebuild_preserves_order_token(tmp_path, monkeypatch):
             "NULL, '0xtx', 25.0, '0xdeposit', 'sent', NULL, 1700000000"
             ")"
         )
+        db.execute("PRAGMA user_version = 0")
 
-    monkeypatch.setattr(app, "DB_PATH", str(db_path))
     asyncio.run(app.init_db())
     with sqlite3.connect(db_path) as db:
         row = db.execute(

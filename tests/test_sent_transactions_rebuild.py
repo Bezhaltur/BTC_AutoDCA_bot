@@ -34,6 +34,33 @@ EXACT_AMOUNT_DEFINITIONS = [
 ]
 
 
+def create_supported_companion_tables(db):
+    db.execute(
+        "CREATE TABLE dca_plans ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, from_asset TEXT, "
+        "amount REAL, interval_hours INTEGER, btc_address TEXT, next_run INTEGER, "
+        "active BOOLEAN DEFAULT 1, created_at INTEGER DEFAULT (strftime('%s','now')), "
+        "active_order_id TEXT, active_order_token TEXT, active_order_address TEXT, "
+        "active_order_amount TEXT, active_order_expires INTEGER, deleted BOOLEAN DEFAULT 0, "
+        "execution_state TEXT DEFAULT 'scheduled', last_tx_hash TEXT, "
+        "skip_notified INTEGER DEFAULT 0, skip_reason TEXT, missed_count INTEGER DEFAULT 0, "
+        "last_missed_at INTEGER, last_execution_attempt_at INTEGER, "
+        "confirmation_message_id INTEGER, confirmation_expires_at INTEGER, "
+        "confirmation_scheduled_at INTEGER, order_expired_notified INTEGER DEFAULT 0)"
+    )
+    db.execute(
+        "CREATE TABLE wallets ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL UNIQUE, "
+        "wallet_address TEXT NOT NULL, created_at INTEGER DEFAULT (strftime('%s','now')))"
+    )
+    db.execute(
+        "CREATE TABLE completed_orders ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, "
+        "order_id TEXT NOT NULL UNIQUE, btc_txid TEXT, notified INTEGER DEFAULT 0, "
+        "completed_at INTEGER, FOREIGN KEY(user_id) REFERENCES dca_plans(user_id))"
+    )
+
+
 def create_legacy_transactions(
     db_path,
     *,
@@ -76,6 +103,7 @@ def create_legacy_transactions(
         definitions.reverse()
 
     with sqlite3.connect(db_path) as db:
+        create_supported_companion_tables(db)
         db.execute(
             f"CREATE TABLE {table_name} ({', '.join(definitions)})"
             f"{table_suffix}"
@@ -660,6 +688,8 @@ def test_cancellation_before_commit_is_queued_rolls_back(tmp_path, monkeypatch):
     assert "COMMIT;" not in submitted
     assert "ROLLBACK;" in submitted
     assert destructive_snapshot(db_path) == before
+    with sqlite3.connect(db_path) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 0
     assert_write_lock_released(db_path)
 
     run_init(db_path, monkeypatch)
@@ -712,6 +742,7 @@ def test_cancellation_while_queued_commit_finishes_with_known_commit(
     assert submitted.count("COMMIT;") == 1
     assert "ROLLBACK;" not in submitted
     with sqlite3.connect(db_path) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 1
         assert db.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'index' "
             "AND name = 'idx_sent_transactions_order_id'"
@@ -752,6 +783,8 @@ def test_sqlite_commit_error_rolls_back_and_fails_closed(tmp_path, monkeypatch):
 
     assert "ROLLBACK;" in submitted
     assert destructive_snapshot(db_path) == before
+    with sqlite3.connect(db_path) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 0
     assert_write_lock_released(db_path)
 
 
@@ -896,35 +929,45 @@ def test_cancellation_after_commit_acknowledgement_keeps_committed_schema(
             "ON sent_transactions(order_id)"
         )
     monkeypatch.setattr(app, "DB_PATH", str(db_path))
-    post_commit_statement_running = threading.Event()
-    release_post_commit_statement = threading.Event()
+    post_commit_acknowledged = None
+    commit_paused = False
+    control_statements = []
+    submitted = install_worker_statement_hooks(monkeypatch, {})
+    original_control = app._execute_sqlite_control_statement_to_completion
 
-    def delay_post_commit_statement(function, args, kwargs):
-        post_commit_statement_running.set()
-        if not release_post_commit_statement.wait(timeout=5):
-            raise RuntimeError("timed out waiting after COMMIT acknowledgement")
-        return function(*args, **kwargs)
+    async def pause_after_commit(db, statement, **kwargs):
+        nonlocal commit_paused
+        control_statements.append(statement)
+        result = await original_control(db, statement, **kwargs)
+        if statement == "COMMIT;" and not commit_paused:
+            commit_paused = True
+            post_commit_acknowledged.set()
+            await asyncio.Event().wait()
+        return result
 
-    submitted = install_worker_statement_hook(
-        monkeypatch, "PRAGMA FOREIGN_KEYS=ON;", delay_post_commit_statement
+    monkeypatch.setattr(
+        app, "_execute_sqlite_control_statement_to_completion", pause_after_commit
     )
 
     async def cancel_after_commit_acknowledgement():
+        nonlocal post_commit_acknowledged
+        post_commit_acknowledged = asyncio.Event()
         init_task = asyncio.create_task(app.init_db())
-        assert await asyncio.to_thread(post_commit_statement_running.wait, 5)
+        await asyncio.wait_for(post_commit_acknowledged.wait(), timeout=5)
         init_task.cancel()
-        await asyncio.sleep(0)
-        release_post_commit_statement.set()
         with pytest.raises(asyncio.CancelledError):
             await init_task
 
     asyncio.run(cancel_after_commit_acknowledgement())
 
+    assert control_statements.count("COMMIT;") == 1
+    assert "ROLLBACK;" not in control_statements
+    assert submitted.count("COMMIT;") == 1
+    assert "ROLLBACK;" not in submitted
     columns, rows, transfer_notnull, temp_table = transaction_snapshot(db_path)
     assert transfer_notnull == 0
     assert temp_table is None
     assert len(rows) == 1
-    assert "ROLLBACK;" not in submitted
     with sqlite3.connect(db_path) as db:
         assert db.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'index' "

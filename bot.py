@@ -282,6 +282,7 @@ bot = Bot(
 )
 dp = Dispatcher(storage=MemoryStorage())
 DB_PATH = resolve_project_path(os.getenv("DATABASE_PATH", ""), DEFAULT_DB_PATH)
+CURRENT_SCHEMA_VERSION = 1
 
 
 # ============================================================================
@@ -3261,6 +3262,202 @@ _SENT_TRANSACTION_COLUMN_SHAPES = {
     "sent_at": ("INTEGER", 0, 0),
 }
 
+_DCA_PLAN_BASE_COLUMNS = frozenset(
+    {
+        "id", "user_id", "from_asset", "amount", "interval_hours",
+        "btc_address", "next_run", "active", "created_at", "active_order_id",
+        "active_order_address", "active_order_amount", "active_order_expires",
+        "deleted", "execution_state", "last_tx_hash",
+    }
+)
+_DCA_PLAN_CONFIRMATION_COLUMNS = frozenset(
+    {
+        "skip_notified", "skip_reason", "missed_count", "last_missed_at",
+        "last_execution_attempt_at", "confirmation_message_id",
+        "confirmation_expires_at", "confirmation_scheduled_at",
+        "order_expired_notified",
+    }
+)
+_DCA_PLAN_TOKEN_COLUMNS = frozenset({"active_order_token"})
+_SUPPORTED_DCA_PLAN_COLUMN_SETS = frozenset(
+    {
+        _DCA_PLAN_BASE_COLUMNS,
+        _DCA_PLAN_BASE_COLUMNS | _DCA_PLAN_CONFIRMATION_COLUMNS,
+        _DCA_PLAN_BASE_COLUMNS
+        | _DCA_PLAN_CONFIRMATION_COLUMNS
+        | _DCA_PLAN_TOKEN_COLUMNS,
+    }
+)
+_CURRENT_DCA_PLAN_COLUMNS = (
+    _DCA_PLAN_BASE_COLUMNS | _DCA_PLAN_CONFIRMATION_COLUMNS | _DCA_PLAN_TOKEN_COLUMNS
+)
+
+_NULLABLE_SENT_TRANSACTION_GENERATIONS = (
+    _SENT_TRANSACTION_REQUIRED_LEGACY_COLUMNS | _SENT_TRANSACTION_STATE_COLUMNS,
+    _SENT_TRANSACTION_REQUIRED_LEGACY_COLUMNS
+    | _SENT_TRANSACTION_STATE_COLUMNS
+    | _SENT_TRANSACTION_TOKEN_COLUMNS,
+    _SENT_TRANSACTION_REQUIRED_LEGACY_COLUMNS
+    | _SENT_TRANSACTION_STATE_COLUMNS
+    | _SENT_TRANSACTION_TOKEN_COLUMNS
+    | _SENT_TRANSACTION_INTENT_COLUMNS,
+    _SENT_TRANSACTION_REQUIRED_LEGACY_COLUMNS
+    | _SENT_TRANSACTION_STATE_COLUMNS
+    | _SENT_TRANSACTION_TOKEN_COLUMNS
+    | _SENT_TRANSACTION_INTENT_COLUMNS
+    | _SENT_TRANSACTION_EXACT_AMOUNT_COLUMNS,
+)
+_SUPPORTED_NULLABLE_SENT_TRANSACTION_COLUMNS = frozenset(
+    _NULLABLE_SENT_TRANSACTION_GENERATIONS
+)
+_CURRENT_SENT_TRANSACTION_COLUMNS = _NULLABLE_SENT_TRANSACTION_GENERATIONS[-1]
+
+_DCA_PLAN_GENERATIONS = {
+    _DCA_PLAN_BASE_COLUMNS: "dca_base",
+    _DCA_PLAN_BASE_COLUMNS | _DCA_PLAN_CONFIRMATION_COLUMNS: "dca_confirmation",
+    _CURRENT_DCA_PLAN_COLUMNS: "dca_current",
+}
+_NULLABLE_SENT_GENERATIONS = {
+    _NULLABLE_SENT_TRANSACTION_GENERATIONS[0]: "sent_nullable_state",
+    _NULLABLE_SENT_TRANSACTION_GENERATIONS[1]: "sent_nullable_token",
+    _NULLABLE_SENT_TRANSACTION_GENERATIONS[2]: "sent_nullable_intent",
+    _NULLABLE_SENT_TRANSACTION_GENERATIONS[3]: "sent_nullable_exact",
+}
+_NOTNULL_SENT_GENERATIONS = {
+    _SENT_TRANSACTION_REQUIRED_LEGACY_COLUMNS: "sent_notnull_core",
+    _SENT_TRANSACTION_REQUIRED_LEGACY_COLUMNS
+    | _SENT_TRANSACTION_STATE_COLUMNS: "sent_notnull_state",
+    _SENT_TRANSACTION_REQUIRED_LEGACY_COLUMNS
+    | _SENT_TRANSACTION_TOKEN_COLUMNS: "sent_notnull_token",
+    _SENT_TRANSACTION_REQUIRED_LEGACY_COLUMNS
+    | _SENT_TRANSACTION_STATE_COLUMNS
+    | _SENT_TRANSACTION_TOKEN_COLUMNS: "sent_notnull_state_token",
+    _SENT_TRANSACTION_REQUIRED_LEGACY_COLUMNS
+    | _SENT_TRANSACTION_INTENT_COLUMNS: "sent_notnull_intent",
+    _SENT_TRANSACTION_REQUIRED_LEGACY_COLUMNS
+    | _SENT_TRANSACTION_STATE_COLUMNS
+    | _SENT_TRANSACTION_INTENT_COLUMNS: "sent_notnull_state_intent",
+    _SENT_TRANSACTION_REQUIRED_LEGACY_COLUMNS
+    | _SENT_TRANSACTION_TOKEN_COLUMNS
+    | _SENT_TRANSACTION_INTENT_COLUMNS: "sent_notnull_token_intent",
+    _SENT_TRANSACTION_REQUIRED_LEGACY_COLUMNS
+    | _SENT_TRANSACTION_STATE_COLUMNS
+    | _SENT_TRANSACTION_TOKEN_COLUMNS
+    | _SENT_TRANSACTION_INTENT_COLUMNS: "sent_notnull_state_token_intent",
+    _SENT_TRANSACTION_REQUIRED_LEGACY_COLUMNS
+    | _SENT_TRANSACTION_INTENT_COLUMNS
+    | _SENT_TRANSACTION_EXACT_AMOUNT_COLUMNS: "sent_notnull_intent_exact",
+    _SENT_TRANSACTION_REQUIRED_LEGACY_COLUMNS
+    | _SENT_TRANSACTION_STATE_COLUMNS
+    | _SENT_TRANSACTION_INTENT_COLUMNS
+    | _SENT_TRANSACTION_EXACT_AMOUNT_COLUMNS: "sent_notnull_state_intent_exact",
+    _SENT_TRANSACTION_REQUIRED_LEGACY_COLUMNS
+    | _SENT_TRANSACTION_TOKEN_COLUMNS
+    | _SENT_TRANSACTION_INTENT_COLUMNS
+    | _SENT_TRANSACTION_EXACT_AMOUNT_COLUMNS: "sent_notnull_token_intent_exact",
+    _SENT_TRANSACTION_REQUIRED_LEGACY_COLUMNS
+    | _SENT_TRANSACTION_STATE_COLUMNS
+    | _SENT_TRANSACTION_TOKEN_COLUMNS
+    | _SENT_TRANSACTION_INTENT_COLUMNS
+    | _SENT_TRANSACTION_EXACT_AMOUNT_COLUMNS: "sent_notnull_state_token_intent_exact",
+}
+
+# Every entry is a complete user_version=0 database fingerprint. Wallets and
+# completed_orders have one exact supported shape; the final two fields name
+# those shapes explicitly so adding another generation cannot widen this list.
+_SUPPORTED_UNVERSIONED_DATABASE_FINGERPRINTS = frozenset(
+    {
+        ("dca_base", "sent_nullable_state", False, "wallets_current", "completed_current"),
+        ("dca_confirmation", "sent_nullable_state", False, "wallets_current", "completed_current"),
+        ("dca_confirmation", "sent_nullable_state", True, "wallets_current", "completed_current"),
+        ("dca_current", "sent_nullable_token", True, "wallets_current", "completed_current"),
+        ("dca_current", "sent_nullable_intent", True, "wallets_current", "completed_current"),
+        ("dca_current", "sent_nullable_exact", False, "wallets_current", "completed_current"),
+        ("dca_current", "sent_nullable_exact", True, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_core", False, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_core", True, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_state", False, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_state", True, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_token", False, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_token", True, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_state_token", False, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_state_token", True, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_intent", False, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_intent", True, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_state_intent", False, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_state_intent", True, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_token_intent", False, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_token_intent", True, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_state_token_intent", False, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_state_token_intent", True, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_intent_exact", False, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_intent_exact", True, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_state_intent_exact", False, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_state_intent_exact", True, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_token_intent_exact", False, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_token_intent_exact", True, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_state_token_intent_exact", False, "wallets_current", "completed_current"),
+        ("dca_current", "sent_notnull_state_token_intent_exact", True, "wallets_current", "completed_current"),
+        (
+            "dca_current",
+            "sent_notnull_canonical",
+            True,
+            "wallets_current",
+            "completed_current",
+        ),
+    }
+)
+
+_WALLET_COLUMNS = frozenset(
+    {"id", "user_id", "wallet_address", "created_at"}
+)
+_COMPLETED_ORDER_COLUMNS = frozenset(
+    {"id", "user_id", "order_id", "btc_txid", "notified", "completed_at"}
+)
+
+_DCA_PLAN_COLUMN_SHAPES = {
+    "id": ("INTEGER", 0, 1, None),
+    "user_id": ("INTEGER", 0, 0, None),
+    "from_asset": ("TEXT", 0, 0, None),
+    "amount": ("REAL", 0, 0, None),
+    "interval_hours": ("INTEGER", 0, 0, None),
+    "btc_address": ("TEXT", 0, 0, None),
+    "next_run": ("INTEGER", 0, 0, None),
+    "active": ("BOOLEAN", 0, 0, "1"),
+    "created_at": ("INTEGER", 0, 0, "strftime('%s','now')"),
+    "active_order_id": ("TEXT", 0, 0, None),
+    "active_order_token": ("TEXT", 0, 0, None),
+    "active_order_address": ("TEXT", 0, 0, None),
+    "active_order_amount": ("TEXT", 0, 0, None),
+    "active_order_expires": ("INTEGER", 0, 0, None),
+    "deleted": ("BOOLEAN", 0, 0, "0"),
+    "execution_state": ("TEXT", 0, 0, "'scheduled'"),
+    "last_tx_hash": ("TEXT", 0, 0, None),
+    "skip_notified": ("INTEGER", 0, 0, "0"),
+    "skip_reason": ("TEXT", 0, 0, None),
+    "missed_count": ("INTEGER", 0, 0, "0"),
+    "last_missed_at": ("INTEGER", 0, 0, None),
+    "last_execution_attempt_at": ("INTEGER", 0, 0, None),
+    "confirmation_message_id": ("INTEGER", 0, 0, None),
+    "confirmation_expires_at": ("INTEGER", 0, 0, None),
+    "confirmation_scheduled_at": ("INTEGER", 0, 0, None),
+    "order_expired_notified": ("INTEGER", 0, 0, "0"),
+}
+_WALLET_COLUMN_SHAPES = {
+    "id": ("INTEGER", 0, 1, None),
+    "user_id": ("INTEGER", 1, 0, None),
+    "wallet_address": ("TEXT", 1, 0, None),
+    "created_at": ("INTEGER", 0, 0, "strftime('%s','now')"),
+}
+_COMPLETED_ORDER_COLUMN_SHAPES = {
+    "id": ("INTEGER", 0, 1, None),
+    "user_id": ("INTEGER", 1, 0, None),
+    "order_id": ("TEXT", 1, 0, None),
+    "btc_txid": ("TEXT", 0, 0, None),
+    "notified": ("INTEGER", 0, 0, "0"),
+    "completed_at": ("INTEGER", 0, 0, None),
+}
+
 
 def _normalize_sqlite_default(value: Any) -> Optional[str]:
     if value is None:
@@ -3271,10 +3468,18 @@ def _normalize_sqlite_default(value: Any) -> Optional[str]:
     return normalized
 
 
-def _split_sqlite_table_clauses(create_sql: str) -> list[str]:
+def _split_sqlite_table_clauses(
+    create_sql: str,
+    table_name: str = "sent_transactions",
+    *,
+    allow_quoted_table_name: bool = False,
+) -> list[str]:
     """Split CREATE TABLE body without treating nested expressions as clauses."""
+    table_pattern = re.escape(table_name)
+    if allow_quoted_table_name:
+        table_pattern = rf'(?:{table_pattern}|"{table_pattern}")'
     match = re.match(
-        r"^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?sent_transactions\s*\(",
+        rf"^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?{table_pattern}\s*\(",
         create_sql,
         flags=re.IGNORECASE,
     )
@@ -3327,6 +3532,187 @@ def _split_sqlite_table_clauses(create_sql: str) -> list[str]:
         "Malformed sent_transactions CREATE TABLE statement; "
         "refusing destructive rebuild"
     )
+
+
+_DCA_PLAN_COLUMN_SQL = {
+    "id": r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT",
+    "user_id": r"INTEGER",
+    "from_asset": r"TEXT",
+    "amount": r"REAL",
+    "interval_hours": r"INTEGER",
+    "btc_address": r"TEXT",
+    "next_run": r"INTEGER",
+    "active": r"BOOLEAN\s+DEFAULT\s+1",
+    "created_at": (
+        r"INTEGER\s+DEFAULT\s+\(?\s*strftime\s*"
+        r"\(\s*'%s'\s*,\s*'now'\s*\)\s*\)?"
+    ),
+    "active_order_id": r"TEXT",
+    "active_order_token": r"TEXT",
+    "active_order_address": r"TEXT",
+    "active_order_amount": r"TEXT",
+    "active_order_expires": r"INTEGER",
+    "deleted": r"BOOLEAN\s+DEFAULT\s+0",
+    "execution_state": r"TEXT\s+DEFAULT\s+'scheduled'",
+    "last_tx_hash": r"TEXT",
+    "skip_notified": r"INTEGER\s+DEFAULT\s+0",
+    "skip_reason": r"TEXT",
+    "missed_count": r"INTEGER\s+DEFAULT\s+0",
+    "last_missed_at": r"INTEGER",
+    "last_execution_attempt_at": r"INTEGER",
+    "confirmation_message_id": r"INTEGER",
+    "confirmation_expires_at": r"INTEGER",
+    "confirmation_scheduled_at": r"INTEGER",
+    "order_expired_notified": r"INTEGER\s+DEFAULT\s+0",
+}
+_WALLET_COLUMN_SQL = {
+    "id": r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT",
+    "user_id": r"INTEGER\s+NOT\s+NULL\s+UNIQUE",
+    "wallet_address": r"TEXT\s+NOT\s+NULL",
+    "created_at": (
+        r"INTEGER\s+DEFAULT\s+\(?\s*strftime\s*"
+        r"\(\s*'%s'\s*,\s*'now'\s*\)\s*\)?"
+    ),
+}
+_COMPLETED_ORDER_COLUMN_SQL = {
+    "id": r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT",
+    "user_id": r"INTEGER\s+NOT\s+NULL",
+    "order_id": r"TEXT\s+NOT\s+NULL\s+UNIQUE",
+    "btc_txid": r"TEXT",
+    "notified": r"INTEGER\s+DEFAULT\s+0",
+    "completed_at": r"INTEGER",
+}
+
+
+def _assert_exact_table_sql(
+    create_sql: str,
+    table_name: str,
+    expected_columns: frozenset[str],
+    column_patterns: dict[str, str],
+    *,
+    foreign_key_pattern: Optional[str] = None,
+    allow_quoted_table_name: bool = False,
+) -> None:
+    seen_columns = set()
+    foreign_key_count = 0
+    for clause in _split_sqlite_table_clauses(
+        create_sql,
+        table_name,
+        allow_quoted_table_name=allow_quoted_table_name,
+    ):
+        if foreign_key_pattern and re.fullmatch(
+            foreign_key_pattern, clause, flags=re.IGNORECASE
+        ):
+            foreign_key_count += 1
+            continue
+        name_match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\b", clause)
+        column_name = name_match.group(1).lower() if name_match else ""
+        pattern = column_patterns.get(column_name)
+        if not pattern or not re.fullmatch(
+            rf"{re.escape(column_name)}\s+{pattern}",
+            clause,
+            flags=re.IGNORECASE,
+        ):
+            raise RuntimeError(
+                f"Unsupported {table_name} table-level or column semantics"
+            )
+        if column_name in seen_columns:
+            raise RuntimeError(f"Duplicate {table_name} column definition")
+        seen_columns.add(column_name)
+
+    if seen_columns != set(expected_columns):
+        raise RuntimeError(f"{table_name} CREATE TABLE columns do not match table_xinfo")
+    if foreign_key_count != int(foreign_key_pattern is not None):
+        raise RuntimeError(f"{table_name} foreign key does not match fingerprint")
+
+
+async def _read_table_xinfo(db, table_name: str):
+    async with db.execute(f'PRAGMA table_xinfo("{table_name}")') as cursor:
+        return await cursor.fetchall()
+
+
+async def _read_table_sql(db, table_name: str) -> str:
+    async with db.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    if len(rows) != 1 or not rows[0][0]:
+        raise RuntimeError(f"Missing {table_name} CREATE TABLE definition")
+    return str(rows[0][0])
+
+
+def _assert_column_shapes(
+    table_name: str,
+    columns,
+    expected_columns: frozenset[str],
+    shapes: dict[str, tuple[str, int, int, Optional[str]]],
+) -> None:
+    hidden = [str(column[1]) for column in columns if int(column[6]) != 0]
+    if hidden:
+        raise RuntimeError(f"Unsupported hidden/generated {table_name} columns")
+    columns_by_name = {str(column[1]): column for column in columns}
+    if frozenset(columns_by_name) != expected_columns:
+        raise RuntimeError(f"Unsupported {table_name} column set")
+    for column_name, column in columns_by_name.items():
+        expected_type, expected_notnull, expected_pk, expected_default = shapes[
+            column_name
+        ]
+        actual_shape = (str(column[2]).upper(), int(column[3]), int(column[5]))
+        if actual_shape != (expected_type, expected_notnull, expected_pk):
+            raise RuntimeError(
+                f"Conflicting {table_name} column definition: {column_name}"
+            )
+        if _normalize_sqlite_default(column[4]) != expected_default:
+            raise RuntimeError(f"Conflicting {table_name} default: {column_name}")
+
+
+async def _assert_no_table_triggers(db, table_name: str) -> None:
+    async with db.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
+        (table_name,),
+    ) as cursor:
+        if await cursor.fetchone() is not None:
+            raise RuntimeError(f"Unsupported {table_name} trigger")
+
+
+async def _assert_single_column_unique_index(
+    db, table_name: str, index_name: str, key_column: str, *, origin: str
+) -> None:
+    async with db.execute(f'PRAGMA index_list("{table_name}")') as cursor:
+        indexes = await cursor.fetchall()
+    matching = [row for row in indexes if str(row[1]) == index_name]
+    if len(matching) != 1 or len(indexes) != 1:
+        raise RuntimeError(f"Unsupported {table_name} indexes")
+    index = matching[0]
+    if (
+        int(index[2]) != 1
+        or str(index[3]) != origin
+        or (len(index) > 4 and int(index[4]) != 0)
+    ):
+        raise RuntimeError(f"Unsupported {index_name} semantics")
+    async with db.execute(
+        "SELECT seqno, cid, name, desc, coll, key "
+        "FROM pragma_index_xinfo(?) ORDER BY seqno",
+        (index_name,),
+    ) as cursor:
+        xinfo = await cursor.fetchall()
+    key_columns = [row for row in xinfo if int(row[5]) == 1]
+    auxiliary = [row for row in xinfo if int(row[5]) == 0]
+    if not (
+        len(key_columns) == 1
+        and int(key_columns[0][1]) >= 0
+        and str(key_columns[0][2]) == key_column
+    ):
+        raise RuntimeError(f"Unsupported {index_name} key columns")
+    if (
+        int(key_columns[0][3]) != 0
+        or str(key_columns[0][4]).upper() != "BINARY"
+        or len(auxiliary) != 1
+        or int(auxiliary[0][1]) != -1
+        or auxiliary[0][2] is not None
+    ):
+        raise RuntimeError(f"Unsupported {index_name} key semantics")
 
 
 def _assert_supported_sent_transactions_table_sql(
@@ -3627,6 +4013,534 @@ async def _assert_rebuilt_sent_transactions_schema(
         raise RuntimeError("sent_transactions rebuild row-count mismatch after rename")
 
 
+async def _assert_foreign_keys(db, table_name: str, expected) -> None:
+    async with db.execute(f'PRAGMA foreign_key_list("{table_name}")') as cursor:
+        rows = await cursor.fetchall()
+    normalized = [
+        (
+            str(row[2]), str(row[3]), str(row[4]), str(row[5]).upper(),
+            str(row[6]).upper(), str(row[7]).upper(),
+        )
+        for row in rows
+    ]
+    if normalized != expected:
+        raise RuntimeError(f"Unsupported {table_name} foreign keys")
+
+
+async def _assert_no_indexes(db, table_name: str) -> None:
+    async with db.execute(f'PRAGMA index_list("{table_name}")') as cursor:
+        if await cursor.fetchone() is not None:
+            raise RuntimeError(f"Unsupported {table_name} indexes")
+
+
+async def _assert_dca_plans_source(db) -> frozenset[str]:
+    columns = await _read_table_xinfo(db, "dca_plans")
+    names = frozenset(str(column[1]) for column in columns)
+    if names not in _SUPPORTED_DCA_PLAN_COLUMN_SETS:
+        raise RuntimeError("Unsupported dca_plans legacy generation")
+    _assert_column_shapes(
+        "dca_plans", columns, names, _DCA_PLAN_COLUMN_SHAPES
+    )
+    _assert_exact_table_sql(
+        await _read_table_sql(db, "dca_plans"),
+        "dca_plans",
+        names,
+        _DCA_PLAN_COLUMN_SQL,
+    )
+    await _assert_foreign_keys(db, "dca_plans", [])
+    await _assert_no_indexes(db, "dca_plans")
+    await _assert_no_table_triggers(db, "dca_plans")
+    return names
+
+
+async def _assert_wallets_schema(db) -> None:
+    columns = await _read_table_xinfo(db, "wallets")
+    _assert_column_shapes(
+        "wallets", columns, _WALLET_COLUMNS, _WALLET_COLUMN_SHAPES
+    )
+    _assert_exact_table_sql(
+        await _read_table_sql(db, "wallets"),
+        "wallets",
+        _WALLET_COLUMNS,
+        _WALLET_COLUMN_SQL,
+    )
+    await _assert_foreign_keys(db, "wallets", [])
+    await _assert_single_column_unique_index(
+        db, "wallets", "sqlite_autoindex_wallets_1", "user_id", origin="u"
+    )
+    await _assert_no_table_triggers(db, "wallets")
+
+
+async def _assert_completed_orders_schema(db) -> None:
+    columns = await _read_table_xinfo(db, "completed_orders")
+    _assert_column_shapes(
+        "completed_orders",
+        columns,
+        _COMPLETED_ORDER_COLUMNS,
+        _COMPLETED_ORDER_COLUMN_SHAPES,
+    )
+    foreign_key_sql = (
+        r"FOREIGN\s+KEY\s*\(\s*user_id\s*\)\s*"
+        r"REFERENCES\s+dca_plans\s*\(\s*user_id\s*\)"
+    )
+    _assert_exact_table_sql(
+        await _read_table_sql(db, "completed_orders"),
+        "completed_orders",
+        _COMPLETED_ORDER_COLUMNS,
+        _COMPLETED_ORDER_COLUMN_SQL,
+        foreign_key_pattern=foreign_key_sql,
+    )
+    await _assert_foreign_keys(
+        db,
+        "completed_orders",
+        [("dca_plans", "user_id", "user_id", "NO ACTION", "NO ACTION", "NONE")],
+    )
+    await _assert_single_column_unique_index(
+        db,
+        "completed_orders",
+        "sqlite_autoindex_completed_orders_1",
+        "order_id",
+        origin="u",
+    )
+    await _assert_no_table_triggers(db, "completed_orders")
+
+
+_NULLABLE_SENT_COLUMN_SQL = {
+    "id": r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT",
+    "user_id": r"INTEGER\s+NOT\s+NULL",
+    "plan_id": r"INTEGER",
+    "order_id": r"TEXT\s+NOT\s+NULL",
+    "order_token": r"TEXT",
+    "network_key": r"TEXT\s+NOT\s+NULL",
+    "approve_tx_hash": r"TEXT",
+    "approve_tx_nonce": r"INTEGER",
+    "approve_raw_tx": r"TEXT",
+    "transfer_tx_hash": r"TEXT",
+    "transfer_tx_nonce": r"INTEGER",
+    "transfer_raw_tx": r"TEXT",
+    "amount": r"REAL\s+NOT\s+NULL",
+    "amount_units": r"TEXT",
+    "token_decimals": r"INTEGER",
+    "deposit_address": r"TEXT\s+NOT\s+NULL",
+    "state": r"TEXT\s+DEFAULT\s+'scheduled'",
+    "error_message": r"TEXT",
+    "sent_at": (
+        r"INTEGER\s+DEFAULT\s+\(?\s*strftime\s*"
+        r"\(\s*'%s'\s*,\s*'now'\s*\)\s*\)?"
+    ),
+}
+
+
+async def _inspect_supported_nullable_sent_transactions(db, columns):
+    names = frozenset(str(column[1]) for column in columns)
+    if names not in _SUPPORTED_NULLABLE_SENT_TRANSACTION_COLUMNS:
+        raise RuntimeError("Unsupported nullable sent_transactions generation")
+    shapes = {
+        name: (*_SENT_TRANSACTION_COLUMN_SHAPES[name], None) for name in names
+    }
+    shapes["transfer_tx_hash"] = ("TEXT", 0, 0, None)
+    shapes["state"] = ("TEXT", 0, 0, "'scheduled'")
+    shapes["sent_at"] = ("INTEGER", 0, 0, "strftime('%s','now')")
+    _assert_column_shapes("sent_transactions", columns, names, shapes)
+    foreign_key_sql = (
+        r"FOREIGN\s+KEY\s*\(\s*plan_id\s*\)\s*"
+        r"REFERENCES\s+dca_plans\s*\(\s*id\s*\)"
+    )
+    _assert_exact_table_sql(
+        await _read_table_sql(db, "sent_transactions"),
+        "sent_transactions",
+        names,
+        _NULLABLE_SENT_COLUMN_SQL,
+        foreign_key_pattern=foreign_key_sql,
+        allow_quoted_table_name=True,
+    )
+    await _assert_foreign_keys(
+        db,
+        "sent_transactions",
+        [("dca_plans", "plan_id", "id", "NO ACTION", "NO ACTION", "NONE")],
+    )
+    await _assert_no_table_triggers(db, "sent_transactions")
+
+    async with db.execute("PRAGMA index_list(sent_transactions)") as cursor:
+        indexes = await cursor.fetchall()
+    if not indexes:
+        return names, False
+    await _assert_single_column_unique_index(
+        db,
+        "sent_transactions",
+        "idx_sent_transactions_order_id",
+        "order_id",
+        origin="c",
+    )
+    return names, True
+
+
+async def _notnull_sent_generation_fingerprint(
+    db, columns, column_names: frozenset[str], has_index: bool
+) -> str:
+    """Return one proven NOT NULL semantic generation, never a product of axes."""
+    create_sql = await _read_table_sql(db, "sent_transactions")
+    clauses = _split_sqlite_table_clauses(create_sql)
+    id_clause = next(
+        (clause for clause in clauses if re.match(r"^id\b", clause, re.IGNORECASE)),
+        "",
+    )
+    id_has_autoincrement = bool(
+        re.fullmatch(
+            r"id\s+INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT",
+            id_clause,
+            flags=re.IGNORECASE,
+        )
+    )
+    columns_by_name = {str(column[1]): column for column in columns}
+    state_default = (
+        _normalize_sqlite_default(columns_by_name["state"][4])
+        if "state" in columns_by_name
+        else None
+    )
+    sent_at_default = _normalize_sqlite_default(columns_by_name["sent_at"][4])
+    async with db.execute("PRAGMA foreign_key_list(sent_transactions)") as cursor:
+        has_foreign_key = bool(await cursor.fetchall())
+
+    generation = _NOTNULL_SENT_GENERATIONS[column_names]
+    plain_semantics = (
+        not id_has_autoincrement
+        and state_default is None
+        and sent_at_default is None
+        and not has_foreign_key
+    )
+    if plain_semantics:
+        return generation
+
+    canonical_semantics = (
+        column_names == _CURRENT_SENT_TRANSACTION_COLUMNS
+        and id_has_autoincrement
+        and state_default == "'scheduled'"
+        and sent_at_default == "strftime('%s','now')"
+        and has_foreign_key
+        and has_index
+    )
+    if canonical_semantics:
+        return "sent_notnull_canonical"
+
+    raise RuntimeError(
+        "Unsupported NOT NULL sent_transactions semantic fingerprint"
+    )
+
+
+async def _assert_expected_database_objects(db, *, allow_missing_sent_index: bool) -> None:
+    async with db.execute(
+        "SELECT type, name, tbl_name FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+    ) as cursor:
+        objects = {(str(r[0]), str(r[1]), str(r[2])) for r in await cursor.fetchall()}
+    expected = {
+        ("table", "dca_plans", "dca_plans"),
+        ("table", "wallets", "wallets"),
+        ("table", "sent_transactions", "sent_transactions"),
+        ("table", "completed_orders", "completed_orders"),
+    }
+    index_object = (
+        "index", "idx_sent_transactions_order_id", "sent_transactions"
+    )
+    if index_object in objects:
+        expected.add(index_object)
+    elif not allow_missing_sent_index:
+        raise RuntimeError("Missing idx_sent_transactions_order_id")
+    if objects != expected:
+        raise RuntimeError(
+            "Unknown or missing SQLite schema objects; refusing destructive rebuild"
+        )
+
+
+async def _assert_no_duplicate_orders(db) -> None:
+    async with db.execute(
+        "SELECT order_id, COUNT(*) FROM sent_transactions "
+        "WHERE order_id IS NOT NULL GROUP BY order_id HAVING COUNT(*) > 1 "
+        "ORDER BY order_id"
+    ) as cursor:
+        duplicate_orders = await cursor.fetchall()
+    if not duplicate_orders:
+        return
+    conflicts = []
+    for duplicate_order_id, duplicate_count in duplicate_orders:
+        async with db.execute(
+            "SELECT id FROM sent_transactions WHERE order_id = ? ORDER BY id",
+            (duplicate_order_id,),
+        ) as cursor:
+            row_ids = [int(row[0]) for row in await cursor.fetchall()]
+        conflicts.append(
+            f"order_id={duplicate_order_id!r} count={int(duplicate_count)} "
+            f"row_ids={row_ids}"
+        )
+    raise RuntimeError(
+        "Duplicate sent_transactions rows prevent safe startup; no rows were deleted. "
+        "Resolve the conflicts manually before restarting. Conflicts: "
+        + "; ".join(conflicts)
+    )
+
+
+async def _classify_unversioned_schema(db):
+    await _assert_expected_database_objects(db, allow_missing_sent_index=True)
+    dca_columns = await _assert_dca_plans_source(db)
+    await _assert_wallets_schema(db)
+    await _assert_completed_orders_schema(db)
+    sent_columns = await _read_table_xinfo(db, "sent_transactions")
+    transfer_column = next(
+        (column for column in sent_columns if str(column[1]) == "transfer_tx_hash"),
+        None,
+    )
+    if transfer_column is None:
+        raise RuntimeError("Missing sent_transactions.transfer_tx_hash")
+    if int(transfer_column[3]) == 1:
+        names, has_index = await _inspect_supported_sent_transactions_rebuild_schema(
+            db, sent_columns
+        )
+        sent_generation = await _notnull_sent_generation_fingerprint(
+            db, sent_columns, names, has_index
+        )
+        sent_kind = "notnull"
+    else:
+        names, has_index = await _inspect_supported_nullable_sent_transactions(
+            db, sent_columns
+        )
+        sent_generation = _NULLABLE_SENT_GENERATIONS[names]
+        sent_kind = "nullable"
+    await _assert_no_duplicate_orders(db)
+    database_fingerprint = (
+        _DCA_PLAN_GENERATIONS[dca_columns],
+        sent_generation,
+        has_index,
+        "wallets_current",
+        "completed_current",
+    )
+    if database_fingerprint not in _SUPPORTED_UNVERSIONED_DATABASE_FINGERPRINTS:
+        raise RuntimeError(
+            "Unsupported user_version=0 whole-database schema fingerprint"
+        )
+    if (
+        sent_kind == "nullable"
+        and dca_columns == _CURRENT_DCA_PLAN_COLUMNS
+        and names == _CURRENT_SENT_TRANSACTION_COLUMNS
+        and has_index
+    ):
+        return "current", dca_columns, names, has_index
+    return sent_kind, dca_columns, names, has_index
+
+
+async def _assert_v1_schema(db) -> None:
+    await _assert_expected_database_objects(db, allow_missing_sent_index=False)
+    dca_columns = await _assert_dca_plans_source(db)
+    if dca_columns != _CURRENT_DCA_PLAN_COLUMNS:
+        raise RuntimeError("Schema version 1 requires the current dca_plans generation")
+    await _assert_wallets_schema(db)
+    await _assert_completed_orders_schema(db)
+    sent_columns = await _read_table_xinfo(db, "sent_transactions")
+    names, has_index = await _inspect_supported_nullable_sent_transactions(
+        db, sent_columns
+    )
+    if names != _CURRENT_SENT_TRANSACTION_COLUMNS or not has_index:
+        raise RuntimeError("Schema version 1 requires the current sent_transactions generation")
+    await _assert_no_duplicate_orders(db)
+
+
+async def _database_has_user_objects(db) -> bool:
+    async with db.execute(
+        "SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' LIMIT 1"
+    ) as cursor:
+        return await cursor.fetchone() is not None
+
+
+async def _create_fresh_v1_schema(db) -> None:
+    await db.execute('''
+        CREATE TABLE dca_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            from_asset TEXT,
+            amount REAL,
+            interval_hours INTEGER,
+            btc_address TEXT,
+            next_run INTEGER,
+            active BOOLEAN DEFAULT 1,
+            created_at INTEGER DEFAULT (strftime('%s','now')),
+            active_order_id TEXT,
+            active_order_token TEXT,
+            active_order_address TEXT,
+            active_order_amount TEXT,
+            active_order_expires INTEGER,
+            deleted BOOLEAN DEFAULT 0,
+            execution_state TEXT DEFAULT 'scheduled',
+            last_tx_hash TEXT,
+            skip_notified INTEGER DEFAULT 0,
+            skip_reason TEXT,
+            missed_count INTEGER DEFAULT 0,
+            last_missed_at INTEGER,
+            last_execution_attempt_at INTEGER,
+            confirmation_message_id INTEGER,
+            confirmation_expires_at INTEGER,
+            confirmation_scheduled_at INTEGER,
+            order_expired_notified INTEGER DEFAULT 0
+        )
+    ''')
+    await db.execute('''
+        CREATE TABLE wallets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL UNIQUE,
+            wallet_address TEXT NOT NULL,
+            created_at INTEGER DEFAULT (strftime('%s','now'))
+        )
+    ''')
+    await db.execute('''
+        CREATE TABLE sent_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            plan_id INTEGER,
+            order_id TEXT NOT NULL,
+            order_token TEXT,
+            network_key TEXT NOT NULL,
+            approve_tx_hash TEXT,
+            approve_tx_nonce INTEGER,
+            approve_raw_tx TEXT,
+            transfer_tx_hash TEXT,
+            transfer_tx_nonce INTEGER,
+            transfer_raw_tx TEXT,
+            amount REAL NOT NULL,
+            amount_units TEXT,
+            token_decimals INTEGER,
+            deposit_address TEXT NOT NULL,
+            state TEXT DEFAULT 'scheduled',
+            error_message TEXT,
+            sent_at INTEGER DEFAULT (strftime('%s','now')),
+            FOREIGN KEY(plan_id) REFERENCES dca_plans(id)
+        )
+    ''')
+    await db.execute('''
+        CREATE TABLE completed_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            order_id TEXT NOT NULL UNIQUE,
+            btc_txid TEXT,
+            notified INTEGER DEFAULT 0,
+            completed_at INTEGER,
+            FOREIGN KEY(user_id) REFERENCES dca_plans(user_id)
+        )
+    ''')
+    await db.execute(
+        "CREATE UNIQUE INDEX idx_sent_transactions_order_id "
+        "ON sent_transactions(order_id)"
+    )
+
+
+async def _migrate_dca_plans_to_current(db, source_columns) -> None:
+    additions = (
+        ("skip_notified", "INTEGER DEFAULT 0"),
+        ("skip_reason", "TEXT"),
+        ("missed_count", "INTEGER DEFAULT 0"),
+        ("last_missed_at", "INTEGER"),
+        ("last_execution_attempt_at", "INTEGER"),
+        ("confirmation_message_id", "INTEGER"),
+        ("confirmation_expires_at", "INTEGER"),
+        ("confirmation_scheduled_at", "INTEGER"),
+        ("order_expired_notified", "INTEGER DEFAULT 0"),
+        ("active_order_token", "TEXT"),
+    )
+    for column_name, declaration in additions:
+        if column_name not in source_columns:
+            await db.execute(
+                f"ALTER TABLE dca_plans ADD COLUMN {column_name} {declaration}"
+            )
+
+
+async def _migrate_nullable_sent_transactions_to_current(db, source_columns) -> None:
+    additions = (
+        ("order_token", "TEXT"),
+        ("approve_tx_nonce", "INTEGER"),
+        ("approve_raw_tx", "TEXT"),
+        ("transfer_tx_nonce", "INTEGER"),
+        ("transfer_raw_tx", "TEXT"),
+        ("amount_units", "TEXT"),
+        ("token_decimals", "INTEGER"),
+    )
+    for column_name, declaration in additions:
+        if column_name not in source_columns:
+            await db.execute(
+                f"ALTER TABLE sent_transactions ADD COLUMN {column_name} {declaration}"
+            )
+
+
+async def _rebuild_legacy_sent_transactions_in_transaction(
+    db, source_columns, preserve_order_id_index
+) -> None:
+    ordered_source_columns = [
+        name for name in _SENT_TRANSACTION_COLUMN_ORDER if name in source_columns
+    ]
+    copy_columns_sql = ", ".join(f'"{name}"' for name in ordered_source_columns)
+    await db.execute('''
+        CREATE TABLE sent_transactions_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            plan_id INTEGER,
+            order_id TEXT NOT NULL,
+            order_token TEXT,
+            network_key TEXT NOT NULL,
+            approve_tx_hash TEXT,
+            approve_tx_nonce INTEGER,
+            approve_raw_tx TEXT,
+            transfer_tx_hash TEXT,
+            transfer_tx_nonce INTEGER,
+            transfer_raw_tx TEXT,
+            amount REAL NOT NULL,
+            amount_units TEXT,
+            token_decimals INTEGER,
+            deposit_address TEXT NOT NULL,
+            state TEXT DEFAULT 'scheduled',
+            error_message TEXT,
+            sent_at INTEGER DEFAULT (strftime('%s','now')),
+            FOREIGN KEY(plan_id) REFERENCES dca_plans(id)
+        )
+    ''')
+    async with db.execute("SELECT COUNT(*) FROM sent_transactions") as cursor:
+        source_row_count = int((await cursor.fetchone())[0])
+    await db.execute(
+        f"INSERT INTO sent_transactions_new ({copy_columns_sql}) "
+        f"SELECT {copy_columns_sql} FROM sent_transactions"
+    )
+    await _assert_sent_transactions_copy_preserved(
+        db, ordered_source_columns, source_row_count
+    )
+    await db.execute("DROP TABLE sent_transactions")
+    await db.execute("ALTER TABLE sent_transactions_new RENAME TO sent_transactions")
+    if preserve_order_id_index:
+        await db.execute(
+            "CREATE UNIQUE INDEX idx_sent_transactions_order_id "
+            "ON sent_transactions(order_id)"
+        )
+    await _assert_rebuilt_sent_transactions_schema(
+        db, source_row_count, preserve_order_id_index
+    )
+
+
+async def _migrate_unversioned_schema(db, classification) -> None:
+    kind, dca_columns, sent_columns, has_sent_index = classification
+    if kind == "current":
+        return
+    await _migrate_dca_plans_to_current(db, dca_columns)
+    if kind == "notnull":
+        logger.info("Migrating sent_transactions: transfer_tx_hash NOT NULL -> NULL")
+        await _rebuild_legacy_sent_transactions_in_transaction(
+            db, sent_columns, has_sent_index
+        )
+    elif kind == "nullable":
+        await _migrate_nullable_sent_transactions_to_current(db, sent_columns)
+    else:
+        raise RuntimeError(f"Unsupported unversioned schema classification: {kind}")
+    if not has_sent_index:
+        await db.execute(
+            "CREATE UNIQUE INDEX idx_sent_transactions_order_id "
+            "ON sent_transactions(order_id)"
+        )
+
+
 async def _execute_sqlite_control_statement_to_completion(
     db, statement, *, check_pending_cancellation=False
 ):
@@ -3653,321 +4567,74 @@ async def _execute_sqlite_control_statement_to_completion(
 
 
 async def init_db():
-    """
-    Инициализация SQLite базы данных.
-    Создаёт таблицу dca_plans для хранения планов автоматических покупок.
-    
-    Структура таблицы:
-    - user_id: Telegram ID пользователя (НЕ уникальный - может быть несколько планов)
-    - from_asset: сеть USDT (USDT-ARB, USDT-BSC, USDT-POLYGON)
-    - amount: сумма покупки в USD
-    - interval_hours: интервал между покупками (в часах)
-    - btc_address: адрес BTC для получения
-    - next_run: UNIX timestamp следующего запуска
-    - active: активен ли план (1/0)
-    - active_order_id: ID активного ордера на FixedFloat (если есть)
-    - active_order_address: адрес для депозита активного ордера
-    - active_order_amount: сумма для отправки
-    - active_order_expires: timestamp истечения ордера
-    - deleted: флаг мягкого удаления (0 = активен, 1 = удалён)
-    - Уникальность: может быть до 3 планов на одну сеть (user_id + from_asset)
-    """
+    """Validate or atomically migrate the SQLite schema to the current version."""
     async with aiosqlite.connect(DB_PATH) as db:
-        # Создаём таблицу если её нет
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS dca_plans (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                from_asset TEXT,
-                amount REAL,
-                interval_hours INTEGER,
-                btc_address TEXT,
-                next_run INTEGER,
-                active BOOLEAN DEFAULT 1,
-                created_at INTEGER DEFAULT (strftime('%s','now')),
-                active_order_id TEXT,
-                active_order_token TEXT,
-                active_order_address TEXT,
-                active_order_amount TEXT,
-                active_order_expires INTEGER,
-                deleted BOOLEAN DEFAULT 0,
-                skip_notified INTEGER DEFAULT 0,
-                skip_reason TEXT,
-                missed_count INTEGER DEFAULT 0,
-                last_missed_at INTEGER,
-                last_execution_attempt_at INTEGER,
-                confirmation_message_id INTEGER,
-                confirmation_expires_at INTEGER,
-                confirmation_scheduled_at INTEGER,
-                order_expired_notified INTEGER DEFAULT 0
-            )
-        ''')
-        
-        # Проверяем существующие столбцы и добавляем новые если их нет
-        async with db.execute("PRAGMA table_info(dca_plans)") as cursor:
-            columns = await cursor.fetchall()
-            existing_columns = [col[1] for col in columns]
-        
-        if "active_order_id" not in existing_columns:
-            await db.execute("ALTER TABLE dca_plans ADD COLUMN active_order_id TEXT")
-        if "active_order_token" not in existing_columns:
-            await db.execute("ALTER TABLE dca_plans ADD COLUMN active_order_token TEXT")
-        if "active_order_address" not in existing_columns:
-            await db.execute("ALTER TABLE dca_plans ADD COLUMN active_order_address TEXT")
-        if "active_order_amount" not in existing_columns:
-            await db.execute("ALTER TABLE dca_plans ADD COLUMN active_order_amount TEXT")
-        if "active_order_expires" not in existing_columns:
-            await db.execute("ALTER TABLE dca_plans ADD COLUMN active_order_expires INTEGER")
-        if "deleted" not in existing_columns:
-            await db.execute("ALTER TABLE dca_plans ADD COLUMN deleted BOOLEAN DEFAULT 0")
-        if "execution_state" not in existing_columns:
-            await db.execute("ALTER TABLE dca_plans ADD COLUMN execution_state TEXT DEFAULT 'scheduled'")
-        if "last_tx_hash" not in existing_columns:
-            await db.execute("ALTER TABLE dca_plans ADD COLUMN last_tx_hash TEXT")
-        if "skip_notified" not in existing_columns:
-            await db.execute("ALTER TABLE dca_plans ADD COLUMN skip_notified INTEGER DEFAULT 0")
-        if "skip_reason" not in existing_columns:
-            await db.execute("ALTER TABLE dca_plans ADD COLUMN skip_reason TEXT")
-        if "missed_count" not in existing_columns:
-            await db.execute("ALTER TABLE dca_plans ADD COLUMN missed_count INTEGER DEFAULT 0")
-        if "last_missed_at" not in existing_columns:
-            await db.execute("ALTER TABLE dca_plans ADD COLUMN last_missed_at INTEGER")
-        if "last_execution_attempt_at" not in existing_columns:
-            await db.execute("ALTER TABLE dca_plans ADD COLUMN last_execution_attempt_at INTEGER")
-        if "confirmation_message_id" not in existing_columns:
-            await db.execute("ALTER TABLE dca_plans ADD COLUMN confirmation_message_id INTEGER")
-        if "confirmation_expires_at" not in existing_columns:
-            await db.execute("ALTER TABLE dca_plans ADD COLUMN confirmation_expires_at INTEGER")
-        if "confirmation_scheduled_at" not in existing_columns:
-            await db.execute("ALTER TABLE dca_plans ADD COLUMN confirmation_scheduled_at INTEGER")
-        if "order_expired_notified" not in existing_columns:
-            await db.execute("ALTER TABLE dca_plans ADD COLUMN order_expired_notified INTEGER DEFAULT 0")
-        
-        # Создаём таблицу для хранения информации о кошельках (single wallet per user)
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS wallets (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL UNIQUE,
-                wallet_address TEXT NOT NULL,
-                created_at INTEGER DEFAULT (strftime('%s','now'))
-            )
-        ''')
-        
-        # Удаляем encrypted_password если он существует (legacy migration)
-        async with db.execute("PRAGMA table_info(wallets)") as cursor:
-            columns = await cursor.fetchall()
-            existing_columns = [col[1] for col in columns]
-        
-        # Note: SQLite doesn't support DROP COLUMN easily, so we'll just ignore it
-        
-        # Создаём таблицу для отслеживания отправленных транзакций
-        # State tracking for idempotency and restart safety
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS sent_transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                plan_id INTEGER,
-                order_id TEXT NOT NULL,
-                order_token TEXT,
-                network_key TEXT NOT NULL,
-                approve_tx_hash TEXT,
-                approve_tx_nonce INTEGER,
-                approve_raw_tx TEXT,
-                transfer_tx_hash TEXT,
-                transfer_tx_nonce INTEGER,
-                transfer_raw_tx TEXT,
-                amount REAL NOT NULL,
-                amount_units TEXT,
-                token_decimals INTEGER,
-                deposit_address TEXT NOT NULL,
-                state TEXT DEFAULT 'scheduled',
-                error_message TEXT,
-                sent_at INTEGER DEFAULT (strftime('%s','now')),
-                FOREIGN KEY(plan_id) REFERENCES dca_plans(id)
-            )
-        ''')
-        
-        # Migrate sent_transactions table to add state and error_message columns if missing
-        async with db.execute("PRAGMA table_info(sent_transactions)") as cursor:
-            columns = await cursor.fetchall()
-            existing_columns = [col[1] for col in columns]
-        
-        transfer_col = next((col for col in columns if col[1] == "transfer_tx_hash"), None)
-        transfer_notnull = bool(transfer_col and transfer_col[3] == 1)
-        if not transfer_notnull:
-            if "state" not in existing_columns:
-                await db.execute("ALTER TABLE sent_transactions ADD COLUMN state TEXT DEFAULT 'scheduled'")
-            if "error_message" not in existing_columns:
-                await db.execute("ALTER TABLE sent_transactions ADD COLUMN error_message TEXT")
-            if "order_token" not in existing_columns:
-                await db.execute("ALTER TABLE sent_transactions ADD COLUMN order_token TEXT")
-
-        # Safe migration: ensure transfer_tx_hash is nullable for pre-send records
-        async with db.execute("PRAGMA table_info(sent_transactions)") as cursor:
-            tx_columns = await cursor.fetchall()
-        transfer_col = next((col for col in tx_columns if col[1] == "transfer_tx_hash"), None)
-        transfer_notnull = bool(transfer_col and transfer_col[3] == 1)
-        if transfer_notnull:
-            logger.info("Migrating sent_transactions: transfer_tx_hash NOT NULL -> NULL")
-            await db.execute("PRAGMA foreign_keys=off;")
-            transaction_started = False
-            commit_cancellation = None
-            try:
-                await db.execute("BEGIN IMMEDIATE;")
-                transaction_started = True
-                async with db.execute("PRAGMA table_xinfo(sent_transactions)") as cursor:
-                    locked_tx_columns = await cursor.fetchall()
-                source_columns, preserve_order_id_index = (
-                    await _inspect_supported_sent_transactions_rebuild_schema(
-                        db, locked_tx_columns
-                    )
-                )
-                ordered_source_columns = [
-                    column_name
-                    for column_name in _SENT_TRANSACTION_COLUMN_ORDER
-                    if column_name in source_columns
-                ]
-                copy_columns_sql = ", ".join(
-                    f'"{column_name}"' for column_name in ordered_source_columns
-                )
-                await db.execute('''
-                    CREATE TABLE sent_transactions_new (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id INTEGER NOT NULL,
-                        plan_id INTEGER,
-                        order_id TEXT NOT NULL,
-                        order_token TEXT,
-                        network_key TEXT NOT NULL,
-                        approve_tx_hash TEXT,
-                        approve_tx_nonce INTEGER,
-                        approve_raw_tx TEXT,
-                        transfer_tx_hash TEXT,
-                        transfer_tx_nonce INTEGER,
-                        transfer_raw_tx TEXT,
-                        amount REAL NOT NULL,
-                        amount_units TEXT,
-                        token_decimals INTEGER,
-                        deposit_address TEXT NOT NULL,
-                        state TEXT DEFAULT 'scheduled',
-                        error_message TEXT,
-                        sent_at INTEGER DEFAULT (strftime('%s','now')),
-                        FOREIGN KEY(plan_id) REFERENCES dca_plans(id)
-                    )
-                ''')
-                async with db.execute("SELECT COUNT(*) FROM sent_transactions") as cursor:
-                    source_row_count = int((await cursor.fetchone())[0])
-                await db.execute(
-                    f"INSERT INTO sent_transactions_new ({copy_columns_sql}) "
-                    f"SELECT {copy_columns_sql} FROM sent_transactions"
-                )
-                await _assert_sent_transactions_copy_preserved(
-                    db, ordered_source_columns, source_row_count
-                )
-                await db.execute("DROP TABLE sent_transactions")
-                await db.execute("ALTER TABLE sent_transactions_new RENAME TO sent_transactions")
-                if preserve_order_id_index:
-                    await db.execute(
-                        "CREATE UNIQUE INDEX idx_sent_transactions_order_id "
-                        "ON sent_transactions(order_id)"
-                    )
-                await _assert_rebuilt_sent_transactions_schema(
-                    db, source_row_count, preserve_order_id_index
-                )
-                commit_cancellation = (
-                    await _execute_sqlite_control_statement_to_completion(
-                        db, "COMMIT;", check_pending_cancellation=True
-                    )
-                )
-                transaction_started = False
-            except BaseException as rebuild_error:
-                if transaction_started and db.in_transaction:
-                    try:
-                        rollback_cancellation = (
-                            await _execute_sqlite_control_statement_to_completion(
-                                db, "ROLLBACK;"
-                            )
-                        )
-                    except BaseException as rollback_error:
-                        rebuild_error.sent_transactions_rollback_error = rollback_error
-                        raise rebuild_error from rollback_error
-                    transaction_started = False
-                    if rollback_cancellation is not None:
-                        rebuild_error.sent_transactions_rollback_cancellation = (
-                            rollback_cancellation
-                        )
-                raise
-            finally:
-                await db.execute("PRAGMA foreign_keys=on;")
-            if commit_cancellation is not None:
-                raise commit_cancellation
-
-        async with db.execute("PRAGMA table_info(sent_transactions)") as cursor:
-            tx_columns = await cursor.fetchall()
-        tx_column_names = {column[1] for column in tx_columns}
-        for column_name, column_type in (
-            ("approve_tx_nonce", "INTEGER"),
-            ("approve_raw_tx", "TEXT"),
-            ("transfer_tx_nonce", "INTEGER"),
-            ("transfer_raw_tx", "TEXT"),
-            ("amount_units", "TEXT"),
-            ("token_decimals", "INTEGER"),
-        ):
-            if column_name not in tx_column_names:
-                await db.execute(
-                    f"ALTER TABLE sent_transactions ADD COLUMN {column_name} {column_type}"
-                )
-        
-        # Создаём таблицу для отслеживания завершённых ордеров
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS completed_orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                order_id TEXT NOT NULL UNIQUE,
-                btc_txid TEXT,
-                notified INTEGER DEFAULT 0,
-                completed_at INTEGER,
-                FOREIGN KEY(user_id) REFERENCES dca_plans(user_id)
-            )
-        ''')
-
-        # Finish any transaction opened by preceding schema migrations before
-        # taking the write lock that protects duplicate detection and indexing.
-        await db.commit()
+        transaction_started = False
+        commit_cancellation = None
         try:
-            await db.execute("BEGIN IMMEDIATE")
-            async with db.execute(
-                "SELECT order_id, COUNT(*) FROM sent_transactions "
-                "WHERE order_id IS NOT NULL GROUP BY order_id HAVING COUNT(*) > 1 "
-                "ORDER BY order_id"
-            ) as duplicate_cur:
-                duplicate_orders = await duplicate_cur.fetchall()
-
-            if duplicate_orders:
-                conflicts = []
-                for duplicate_order_id, duplicate_count in duplicate_orders:
-                    async with db.execute(
-                        "SELECT id FROM sent_transactions WHERE order_id = ? ORDER BY id",
-                        (duplicate_order_id,),
-                    ) as row_id_cur:
-                        row_ids = [int(row[0]) for row in await row_id_cur.fetchall()]
-                    conflicts.append(
-                        f"order_id={duplicate_order_id!r} count={int(duplicate_count)} "
-                        f"row_ids={row_ids}"
-                    )
-                raise RuntimeError(
-                    "Duplicate sent_transactions rows prevent safe startup; no rows were deleted. "
-                    "Resolve the conflicts manually before restarting. Conflicts: "
-                    + "; ".join(conflicts)
+            begin_cancellation = (
+                await _execute_sqlite_control_statement_to_completion(
+                    db, "BEGIN IMMEDIATE;", check_pending_cancellation=True
                 )
-
-            await db.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_sent_transactions_order_id "
-                "ON sent_transactions(order_id)"
             )
-            await db.commit()
-        except BaseException:
-            await db.rollback()
+            transaction_started = True
+            if begin_cancellation is not None:
+                raise begin_cancellation
+
+            async with db.execute("PRAGMA user_version") as cursor:
+                schema_version = int((await cursor.fetchone())[0])
+            if schema_version > CURRENT_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Database schema version {schema_version} is newer than supported "
+                    f"version {CURRENT_SCHEMA_VERSION}"
+                )
+            if schema_version < 0:
+                raise RuntimeError(f"Invalid database schema version {schema_version}")
+
+            if schema_version == CURRENT_SCHEMA_VERSION:
+                await _assert_v1_schema(db)
+            elif schema_version == 0:
+                if await _database_has_user_objects(db):
+                    classification = await _classify_unversioned_schema(db)
+                    await _migrate_unversioned_schema(db, classification)
+                else:
+                    await _create_fresh_v1_schema(db)
+                await _assert_v1_schema(db)
+                await db.execute(
+                    f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"
+                )
+            else:
+                raise RuntimeError(f"Unsupported database schema version {schema_version}")
+
+            commit_cancellation = (
+                await _execute_sqlite_control_statement_to_completion(
+                    db, "COMMIT;", check_pending_cancellation=True
+                )
+            )
+            transaction_started = False
+        except BaseException as migration_error:
+            if transaction_started and db.in_transaction:
+                try:
+                    rollback_cancellation = (
+                        await _execute_sqlite_control_statement_to_completion(
+                            db, "ROLLBACK;"
+                        )
+                    )
+                except BaseException as rollback_error:
+                    migration_error.sqlite_migration_rollback_error = rollback_error
+                    migration_error.sent_transactions_rollback_error = rollback_error
+                    raise migration_error from rollback_error
+                transaction_started = False
+                if rollback_cancellation is not None:
+                    migration_error.sqlite_migration_rollback_cancellation = (
+                        rollback_cancellation
+                    )
+                    migration_error.sent_transactions_rollback_cancellation = (
+                        rollback_cancellation
+                    )
             raise
+        if commit_cancellation is not None:
+            raise commit_cancellation
     logger.info("База данных инициализирована")
 
 
