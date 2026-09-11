@@ -10,6 +10,14 @@ import bot as app
 import erc20
 
 
+def seed_linked_plan(db, plan_id=7, user_id=10001):
+    db.execute(
+        "INSERT INTO dca_plans(id,user_id,interval_hours,btc_address) "
+        "VALUES (?,?,24,'bc1unused')",
+        (plan_id, user_id),
+    )
+
+
 class FakeSignedTransaction:
     def __init__(self, raw_transaction):
         self.rawTransaction = raw_transaction
@@ -170,6 +178,7 @@ def test_restart_rebroadcasts_only_persisted_raw_transaction(tmp_path, monkeypat
     asyncio.run(app.init_db())
 
     with sqlite3.connect(db_path) as db:
+        seed_linked_plan(db)
         db.execute(
             "INSERT INTO sent_transactions "
             "(user_id, plan_id, order_id, network_key, amount, deposit_address, state) "
@@ -558,6 +567,7 @@ def test_prepared_transaction_is_committed_before_broadcast(tmp_path, monkeypatc
     asyncio.run(app.init_db())
 
     with sqlite3.connect(db_path) as db:
+        seed_linked_plan(db)
         db.execute(
             "INSERT INTO sent_transactions "
             "(user_id, plan_id, order_id, network_key, amount, deposit_address, state) "
@@ -595,6 +605,7 @@ def test_prepared_transaction_cas_rejects_different_intent(tmp_path, monkeypatch
     asyncio.run(app.init_db())
 
     with sqlite3.connect(db_path) as db:
+        seed_linked_plan(db)
         db.execute(
             "INSERT INTO sent_transactions "
             "(user_id, plan_id, order_id, network_key, amount, deposit_address, state) "
@@ -640,6 +651,7 @@ def test_approve_only_transfering_crash_cannot_confirm_transfer(tmp_path, monkey
     approve_raw = Web3.to_hex(b"persisted-approve")
     approve_hash = Web3.keccak(b"persisted-approve").hex()
     with sqlite3.connect(db_path) as db:
+        seed_linked_plan(db)
         db.execute(
             "INSERT INTO sent_transactions "
             "(user_id, plan_id, order_id, network_key, approve_tx_hash, approve_tx_nonce, "
@@ -718,6 +730,7 @@ def test_confirmed_transfer_receipt_never_rebroadcasts(tmp_path, monkeypatch):
     raw_tx = Web3.to_hex(b"confirmed-transfer")
     tx_hash = Web3.keccak(b"confirmed-transfer").hex()
     with sqlite3.connect(db_path) as db:
+        seed_linked_plan(db)
         db.execute(
             "INSERT INTO sent_transactions "
             "(user_id, plan_id, order_id, network_key, transfer_tx_hash, transfer_tx_nonce, "

@@ -121,6 +121,11 @@ def seed_active_gate(db_path, order_id="duplicate-order"):
         )
 
 
+def seed_linked_plan(db_path):
+    with sqlite3.connect(db_path) as db:
+        db.execute("INSERT INTO dca_plans(id,user_id) VALUES(7,10001)")
+
+
 def install_init_trace(monkeypatch, trace_callback):
     real_connect = app.aiosqlite.connect
 
@@ -264,6 +269,7 @@ def test_init_db_without_duplicates_creates_unique_index_and_is_idempotent(
     db_path = tmp_path / "no-duplicates.sqlite3"
     init_current_db(db_path, monkeypatch)
     remove_unique_index(db_path)
+    seed_linked_plan(db_path)
     insert_transaction(db_path, order_id="order-a", state="scheduled")
     insert_transaction(db_path, order_id="order-b", state="sent")
     before = snapshot_transactions_and_gate(db_path)
@@ -325,6 +331,7 @@ def test_begin_immediate_blocks_duplicate_writer_until_index_exists(
     db_path = tmp_path / "two-connection-race.sqlite3"
     init_current_db(db_path, monkeypatch)
     remove_unique_index(db_path)
+    seed_linked_plan(db_path)
     insert_transaction(db_path, order_id="race-order", state="scheduled")
 
     index_reached = threading.Event()

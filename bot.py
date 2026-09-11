@@ -299,6 +299,13 @@ async def open_db():
                 f"SQLite busy_timeout mismatch: expected {DB_BUSY_TIMEOUT_MS}, "
                 f"got {busy_timeout}"
             )
+        await db.execute("PRAGMA foreign_keys = ON")
+        async with db.execute("PRAGMA foreign_keys") as cursor:
+            foreign_keys = int((await cursor.fetchone())[0])
+        if foreign_keys != 1:
+            raise RuntimeError(
+                f"SQLite foreign_keys mismatch: expected 1, got {foreign_keys}"
+            )
         yield db
 
 
@@ -312,6 +319,12 @@ def open_db_sync():
             raise RuntimeError(
                 f"SQLite busy_timeout mismatch: expected {DB_BUSY_TIMEOUT_MS}, "
                 f"got {busy_timeout}"
+            )
+        db.execute("PRAGMA foreign_keys = ON")
+        foreign_keys = int(db.execute("PRAGMA foreign_keys").fetchone()[0])
+        if foreign_keys != 1:
+            raise RuntimeError(
+                f"SQLite foreign_keys mismatch: expected 1, got {foreign_keys}"
             )
         yield db
 
