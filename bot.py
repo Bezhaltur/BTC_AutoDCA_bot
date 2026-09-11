@@ -4763,14 +4763,72 @@ async def _execute_sqlite_control_statement_to_completion(
 
     operation = asyncio.create_task(execute_statement())
     pending_cancellation = None
-    while not operation.done():
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError as cancellation:
-            pending_cancellation = cancellation
+    try:
+        while not operation.done():
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError as cancellation:
+                pending_cancellation = cancellation
 
-    operation.result()
+        operation.result()
+    except BaseException as operation_error:
+        if pending_cancellation is not None:
+            operation_error.sqlite_control_pending_cancellation = (
+                pending_cancellation
+            )
+        raise
     return pending_cancellation
+
+
+async def _rollback_scheduler_transaction_after_error(db, primary_error) -> None:
+    """Finish scheduler transaction cleanup before any nested async work."""
+    if not db.in_transaction:
+        return
+    try:
+        rollback_cancellation = (
+            await _execute_sqlite_control_statement_to_completion(db, "ROLLBACK;")
+        )
+    except BaseException as rollback_error:
+        primary_error.scheduler_transaction_rollback_error = rollback_error
+        raise primary_error from rollback_error
+    if rollback_cancellation is not None:
+        primary_error.scheduler_transaction_rollback_cancellation = (
+            rollback_cancellation
+        )
+
+
+async def _commit_scheduler_transaction(db) -> None:
+    """Commit a scheduler write with an unambiguous cancellation outcome."""
+    try:
+        commit_cancellation = (
+            await _execute_sqlite_control_statement_to_completion(
+                db, "COMMIT;", check_pending_cancellation=True
+            )
+        )
+    except BaseException as commit_error:
+        commit_cancellation = getattr(
+            commit_error, "sqlite_control_pending_cancellation", None
+        )
+        try:
+            await _rollback_scheduler_transaction_after_error(db, commit_error)
+        except BaseException:
+            if commit_cancellation is not None:
+                commit_cancellation.scheduler_transaction_commit_error = commit_error
+                rollback_error = getattr(
+                    commit_error, "scheduler_transaction_rollback_error", None
+                )
+                if rollback_error is not None:
+                    commit_cancellation.scheduler_transaction_rollback_error = (
+                        rollback_error
+                    )
+                raise commit_cancellation from commit_error
+            raise
+        if commit_cancellation is not None:
+            commit_cancellation.scheduler_transaction_commit_error = commit_error
+            raise commit_cancellation from commit_error
+        raise
+    if commit_cancellation is not None:
+        raise commit_cancellation
 
 
 async def init_db():
@@ -5014,7 +5072,7 @@ async def dca_scheduler():
                                             "UPDATE sent_transactions SET error_message = ? WHERE id = ?",
                                             (f"ERC20 recovery blocked: invalid persisted raw transaction: {e}", existing_tx_id),
                                         )
-                                        await db.commit()
+                                        await _commit_scheduler_transaction(db)
                                         continue
 
                                     if existing_state == 'approve_confirmed' and pending_action != "transfer":
@@ -5027,7 +5085,7 @@ async def dca_scheduler():
                                                 "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE id = ?",
                                                 (f"INVALID_PAYMENT_AMOUNT:{e}", existing_tx_id),
                                             )
-                                            await db.commit()
+                                            await _commit_scheduler_transaction(db)
                                             continue
                                         if not await claim_transfer_after_approve(
                                             existing_tx_id, plan_id, existing_order_id, existing_approve_tx
@@ -5075,7 +5133,7 @@ async def dca_scheduler():
                                                     "WHERE order_id = ? AND plan_id = ?",
                                                     (resume_state, resume_approve_tx, resume_transfer_tx, resume_error, existing_order_id, plan_id)
                                                 )
-                                        await db.commit()
+                                        await _commit_scheduler_transaction(db)
                                         continue
                                     if existing_state in ('pending', 'tx_pending', 'blocked', 'transfering') or (
                                         existing_state == 'approve_confirmed' and pending_action == "transfer"
@@ -5087,7 +5145,7 @@ async def dca_scheduler():
                                                 "WHERE order_id = ? AND plan_id = ?",
                                                 ("ERC20 recovery blocked: no persisted transaction hash/raw; manual review required", existing_order_id, plan_id)
                                             )
-                                            await db.commit()
+                                            await _commit_scheduler_transaction(db)
                                             logger.info(f"Skip DCA plan_id={plan_id}: no tx hash for state={existing_state} order {existing_order_id}")
                                             continue
                                         tx_status = await get_transfer_tx_status(from_asset, pending_tx_hash)
@@ -5102,7 +5160,7 @@ async def dca_scheduler():
                                                         "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE id = ?",
                                                         (f"INVALID_PAYMENT_AMOUNT:{e}", existing_tx_id),
                                                     )
-                                                    await db.commit()
+                                                    await _commit_scheduler_transaction(db)
                                                     continue
                                                 if not await claim_transfer_after_approve(
                                                     existing_tx_id,
@@ -5153,7 +5211,7 @@ async def dca_scheduler():
                                                             "WHERE order_id = ? AND plan_id = ?",
                                                             (resume_state, resume_approve_tx, resume_transfer_tx, resume_error, existing_order_id, plan_id)
                                                         )
-                                                await db.commit()
+                                                await _commit_scheduler_transaction(db)
                                                 continue
                                             await db.execute(
                                                 "UPDATE sent_transactions SET state = 'confirmed', error_message = NULL "
@@ -5165,7 +5223,7 @@ async def dca_scheduler():
                                                 "UPDATE dca_plans SET next_run = ?, missed_count = 0 WHERE id = ?",
                                                 (new_next_run, plan_id)
                                             )
-                                            await db.commit()
+                                            await _commit_scheduler_transaction(db)
                                             logger.info(f"Pending tx confirmed for order {existing_order_id}")
                                             continue
                                         if tx_status == "failed":
@@ -5193,7 +5251,7 @@ async def dca_scheduler():
                                             "UPDATE sent_transactions SET state = 'tx_pending' WHERE order_id = ? AND plan_id = ?",
                                             (existing_order_id, plan_id)
                                         )
-                                        await db.commit()
+                                        await _commit_scheduler_transaction(db)
                                         logger.info(f"Skip DCA plan_id={plan_id}: tx status still pending for order {existing_order_id}")
                                         continue
 
@@ -5207,7 +5265,7 @@ async def dca_scheduler():
                                                 "WHERE id = ? AND active_order_id = ?",
                                                 (plan_id, existing_order_id)
                                             )
-                                            await db.commit()
+                                            await _commit_scheduler_transaction(db)
                                             if clear_cur.rowcount != 1:
                                                 logger.info("Stale sent result ignored for order %s", existing_order_id)
                                             continue
@@ -5322,7 +5380,7 @@ async def dca_scheduler():
                                     "UPDATE dca_plans SET next_run = ? WHERE id = ?",
                                     (new_next_run, plan_id)
                                 )
-                                await db.commit()
+                                await _commit_scheduler_transaction(db)
                                 continue
                         except RuntimeError as e:
                             error_msg = str(e)
@@ -5339,7 +5397,7 @@ async def dca_scheduler():
                                     "UPDATE dca_plans SET next_run = ? WHERE id = ?",
                                     (new_next_run, plan_id)
                                 )
-                                await db.commit()
+                                await _commit_scheduler_transaction(db)
                                 continue
                         
                         plan_claimed = await claim_plan_execution(plan_id)
@@ -5401,7 +5459,7 @@ async def dca_scheduler():
                             "last_execution_attempt_at = ? WHERE id = ?",
                             (order_id, order_token, deposit_address, f"{deposit_amount} {deposit_code}", order_expires, now, plan_id)
                         )
-                        await db.commit()
+                        await _commit_scheduler_transaction(db)
                         plan_claimed = False
 
                         if not order_token:
@@ -5447,7 +5505,7 @@ async def dca_scheduler():
                                 "INSERT INTO sent_transactions (user_id, plan_id, order_id, order_token, network_key, amount, deposit_address, state) VALUES (?, ?, ?, ?, ?, ?, ?, 'sending')",
                                 (user_id, plan_id, order_id, order_token, from_asset, required_amount, deposit_address)
                             )
-                            await db.commit()
+                            await _commit_scheduler_transaction(db)
                             
                             await update_order_progress_message(
                                 int(user_id), str(order_id),
@@ -5508,7 +5566,7 @@ async def dca_scheduler():
                                         "UPDATE sent_transactions SET state = 'blocked', error_message = ? WHERE order_id = ? AND plan_id = ?",
                                         (error_str[:500], order_id, plan_id)
                                     )
-                                    await db.commit()
+                                    await _commit_scheduler_transaction(db)
                                     
                                     await update_order_progress_message(
                                         int(user_id), str(order_id),
@@ -5531,7 +5589,7 @@ async def dca_scheduler():
                                         "UPDATE sent_transactions SET state = 'failed', error_message = ? WHERE order_id = ? AND plan_id = ?",
                                         (error_str[:500], order_id, plan_id)
                                     )
-                                    await db.commit()
+                                    await _commit_scheduler_transaction(db)
 
                                     if is_order_expired(order_expires):
                                         await mark_order_expired_before_send(
@@ -5565,7 +5623,7 @@ async def dca_scheduler():
                                         "UPDATE dca_plans SET next_run = ? WHERE id = ?",
                                         (new_next_run, plan_id)
                                     )
-                                    await db.commit()
+                                    await _commit_scheduler_transaction(db)
                                     continue
                             
                             if success:
@@ -5574,7 +5632,7 @@ async def dca_scheduler():
                                     "UPDATE sent_transactions SET approve_tx_hash = ?, transfer_tx_hash = ?, state = 'sent', error_message = NULL WHERE order_id = ? AND plan_id = ?",
                                     (approve_tx, transfer_tx, order_id, plan_id)
                                 )
-                                await db.commit()
+                                await _commit_scheduler_transaction(db)
                                 
                                 msg = (
                                     build_order_state_message(
@@ -5602,7 +5660,7 @@ async def dca_scheduler():
                                     "UPDATE dca_plans SET next_run = ?, missed_count = 0 WHERE id = ?",
                                     (new_next_run, plan_id)
                                 )
-                                await db.commit()
+                                await _commit_scheduler_transaction(db)
                             else:
                                 # Check if error is retryable
                                 is_retryable = is_retryable_network_error(error_msg)
@@ -5614,7 +5672,7 @@ async def dca_scheduler():
                                         "AND state IN ('transfering', 'approve_confirmed', 'tx_pending', 'pending', 'blocked')",
                                         (error_msg[:500], order_id, plan_id),
                                     )
-                                    await db.commit()
+                                    await _commit_scheduler_transaction(db)
                                     await update_order_progress_message(
                                         int(user_id), str(order_id),
                                         build_order_state_message(
@@ -5634,7 +5692,7 @@ async def dca_scheduler():
                                         "WHERE order_id = ? AND plan_id = ?",
                                         (approve_tx, transfer_tx, error_msg[:500], order_id, plan_id)
                                     )
-                                    await db.commit()
+                                    await _commit_scheduler_transaction(db)
                                     await update_order_progress_message(
                                         int(user_id), str(order_id),
                                         build_order_state_message(
@@ -5656,7 +5714,7 @@ async def dca_scheduler():
                                             "WHERE order_id = ? AND plan_id = ?",
                                             (approve_tx, transfer_tx, error_msg[:500], order_id, plan_id)
                                         )
-                                        await db.commit()
+                                        await _commit_scheduler_transaction(db)
                                         await update_order_progress_message(
                                             int(user_id), str(order_id),
                                             build_order_state_message(
@@ -5675,7 +5733,7 @@ async def dca_scheduler():
                                             "UPDATE sent_transactions SET state = 'blocked', error_message = ? WHERE order_id = ? AND plan_id = ?",
                                             (error_msg[:500], order_id, plan_id)
                                         )
-                                        await db.commit()
+                                        await _commit_scheduler_transaction(db)
                                         await update_order_progress_message(
                                             int(user_id), str(order_id),
                                             build_order_state_message(
@@ -5696,7 +5754,7 @@ async def dca_scheduler():
                                         "UPDATE sent_transactions SET state = 'failed', error_message = ? WHERE order_id = ? AND plan_id = ?",
                                         (error_msg[:500], order_id, plan_id)
                                     )
-                                    await db.commit()
+                                    await _commit_scheduler_transaction(db)
 
                                     if is_order_expired(order_expires):
                                         await mark_order_expired_before_send(
@@ -5730,7 +5788,7 @@ async def dca_scheduler():
                                         "UPDATE dca_plans SET next_run = ? WHERE id = ?",
                                         (new_next_run, plan_id)
                                     )
-                                    await db.commit()
+                                    await _commit_scheduler_transaction(db)
                         else:
                             # Wallet not configured - ask to send manually
                             if is_order_expired(order_expires):
@@ -5762,11 +5820,14 @@ async def dca_scheduler():
                                 "UPDATE dca_plans SET next_run = ? WHERE id = ?",
                                 (new_next_run, plan_id)
                             )
-                            await db.commit()
+                            await _commit_scheduler_transaction(db)
                         
                         logger.info(f"DCA execution completed for plan_id={plan_id}, user_id={user_id}, order_id={order_id}")
                         
                     except Exception as e:
+                        if hasattr(e, "scheduler_transaction_rollback_error"):
+                            raise
+                        await _rollback_scheduler_transaction_after_error(db, e)
                         if plan_claimed:
                             await release_plan_claim(plan_id)
                         logger.error(f"Ошибка выполнения DCA для plan_id={plan_id}, user_id={user_id}: {e}")
@@ -5789,10 +5850,10 @@ async def dca_scheduler():
                             "UPDATE dca_plans SET next_run = ? WHERE id = ?",
                             (new_next_run, plan_id)
                         )
-                        await db.commit()
+                        await _commit_scheduler_transaction(db)
                         
         except Exception as e:
-            logger.error(f"Ошибка в DCA scheduler: {e}")
+            logger.error(f"Ошибка в DCA scheduler: {e}", exc_info=True)
         await asyncio.sleep(60)  # проверка каждую минуту
 
 

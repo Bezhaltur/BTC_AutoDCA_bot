@@ -963,8 +963,12 @@ def run_one_order_monitor_iteration(monkeypatch):
 
 
 def _stop_scheduler_after_one_iteration(monkeypatch):
-    async def stop_scheduler(*_args, **_kwargs):
-        raise asyncio.CancelledError
+    original_sleep = asyncio.sleep
+
+    async def stop_scheduler(seconds, *args, **kwargs):
+        if seconds == 60:
+            raise asyncio.CancelledError
+        return await original_sleep(seconds, *args, **kwargs)
 
     monkeypatch.setattr(app.asyncio, "sleep", stop_scheduler)
     with pytest.raises(asyncio.CancelledError):
