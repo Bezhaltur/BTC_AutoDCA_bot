@@ -6,7 +6,7 @@ from pathlib import Path
 import bot as app
 
 
-def test_async_factory_applies_only_busy_timeout(tmp_path, monkeypatch):
+def test_async_factory_applies_busy_timeout_and_foreign_keys(tmp_path, monkeypatch):
     db_path = tmp_path / "async-policy.sqlite3"
     monkeypatch.setattr(app, "DB_PATH", str(db_path))
 
@@ -33,7 +33,7 @@ def test_async_factory_applies_only_busy_timeout(tmp_path, monkeypatch):
 
     assert values == {
         "busy_timeout": app.DB_BUSY_TIMEOUT_MS,
-        "foreign_keys": 0,
+        "foreign_keys": 1,
         "journal_mode": journal_mode_before,
         "synchronous": synchronous_before,
         "isolation_level": "",
@@ -44,7 +44,7 @@ def test_async_factory_applies_only_busy_timeout(tmp_path, monkeypatch):
         assert verify.execute("PRAGMA journal_mode").fetchone()[0] == journal_mode_before
 
 
-def test_sync_factory_applies_only_busy_timeout(tmp_path, monkeypatch):
+def test_sync_factory_applies_busy_timeout_and_foreign_keys(tmp_path, monkeypatch):
     db_path = tmp_path / "sync-policy.sqlite3"
     monkeypatch.setattr(app, "DB_PATH", str(db_path))
 
@@ -54,7 +54,7 @@ def test_sync_factory_applies_only_busy_timeout(tmp_path, monkeypatch):
 
     with app.open_db_sync() as db:
         assert db.execute("PRAGMA busy_timeout").fetchone()[0] == app.DB_BUSY_TIMEOUT_MS
-        assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert db.execute("PRAGMA journal_mode").fetchone()[0] == journal_mode_before
         assert db.execute("PRAGMA synchronous").fetchone()[0] == synchronous_before
         assert db.isolation_level == ""

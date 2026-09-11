@@ -18,6 +18,14 @@ import bot as app
 import erc20
 
 
+def _seed_linked_plan(db, plan_id=7, user_id=10001):
+    db.execute(
+        "INSERT INTO dca_plans(id,user_id,interval_hours,btc_address) "
+        "VALUES (?,?,24,'bc1unused')",
+        (plan_id, user_id),
+    )
+
+
 def _amount_to_units(amount_text: str, token_decimals: int) -> int:
     converter = getattr(erc20, "decimal_amount_to_units", None)
     assert callable(converter), (
@@ -404,6 +412,7 @@ def test_production_persister_precedes_transfer_preparation(tmp_path, monkeypatc
     monkeypatch.setattr(app, "DB_PATH", db_path)
     asyncio.run(app.init_db())
     with sqlite3.connect(db_path) as db:
+        _seed_linked_plan(db)
         db.execute(
             "INSERT INTO sent_transactions "
             "(user_id, plan_id, order_id, network_key, amount, deposit_address, state) "
@@ -537,6 +546,7 @@ def test_restart_persists_same_integer_amount_as_decimal_text(tmp_path, monkeypa
     asyncio.run(app.init_db())
 
     with sqlite3.connect(db_path) as db:
+        _seed_linked_plan(db)
         columns = {
             row[1]: row[2].upper()
             for row in db.execute("PRAGMA table_info(sent_transactions)")
@@ -794,6 +804,7 @@ def test_init_db_does_not_rewrite_legacy_real_amount(tmp_path, monkeypatch):
     asyncio.run(app.init_db())
 
     with sqlite3.connect(db_path) as db:
+        _seed_linked_plan(db)
         db.execute(
             "INSERT INTO sent_transactions "
             "(user_id, plan_id, order_id, network_key, amount, deposit_address, state) "
@@ -827,6 +838,7 @@ def test_existing_signed_transfer_intent_is_never_recomputed_from_real(
     raw_tx = Web3.to_hex(b"already-signed-exact-transfer")
     tx_hash = Web3.keccak(b"already-signed-exact-transfer").hex()
     with sqlite3.connect(db_path) as db:
+        _seed_linked_plan(db)
         db.execute(
             "INSERT INTO sent_transactions "
             "(user_id, plan_id, order_id, network_key, transfer_tx_hash, "
