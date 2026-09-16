@@ -306,6 +306,13 @@ async def open_db():
             raise RuntimeError(
                 f"SQLite foreign_keys mismatch: expected 1, got {foreign_keys}"
             )
+        await db.execute("PRAGMA synchronous = FULL")
+        async with db.execute("PRAGMA synchronous") as cursor:
+            synchronous = int((await cursor.fetchone())[0])
+        if synchronous != 2:
+            raise RuntimeError(
+                f"SQLite synchronous mismatch: expected 2, got {synchronous}"
+            )
         yield db
 
 
@@ -325,6 +332,12 @@ def open_db_sync():
         if foreign_keys != 1:
             raise RuntimeError(
                 f"SQLite foreign_keys mismatch: expected 1, got {foreign_keys}"
+            )
+        db.execute("PRAGMA synchronous = FULL")
+        synchronous = int(db.execute("PRAGMA synchronous").fetchone()[0])
+        if synchronous != 2:
+            raise RuntimeError(
+                f"SQLite synchronous mismatch: expected 2, got {synchronous}"
             )
         yield db
 
@@ -4909,6 +4922,30 @@ async def init_db():
     logger.info("База данных инициализирована")
 
 
+async def ensure_wal_mode() -> None:
+    """Enable and verify the persistent WAL journal policy at startup."""
+    async with open_db() as db:
+        if db.in_transaction:
+            raise RuntimeError("Cannot enable SQLite WAL inside an active transaction")
+        async with db.execute("PRAGMA journal_mode = WAL") as cursor:
+            row = await cursor.fetchone()
+        selected_mode = str(row[0]).lower() if row else ""
+        if selected_mode != "wal":
+            raise RuntimeError(
+                f"SQLite journal_mode mismatch: expected wal, got {selected_mode or 'empty'}"
+            )
+        async with db.execute("PRAGMA journal_mode") as cursor:
+            row = await cursor.fetchone()
+        confirmed_mode = str(row[0]).lower() if row else ""
+        if confirmed_mode != "wal":
+            raise RuntimeError(
+                f"SQLite journal_mode confirmation mismatch: expected wal, "
+                f"got {confirmed_mode or 'empty'}"
+            )
+        if db.in_transaction:
+            raise RuntimeError("SQLite WAL setup unexpectedly opened a transaction")
+
+
 # ============================================================================
 # DCA SCHEDULER - автоматическое выполнение планов
 # ============================================================================
@@ -8377,6 +8414,7 @@ async def main():
         
         # Инициализация базы данных
         await init_db()
+        await ensure_wal_mode()
         
         # Load passwords from keyring into memory cache
         await load_passwords_at_startup()
