@@ -275,7 +275,7 @@ def test_double_confirm_claims_once_and_creates_one_fake_order(harness, monkeypa
 
     row = harness.plan(plan_id)
     assert len(harness.fixedfloat_calls) == 1
-    assert harness.claimed_states == ["claiming"]
+    assert harness.claimed_states == ["creating_order"]
     assert row["active_order_id"] == "fake-order-1"
     assert row["active_order_token"] == "fake-token-1"
     assert row["execution_state"] == "scheduled"
