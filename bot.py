@@ -1016,7 +1016,7 @@ async def create_dca_confirmation_request(
         if current_state == "awaiting_confirmation" and current_expires_at and int(current_expires_at) > now:
             await db.rollback()
             return False
-        if current_state in ("claiming", "confirming"):
+        if current_state in ("claiming", "confirming", "creating_order"):
             await db.rollback()
             return False
         await db.execute(
@@ -1277,19 +1277,32 @@ async def skip_missed_dca_cycle(
     scheduled_time: int,
     interval_hours: int,
     reason_code: str = "window_expired",
-) -> None:
-    """Mark overdue cycle as skipped and notify user."""
+) -> bool:
+    """Mark an overdue scheduler-owned cycle as skipped and notify user."""
     now_ts = int(time.time())
     new_next_run = calculate_next_run_preserving_schedule(scheduled_time, interval_hours, now_ts)
     async with open_db() as db:
-        await db.execute(
+        cur = await db.execute(
             "UPDATE dca_plans SET next_run = ?, execution_state = 'skipped', "
             "skip_notified = 0, skip_reason = COALESCE(skip_reason, ?), "
             "missed_count = COALESCE(missed_count, 0) + 1, last_missed_at = ?, "
             "last_execution_attempt_at = ? "
-            "WHERE id = ?",
+            "WHERE id = ? AND active_order_id IS NULL "
+            "AND execution_state IN ('scheduled', 'skipped', 'expired') "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM sent_transactions st WHERE st.plan_id = dca_plans.id "
+            "AND st.state IN ('sending', 'blocked', 'approve_confirmed', "
+            "'transfering', 'tx_pending', 'pending', 'sent')"
+            ")",
             (new_next_run, reason_code, now_ts, now_ts, plan_id)
         )
+        if cur.rowcount != 1:
+            await db.rollback()
+            logger.info(
+                "DCA skip lost race or plan is no longer scheduler-owned: plan_id=%s",
+                plan_id,
+            )
+            return False
         await db.commit()
     logger.warning(
         "DCA цикл пропущен из-за пропущенного времени исполнения: plan_id=%s, scheduled_time=%s, now=%s",
@@ -1321,7 +1334,7 @@ async def skip_missed_dca_cycle(
         )
     except Exception as e:
         logger.warning("Failed to send missed cycle notification to user %s: %s", user_id, e)
-        return
+        return True
 
     async with open_db() as db:
         await db.execute(
@@ -1329,6 +1342,7 @@ async def skip_missed_dca_cycle(
             (plan_id,)
         )
         await db.commit()
+    return True
 
 
 async def mark_order_expired_before_send(
@@ -1590,15 +1604,44 @@ async def claim_plan_execution(plan_id: int, user_id: Optional[int] = None) -> b
             cur = await db.execute(
                 "UPDATE dca_plans SET execution_state = 'claiming' "
                 "WHERE id = ? AND active = 1 AND deleted = 0 "
-                "AND active_order_id IS NULL AND execution_state != 'claiming'",
+                "AND active_order_id IS NULL "
+                "AND execution_state IN ('scheduled', 'confirming', 'skipped', 'expired')",
                 (plan_id,)
             )
         else:
             cur = await db.execute(
                 "UPDATE dca_plans SET execution_state = 'claiming' "
                 "WHERE id = ? AND user_id = ? AND active = 1 AND deleted = 0 "
-                "AND active_order_id IS NULL AND execution_state != 'claiming'",
+                "AND active_order_id IS NULL "
+                "AND execution_state IN ('scheduled', 'confirming', 'skipped', 'expired')",
                 (plan_id, user_id)
+            )
+        if cur.rowcount == 1:
+            await db.commit()
+            return True
+        await db.rollback()
+        return False
+
+
+async def mark_plan_order_creation_started(
+    plan_id: int, user_id: Optional[int] = None
+) -> bool:
+    """Durably gate a claimed plan before the external order-create request."""
+    async with open_db() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        if user_id is None:
+            cur = await db.execute(
+                "UPDATE dca_plans SET execution_state = 'creating_order' "
+                "WHERE id = ? AND execution_state = 'claiming' "
+                "AND active_order_id IS NULL",
+                (plan_id,),
+            )
+        else:
+            cur = await db.execute(
+                "UPDATE dca_plans SET execution_state = 'creating_order' "
+                "WHERE id = ? AND user_id = ? AND execution_state = 'claiming' "
+                "AND active_order_id IS NULL",
+                (plan_id, user_id),
             )
         if cur.rowcount == 1:
             await db.commit()
@@ -2522,7 +2565,8 @@ async def recovery_scan_pending_transactions() -> None:
 async def recover_stale_plan_claims() -> None:
     """
     Clear stale transient execution states left after unexpected restart/crash.
-    Safe because only rows without active_order_id are reset.
+    Safe because only pre-create claims without active_order_id are reset.
+    creating_order is intentionally retained: the external create outcome may be unknown.
     """
     async with open_db() as db:
         cur = await db.execute(
@@ -5002,7 +5046,7 @@ async def dca_scheduler():
                         else:
                             logger.info("Skip DCA plan_id=%s: awaiting user confirmation", plan_id)
                         continue
-                    if execution_state in ("claiming", "confirming"):
+                    if execution_state in ("claiming", "confirming", "creating_order"):
                         logger.info("Skip DCA plan_id=%s: execution_state=%s", plan_id, execution_state)
                         continue
 
@@ -5442,6 +5486,15 @@ async def dca_scheduler():
                             logger.info(f"Skip DCA plan_id={plan_id}: atomic claim not acquired")
                             continue
 
+                        if not await mark_plan_order_creation_started(plan_id):
+                            await release_plan_claim(plan_id)
+                            plan_claimed = False
+                            logger.warning(
+                                "Skip DCA plan_id=%s: durable order-create gate not acquired",
+                                plan_id,
+                            )
+                            continue
+
                         # Создаём ордер на обмен
                         order_data = await asyncio.to_thread(
                             create_fixedfloat_order,
@@ -5489,13 +5542,19 @@ async def dca_scheduler():
                         order_expires = extract_order_expires_at(order_data)
                         
                         # ВАЖНО: Сохраняем активный ордер в БД для предотвращения дубликатов
-                        await db.execute(
+                        persist_order_cur = await db.execute(
                             "UPDATE dca_plans SET active_order_id = ?, active_order_token = ?, active_order_address = ?, "
                             "active_order_amount = ?, active_order_expires = ?, order_expired_notified = 0, execution_state = 'scheduled', "
                             "confirmation_message_id = NULL, confirmation_expires_at = NULL, confirmation_scheduled_at = NULL, "
-                            "last_execution_attempt_at = ? WHERE id = ?",
+                            "last_execution_attempt_at = ? WHERE id = ? AND execution_state = 'creating_order' "
+                            "AND active_order_id IS NULL",
                             (order_id, order_token, deposit_address, f"{deposit_amount} {deposit_code}", order_expires, now, plan_id)
                         )
+                        if persist_order_cur.rowcount != 1:
+                            await db.rollback()
+                            raise RuntimeError(
+                                f"Cannot persist FixedFloat order gate for plan={plan_id}, order={order_id}"
+                            )
                         await _commit_scheduler_transaction(db)
                         plan_claimed = False
 
@@ -6248,7 +6307,7 @@ async def cmd_execute(message: Message):
     async with open_db() as db:
         async with db.execute(
             "SELECT from_asset, amount, interval_hours, btc_address, active_order_id, active_order_token, active_order_address, "
-            "active_order_amount, active_order_expires, next_run "
+            "active_order_amount, active_order_expires, next_run, execution_state "
             "FROM dca_plans WHERE id = ? AND user_id = ? AND deleted = 0",
             (plan_id, user_id)
         ) as cur:
@@ -6258,9 +6317,16 @@ async def cmd_execute(message: Message):
         await message.answer("❌ План не найден или не принадлежит тебе")
         return
     
-    from_asset, amount, interval_hours, btc_address, active_order_id, active_order_token, active_order_address, active_order_amount, active_order_expires, plan_next_run = row
+    from_asset, amount, interval_hours, btc_address, active_order_id, active_order_token, active_order_address, active_order_amount, active_order_expires, plan_next_run, execution_state = row
     plan_number = await get_plan_display_number(user_id, plan_id)
     plan_claimed = False
+
+    if execution_state == "creating_order":
+        await message.answer(
+            "⚠️ Результат предыдущего запроса создания ордера не определён. "
+            "Требуется ручная проверка; новый ордер не создаётся."
+        )
+        return
 
     now = int(time.time())
     if active_order_id and (not active_order_expires or int(active_order_expires) > now):
@@ -6673,6 +6739,15 @@ async def cmd_execute(message: Message):
             await message.answer("⚠️ План уже выполняется другим процессом. Повтори через несколько секунд.")
             return
 
+        if not await mark_plan_order_creation_started(plan_id, user_id):
+            await release_plan_claim(plan_id)
+            plan_claimed = False
+            await message.answer(
+                "⚠️ Не удалось безопасно зафиксировать попытку создания ордера. "
+                "Новый ордер не создаётся."
+            )
+            return
+
         progress_msg = await message.answer(f"⏳ Создаю ордер {from_asset} на FixedFloat...")
         
         # Создаём ордер через универсальную функцию
@@ -6723,13 +6798,19 @@ async def cmd_execute(message: Message):
         # Сохраняем информацию об активном ордере в БД
         order_expires = extract_order_expires_at(data)
         async with open_db() as db:
-            await db.execute(
+            persist_order_cur = await db.execute(
                 "UPDATE dca_plans SET active_order_id = ?, active_order_token = ?, active_order_address = ?, "
                 "active_order_amount = ?, active_order_expires = ?, order_expired_notified = 0, execution_state = 'scheduled', "
                 "confirmation_message_id = NULL, confirmation_expires_at = NULL, confirmation_scheduled_at = NULL, "
-                "last_execution_attempt_at = ? WHERE id = ?",
-                (order_id, order_token, deposit_address, f"{deposit_amount} {deposit_code}", order_expires, int(time.time()), plan_id)
+                "last_execution_attempt_at = ? WHERE id = ? AND user_id = ? "
+                "AND execution_state = 'creating_order' AND active_order_id IS NULL",
+                (order_id, order_token, deposit_address, f"{deposit_amount} {deposit_code}", order_expires, int(time.time()), plan_id, user_id)
             )
+            if persist_order_cur.rowcount != 1:
+                await db.rollback()
+                raise RuntimeError(
+                    f"Cannot persist FixedFloat order gate for plan={plan_id}, order={order_id}"
+                )
             await db.commit()
             plan_claimed = False
 
