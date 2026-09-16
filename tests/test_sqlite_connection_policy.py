@@ -6,13 +6,14 @@ from pathlib import Path
 import bot as app
 
 
-def test_async_factory_applies_busy_timeout_and_foreign_keys(tmp_path, monkeypatch):
+def test_async_factory_applies_busy_timeout_foreign_keys_and_full_sync(
+    tmp_path, monkeypatch
+):
     db_path = tmp_path / "async-policy.sqlite3"
     monkeypatch.setattr(app, "DB_PATH", str(db_path))
 
     with sqlite3.connect(db_path) as seed:
         journal_mode_before = seed.execute("PRAGMA journal_mode").fetchone()[0]
-        synchronous_before = seed.execute("PRAGMA synchronous").fetchone()[0]
 
     async def inspect_policy():
         async with app.open_db() as db:
@@ -35,7 +36,7 @@ def test_async_factory_applies_busy_timeout_and_foreign_keys(tmp_path, monkeypat
         "busy_timeout": app.DB_BUSY_TIMEOUT_MS,
         "foreign_keys": 1,
         "journal_mode": journal_mode_before,
-        "synchronous": synchronous_before,
+        "synchronous": 2,
         "isolation_level": "",
         "in_transaction_after_dml": True,
     }
@@ -44,19 +45,20 @@ def test_async_factory_applies_busy_timeout_and_foreign_keys(tmp_path, monkeypat
         assert verify.execute("PRAGMA journal_mode").fetchone()[0] == journal_mode_before
 
 
-def test_sync_factory_applies_busy_timeout_and_foreign_keys(tmp_path, monkeypatch):
+def test_sync_factory_applies_busy_timeout_foreign_keys_and_full_sync(
+    tmp_path, monkeypatch
+):
     db_path = tmp_path / "sync-policy.sqlite3"
     monkeypatch.setattr(app, "DB_PATH", str(db_path))
 
     with sqlite3.connect(db_path) as seed:
         journal_mode_before = seed.execute("PRAGMA journal_mode").fetchone()[0]
-        synchronous_before = seed.execute("PRAGMA synchronous").fetchone()[0]
 
     with app.open_db_sync() as db:
         assert db.execute("PRAGMA busy_timeout").fetchone()[0] == app.DB_BUSY_TIMEOUT_MS
         assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert db.execute("PRAGMA journal_mode").fetchone()[0] == journal_mode_before
-        assert db.execute("PRAGMA synchronous").fetchone()[0] == synchronous_before
+        assert db.execute("PRAGMA synchronous").fetchone()[0] == 2
         assert db.isolation_level == ""
         db.execute("CREATE TABLE policy_probe (id INTEGER)")
         db.execute("INSERT INTO policy_probe VALUES (1)")
