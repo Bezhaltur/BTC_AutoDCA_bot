@@ -68,7 +68,7 @@ async def wait_until_submitted(submitted, statement):
     raise AssertionError(f"statement was not submitted: {statement}")
 
 
-def seed_scheduler_sent_order(db_path, now):
+def seed_scheduler_committing_order(db_path, now):
     with sqlite3.connect(db_path) as db:
         db.execute(
             "INSERT INTO dca_plans "
@@ -83,7 +83,7 @@ def seed_scheduler_sent_order(db_path, now):
             "(user_id, plan_id, order_id, order_token, network_key, amount, "
             "deposit_address, state, sent_at) "
             "VALUES (10001, 7, 'scheduler-order', 'scheduler-token', "
-            "'USDT-ARB', 25, '0xdeposit', 'sent', ?)",
+            "'USDT-ARB', 25, '0xdeposit', 'sending', ?)",
             (now,),
         )
 
@@ -94,7 +94,7 @@ def test_scheduler_commit_failure_rolls_back_before_nested_work(
     db_path = tmp_path / "scheduler-commit-cleanup.sqlite3"
     initialize_db(db_path, monkeypatch)
     now = 1_700_000_000
-    seed_scheduler_sent_order(db_path, now)
+    seed_scheduler_committing_order(db_path, now)
 
     monkeypatch.setattr(app.time, "time", lambda: now)
     async def display_number(*_args, **_kwargs):
@@ -103,7 +103,7 @@ def test_scheduler_commit_failure_rolls_back_before_nested_work(
     monkeypatch.setattr(app, "get_plan_display_number", display_number)
 
     async def active_status(*_args, **_kwargs):
-        return "NEW"
+        return "done"
 
     monkeypatch.setattr(app, "get_fixedfloat_order_status_with_retry", active_status)
     events = []
@@ -150,14 +150,14 @@ def test_scheduler_rollback_failure_stops_nested_business_work(
     db_path = tmp_path / "scheduler-cleanup-fail-closed.sqlite3"
     initialize_db(db_path, monkeypatch)
     now = 1_700_000_000
-    seed_scheduler_sent_order(db_path, now)
+    seed_scheduler_committing_order(db_path, now)
     monkeypatch.setattr(app.time, "time", lambda: now)
 
     async def display_number(*_args, **_kwargs):
         return 1
 
     async def active_status(*_args, **_kwargs):
-        return "NEW"
+        return "done"
 
     monkeypatch.setattr(app, "get_plan_display_number", display_number)
     monkeypatch.setattr(app, "get_fixedfloat_order_status_with_retry", active_status)
@@ -533,7 +533,7 @@ def test_scheduler_running_commit_error_after_cancellation_stops_business_work(
     db_path = tmp_path / "scheduler-running-cancelled-commit-error.sqlite3"
     initialize_db(db_path, monkeypatch)
     now = 1_700_000_000
-    seed_scheduler_sent_order(db_path, now)
+    seed_scheduler_committing_order(db_path, now)
     commit_started = threading.Event()
     release_commit_error = threading.Event()
 
@@ -543,7 +543,7 @@ def test_scheduler_running_commit_error_after_cancellation_stops_business_work(
         return 1
 
     async def active_status(*_args, **_kwargs):
-        return "NEW"
+        return "done"
 
     monkeypatch.setattr(app, "get_plan_display_number", display_number)
     monkeypatch.setattr(app, "get_fixedfloat_order_status_with_retry", active_status)

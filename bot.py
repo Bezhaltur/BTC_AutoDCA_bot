@@ -14,6 +14,7 @@ import time
 import re
 import sqlite3
 from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -1877,6 +1878,7 @@ async def claim_transfer_after_approve(
     approve_tx_hash: str,
     *,
     allow_startup_transfering: bool = False,
+    commit_fn: Optional[Callable[[Any], Awaitable[None]]] = None,
 ) -> bool:
     """Atomically claim the single approve-to-transfer transition."""
     expected_states = ["approve_confirmed", "tx_pending", "pending", "blocked"]
@@ -1895,7 +1897,10 @@ async def claim_transfer_after_approve(
         if cur.rowcount != 1:
             await db.rollback()
             return False
-        await db.commit()
+        if commit_fn is None:
+            await db.commit()
+        else:
+            await commit_fn(db)
         return True
 
 
@@ -2127,7 +2132,13 @@ async def update_status_message(user_id: int, text: str) -> None:
         logger.error("Failed to send status message for user %s: %s", user_id, e)
 
 
-async def mark_order_completed(plan_id: int, order_id: str, reason: str) -> bool:
+async def mark_order_completed(
+    plan_id: int,
+    order_id: str,
+    reason: str,
+    *,
+    commit_fn: Optional[Callable[[Any], Awaitable[None]]] = None,
+) -> bool:
     """Mark order as completed, clear active marker, and write history entry."""
     completed_at = int(time.time())
     async with open_db() as db:
@@ -2163,7 +2174,10 @@ async def mark_order_completed(plan_id: int, order_id: str, reason: str) -> bool
                 "INSERT OR IGNORE INTO completed_orders (user_id, order_id, completed_at) VALUES (?, ?, ?)",
                 (user_id, order_id, completed_at)
             )
-        await db.commit()
+        if commit_fn is None:
+            await db.commit()
+        else:
+            await commit_fn(db)
     _balances_cache.clear()
     logger.info("Order %s completed (reason=%s), clearing active order", order_id, reason)
     return True
@@ -2177,6 +2191,7 @@ async def mark_order_failed(
     proven_transfer_failure_hash: Optional[str] = None,
     proven_approve_failure_hash: Optional[str] = None,
     proven_pre_broadcast: bool = False,
+    commit_fn: Optional[Callable[[Any], Awaitable[None]]] = None,
 ) -> bool:
     """Mark order as failed and clear active marker."""
     async with open_db() as db:
@@ -2212,7 +2227,10 @@ async def mark_order_failed(
             "('sending', 'tx_pending', 'pending', 'blocked', 'approve_confirmed', 'transfering', 'sent', 'failed')",
             (reason[:500], plan_id, order_id)
         )
-        await db.commit()
+        if commit_fn is None:
+            await db.commit()
+        else:
+            await commit_fn(db)
     logger.info("Order %s failed (reason=%s), clearing active order", order_id, reason)
     return True
 
@@ -2319,92 +2337,184 @@ async def resume_transfer_after_approve(
     return ("failed", final_approve_tx, transfer_tx, (error_msg or "Transfer failed")[:500])
 
 
-async def recovery_scan_pending_transactions() -> None:
-    """Recover in-flight transactions after bot restart."""
+@dataclass(frozen=True)
+class ReconciliationResult:
+    outcome: str
+    plan_id: int
+    order_id: Optional[str]
+    tx_state: Optional[str]
+    reason_code: str
+    should_notify: bool
+    schedule_effect: str
+
+
+async def reconcile_existing_order(
+    *,
+    plan_id: int,
+    trigger: str,
+    user_id: Optional[int] = None,
+    existing_order_id: Optional[str] = None,
+    fixedfloat_status: Optional[str] = None,
+    schedule_anchor: Optional[int] = None,
+) -> ReconciliationResult:
+    """Reconcile only already-persisted order/transaction evidence."""
+    if trigger not in {"manual", "scheduler", "startup_recovery"}:
+        raise ValueError(f"Unsupported reconciliation trigger: {trigger}")
+    should_notify = trigger != "startup_recovery"
+
+    async def commit_mutation(db) -> None:
+        if trigger == "scheduler":
+            await _commit_scheduler_transaction(db)
+        else:
+            await db.commit()
+
     async with open_db() as db:
         async with db.execute(
-            "SELECT id, plan_id, user_id, order_id, network_key, approve_tx_hash, transfer_tx_hash, "
-            "error_message, state, amount, deposit_address, approve_raw_tx, transfer_raw_tx, "
-            "amount_units, token_decimals "
-            "FROM sent_transactions WHERE state IN ('sending', 'transfering', 'tx_pending', 'pending', 'blocked')"
+            "SELECT user_id, from_asset, btc_address, active_order_id, active_order_token, "
+            "active_order_expires, next_run, interval_hours FROM dca_plans WHERE id = ?",
+            (plan_id,),
         ) as cur:
-            rows = await cur.fetchall()
+            plan_row = await cur.fetchone()
+    if not plan_row:
+        return ReconciliationResult(
+            "no_plan", plan_id, existing_order_id, None, "plan_missing", False, "unchanged"
+        )
 
-    if not rows:
-        return
+    (
+        authoritative_user_id,
+        plan_network_key,
+        btc_address,
+        active_order_id,
+        _active_order_token,
+        active_order_expires,
+        next_run,
+        interval_hours,
+    ) = plan_row
+    if user_id is not None and int(user_id) != int(authoritative_user_id):
+        return ReconciliationResult(
+            "ownership_mismatch", plan_id, existing_order_id, None,
+            "user_mismatch", False, "unchanged",
+        )
 
-    now = int(time.time())
-    for (
-        tx_id, plan_id, tx_user_id, order_id, network_key, approve_tx, transfer_tx,
-        error_message, current_state, tx_amount, tx_deposit_address,
-        approve_raw_tx, transfer_raw_tx, persisted_amount_units, persisted_token_decimals,
-    ) in rows:
-        try:
-            action_name, tx_hash, raw_tx = resolve_persisted_erc20_transaction(
-                approve_tx, transfer_tx, approve_raw_tx, transfer_raw_tx
+    order_id = str(existing_order_id or active_order_id or "").strip() or None
+    if order_id is None:
+        return ReconciliationResult(
+            "no_order", plan_id, None, None, "active_order_missing", False, "unchanged"
+        )
+
+    # Caller values are hints only. The persisted plan and transaction row
+    # above/below remain authoritative for every recovery decision.
+    async with open_db() as db:
+        async with db.execute(
+            "SELECT id, user_id, network_key, state, approve_tx_hash, transfer_tx_hash, error_message, "
+            "amount, deposit_address, amount_units, token_decimals, approve_raw_tx, transfer_raw_tx "
+            "FROM sent_transactions WHERE plan_id = ? AND order_id = ? "
+            "ORDER BY sent_at DESC, id DESC LIMIT 1",
+            (plan_id, order_id),
+        ) as cur:
+            tx_row = await cur.fetchone()
+    if tx_row and str(tx_row[3] or "") in {"sent", "confirmed", "failed", "expired"}:
+        terminal_state = str(tx_row[3] or "")
+        return ReconciliationResult(
+            "terminal_noop", plan_id, order_id, terminal_state,
+            f"terminal_{terminal_state}", False, "unchanged",
+        )
+
+    if fixedfloat_status in SUCCESS_FIXEDFLOAT_ORDER_STATUSES:
+        completed = await mark_order_completed(
+            plan_id,
+            order_id,
+            f"fixedfloat_{fixedfloat_status}",
+            commit_fn=commit_mutation,
+        )
+        return ReconciliationResult(
+            "order_completed" if completed else "stale_result",
+            plan_id,
+            order_id,
+            "confirmed" if completed else None,
+            "fixedfloat_completed" if completed else "active_gate_changed",
+            should_notify,
+            "unchanged",
+        )
+    if fixedfloat_status in FINAL_FIXEDFLOAT_ORDER_STATUSES:
+        cleared = await mark_order_failed(
+            plan_id,
+            order_id,
+            f"FixedFloat order {fixedfloat_status}",
+            commit_fn=commit_mutation,
+        )
+        return ReconciliationResult(
+            "order_failed" if cleared else "manual_review",
+            plan_id,
+            order_id,
+            "failed" if cleared else None,
+            "fixedfloat_terminal" if cleared else "active_gate_retained",
+            should_notify,
+            "unchanged",
+        )
+    if not tx_row:
+        return ReconciliationResult(
+            "no_transaction", plan_id, order_id, None,
+            "persisted_transaction_missing", should_notify, "unchanged",
+        )
+
+    (
+        tx_id,
+        tx_user_id,
+        tx_network_key,
+        tx_state,
+        approve_tx_hash,
+        transfer_tx_hash,
+        tx_error,
+        tx_amount,
+        deposit_address,
+        persisted_amount_units,
+        persisted_token_decimals,
+        approve_raw_tx,
+        transfer_raw_tx,
+    ) = tx_row
+    network_key = tx_network_key or plan_network_key
+    tx_state = str(tx_state or "")
+    if trigger in {"manual", "scheduler"} and tx_state in {
+        "sending", "transfering", "tx_pending", "pending", "blocked"
+    }:
+        return ReconciliationResult(
+            "in_progress", plan_id, order_id, tx_state,
+            "existing_execution_in_progress", should_notify, "unchanged",
+        )
+
+    try:
+        action_name, tx_hash, raw_tx = resolve_persisted_erc20_transaction(
+            approve_tx_hash, transfer_tx_hash, approve_raw_tx, transfer_raw_tx
+        )
+    except Exception as exc:
+        async with open_db() as db:
+            await db.execute(
+                "UPDATE sent_transactions SET error_message = ? WHERE id = ?",
+                (f"ERC20 recovery blocked: invalid persisted raw transaction: {exc}", tx_id),
             )
-        except Exception as e:
-            async with open_db() as db:
+            await commit_mutation(db)
+        return ReconciliationResult(
+            "manual_review", plan_id, order_id, tx_state,
+            "invalid_persisted_raw", should_notify, "unchanged",
+        )
+
+    async def persist_resume_result(
+        resume_state: str,
+        resume_approve_tx: Optional[str],
+        resume_transfer_tx: Optional[str],
+        resume_error: str,
+    ) -> str:
+        schedule_effect = "unchanged"
+        async with open_db() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            if is_persistence_conflict_error(resume_error):
                 await db.execute(
-                    "UPDATE sent_transactions SET error_message = ? WHERE id = ?",
-                    (f"ERC20 recovery blocked: invalid persisted raw transaction: {e}", tx_id),
+                    "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE id = ? "
+                    "AND state IN ('transfering', 'approve_confirmed', 'tx_pending', 'pending', 'blocked')",
+                    (resume_error[:500], tx_id),
                 )
-                await db.commit()
-            continue
-
-        if not tx_hash:
-            try:
-                exact_amount_units, exact_token_decimals = parse_persisted_payment_intent(
-                    persisted_amount_units, persisted_token_decimals
-                )
-            except (TypeError, ValueError) as e:
-                async with open_db() as db:
-                    await db.execute(
-                        "UPDATE sent_transactions SET error_message = ? WHERE id = ?",
-                        (f"INVALID_PAYMENT_AMOUNT:{e}; manual review required", tx_id),
-                    )
-                    await db.commit()
-                continue
-
-            wallet_password = _wallet_passwords.get(tx_user_id)
-            if plan_id is None or not wallet_password:
-                async with open_db() as db:
-                    await db.execute(
-                        "UPDATE sent_transactions SET error_message = "
-                        "COALESCE(NULLIF(error_message, ''), ?) WHERE id = ?",
-                        ("ERC20 recovery blocked: wallet unlock or plan context unavailable", tx_id),
-                    )
-                    await db.commit()
-                continue
-
-            async with open_db() as db:
-                async with db.execute(
-                    "SELECT btc_address, active_order_expires, next_run, interval_hours "
-                    "FROM dca_plans WHERE id = ?",
-                    (plan_id,),
-                ) as plan_cur:
-                    plan_row = await plan_cur.fetchone()
-            if not plan_row:
-                continue
-
-            resume_state, resume_approve_tx, resume_transfer_tx, resume_error = (
-                await resume_transfer_after_approve(
-                    network_key=network_key,
-                    user_id=tx_user_id,
-                    btc_address=plan_row[0] or "",
-                    order_id=order_id,
-                    deposit_address=tx_deposit_address or "",
-                    required_amount=tx_amount,
-                    existing_approve_tx=approve_tx,
-                    amount_units=exact_amount_units,
-                    token_decimals=exact_token_decimals,
-                    plan_id=plan_id,
-                    order_expires=plan_row[1],
-                    scheduled_time=plan_row[2],
-                    interval_hours=plan_row[3],
-                )
-            )
-            async with open_db() as db:
+            else:
                 await db.execute(
                     "UPDATE sent_transactions SET state = ?, approve_tx_hash = ?, "
                     "transfer_tx_hash = ?, error_message = ? WHERE id = ?",
@@ -2412,153 +2522,268 @@ async def recovery_scan_pending_transactions() -> None:
                         resume_state,
                         resume_approve_tx,
                         resume_transfer_tx,
-                        None if resume_state == "confirmed" else resume_error,
+                        None if resume_state == "confirmed" else resume_error[:500],
                         tx_id,
                     ),
                 )
-                if resume_state == "confirmed":
-                    new_next_run = now + (plan_row[3] * 3600)
-                    await db.execute(
-                        "UPDATE dca_plans SET next_run = ?, missed_count = 0 WHERE id = ?",
-                        (new_next_run, plan_id),
-                    )
-                await db.commit()
+            if resume_state == "confirmed" and trigger in {"scheduler", "startup_recovery"}:
+                schedule_now = int(schedule_anchor if schedule_anchor is not None else time.time())
+                new_next_run = schedule_now + (int(interval_hours or 24) * 3600)
+                await db.execute(
+                    "UPDATE dca_plans SET next_run = ?, missed_count = 0 WHERE id = ?",
+                    (new_next_run, plan_id),
+                )
+                schedule_effect = "advanced"
+            await commit_mutation(db)
+        return schedule_effect
+
+    async def resume_from_persisted_intent() -> ReconciliationResult:
+        try:
+            exact_amount_units, exact_token_decimals = parse_persisted_payment_intent(
+                persisted_amount_units, persisted_token_decimals
+            )
+        except (TypeError, ValueError) as exc:
+            async with open_db() as db:
+                state_sql = "state = 'tx_pending', " if action_name == "approve" else ""
+                error_text = f"INVALID_PAYMENT_AMOUNT:{exc}"
+                if trigger == "startup_recovery" and not tx_hash:
+                    error_text += "; manual review required"
+                await db.execute(
+                    f"UPDATE sent_transactions SET {state_sql}error_message = ? WHERE id = ?",
+                    (error_text, tx_id),
+                )
+                await commit_mutation(db)
+            return ReconciliationResult(
+                "manual_review", plan_id, order_id, tx_state,
+                "missing_exact_intent", should_notify, "unchanged",
+            )
+
+        if trigger == "startup_recovery" and not tx_hash and not _wallet_passwords.get(
+            int(tx_user_id or authoritative_user_id)
+        ):
+            async with open_db() as db:
+                await db.execute(
+                    "UPDATE sent_transactions SET error_message = "
+                    "COALESCE(NULLIF(error_message, ''), ?) WHERE id = ?",
+                    ("ERC20 recovery blocked: wallet unlock or plan context unavailable", tx_id),
+                )
+                await commit_mutation(db)
+            return ReconciliationResult(
+                "manual_review", plan_id, order_id, tx_state,
+                "wallet_unlock_unavailable", False, "unchanged",
+            )
+
+        if action_name == "approve":
+            claimed = await claim_transfer_after_approve(
+                tx_id,
+                plan_id,
+                order_id,
+            approve_tx_hash,
+            allow_startup_transfering=(trigger == "startup_recovery"),
+            commit_fn=commit_mutation,
+        )
+            if not claimed:
+                return ReconciliationResult(
+                    "claim_contended", plan_id, order_id, tx_state,
+                    "transfer_claim_not_acquired", should_notify, "unchanged",
+                )
+        elif trigger != "startup_recovery":
+            return ReconciliationResult(
+                "manual_review", plan_id, order_id, tx_state,
+                "persisted_hash_missing", should_notify, "unchanged",
+            )
+
+        resume_state, resume_approve_tx, resume_transfer_tx, resume_error = (
+            await resume_transfer_after_approve(
+                network_key=network_key,
+                user_id=int(tx_user_id or authoritative_user_id),
+                btc_address=btc_address or "",
+                order_id=order_id,
+                deposit_address=deposit_address or "",
+                required_amount=tx_amount,
+                existing_approve_tx=approve_tx_hash,
+                amount_units=exact_amount_units,
+                token_decimals=exact_token_decimals,
+                plan_id=plan_id,
+                order_expires=active_order_expires,
+                scheduled_time=next_run,
+                interval_hours=interval_hours,
+            )
+        )
+        schedule_effect = await persist_resume_result(
+            resume_state, resume_approve_tx, resume_transfer_tx, resume_error
+        )
+        return ReconciliationResult(
+            resume_state,
+            plan_id,
+            order_id,
+            resume_state,
+            f"resume_{resume_state}",
+            should_notify,
+            schedule_effect,
+        )
+
+    if not tx_hash:
+        if trigger == "startup_recovery" or tx_state == "approve_confirmed":
+            return await resume_from_persisted_intent()
+        async with open_db() as db:
+            await db.execute(
+                "UPDATE sent_transactions SET error_message = COALESCE(NULLIF(error_message, ''), ?) "
+                "WHERE id = ?",
+                ("ERC20 recovery blocked: no persisted transaction hash/raw; manual review required", tx_id),
+            )
+            await commit_mutation(db)
+        return ReconciliationResult(
+            "manual_review", plan_id, order_id, tx_state,
+            "persisted_hash_missing", should_notify, "unchanged",
+        )
+
+    if tx_state == "approve_confirmed" and action_name != "transfer":
+        return await resume_from_persisted_intent()
+
+    tx_status = await get_transfer_tx_status(network_key, tx_hash)
+    if tx_status == "pending":
+        if raw_tx:
+            await rebroadcast_persisted_erc20_transaction(
+                network_key, raw_tx, tx_hash, action_name
+            )
+        async with open_db() as db:
+            await db.execute(
+                "UPDATE sent_transactions SET state = 'tx_pending' WHERE id = ?",
+                (tx_id,),
+            )
+            await commit_mutation(db)
+        return ReconciliationResult(
+            "tx_pending", plan_id, order_id, "tx_pending",
+            "chain_status_pending", should_notify, "unchanged",
+        )
+
+    if tx_status == "confirmed":
+        if action_name == "approve":
+            return await resume_from_persisted_intent()
+        schedule_effect = "unchanged"
+        async with open_db() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                "UPDATE sent_transactions SET state = 'confirmed', error_message = NULL WHERE id = ?",
+                (tx_id,),
+            )
+            if trigger in {"scheduler", "startup_recovery"}:
+                schedule_now = int(schedule_anchor if schedule_anchor is not None else time.time())
+                new_next_run = schedule_now + (int(interval_hours or 24) * 3600)
+                await db.execute(
+                    "UPDATE dca_plans SET next_run = ?, missed_count = 0 WHERE id = ?",
+                    (new_next_run, plan_id),
+                )
+                schedule_effect = "advanced"
+            await commit_mutation(db)
+        return ReconciliationResult(
+            "confirmed", plan_id, order_id, "confirmed",
+            "transfer_confirmed", should_notify, schedule_effect,
+        )
+
+    cleared = await mark_order_failed(
+        plan_id,
+        order_id,
+        "Transfer tx reverted on-chain",
+        proven_transfer_failure_hash=(tx_hash if action_name == "transfer" else None),
+        proven_approve_failure_hash=(tx_hash if action_name == "approve" else None),
+        commit_fn=commit_mutation,
+    )
+    return ReconciliationResult(
+        "failed" if cleared else "manual_review",
+        plan_id,
+        order_id,
+        "failed" if cleared else tx_state,
+        "chain_status_failed" if cleared else "active_gate_retained",
+        should_notify,
+        "unchanged",
+    )
+
+
+async def recovery_scan_pending_transactions() -> None:
+    """Recover in-flight transactions after bot restart."""
+    async with open_db() as db:
+        async with db.execute(
+            "SELECT id, plan_id, order_id, network_key, approve_tx_hash, transfer_tx_hash, "
+            "approve_raw_tx, transfer_raw_tx, amount_units, token_decimals FROM sent_transactions "
+            "WHERE state IN ('sending', 'transfering', 'tx_pending', 'pending', 'blocked') "
+            "ORDER BY id"
+        ) as cur:
+            rows = await cur.fetchall()
+    recovery_now = int(time.time())
+
+    for (
+        tx_id, plan_id, order_id, network_key, approve_tx, transfer_tx,
+        approve_raw, transfer_raw, persisted_amount_units, persisted_token_decimals,
+    ) in rows:
+        if plan_id is not None:
+            await reconcile_existing_order(
+                plan_id=int(plan_id),
+                existing_order_id=str(order_id),
+                trigger="startup_recovery",
+                schedule_anchor=recovery_now,
+            )
             continue
 
-        logger.info("Recovery: checking pending transaction %s", tx_hash)
+        # Historical plan-less rows cannot use plan-owned release/transfer gates.
+        try:
+            action_name, tx_hash, raw_tx = resolve_persisted_erc20_transaction(
+                approve_tx, transfer_tx, approve_raw, transfer_raw
+            )
+        except Exception as exc:
+            async with open_db() as db:
+                await db.execute(
+                    "UPDATE sent_transactions SET error_message = ? WHERE id = ?",
+                    (f"ERC20 recovery blocked: invalid persisted raw transaction: {exc}", tx_id),
+                )
+                await db.commit()
+            continue
+        if not tx_hash:
+            try:
+                parse_persisted_payment_intent(
+                    persisted_amount_units, persisted_token_decimals
+                )
+            except (TypeError, ValueError) as exc:
+                async with open_db() as db:
+                    await db.execute(
+                        "UPDATE sent_transactions SET error_message = ? WHERE id = ?",
+                        (f"INVALID_PAYMENT_AMOUNT:{exc}; manual review required", tx_id),
+                    )
+                    await db.commit()
+                continue
+            async with open_db() as db:
+                await db.execute(
+                    "UPDATE sent_transactions SET error_message = COALESCE(NULLIF(error_message, ''), ?) WHERE id = ?",
+                    ("ERC20 recovery blocked: wallet unlock or plan context unavailable", tx_id),
+                )
+                await db.commit()
+            continue
         tx_status = await get_transfer_tx_status(network_key, tx_hash)
-
+        if tx_status == "pending" and raw_tx:
+            await rebroadcast_persisted_erc20_transaction(
+                network_key, raw_tx, tx_hash, action_name
+            )
+        if tx_status == "confirmed" and action_name == "approve":
+            # A historical plan-less approve cannot safely transition into the
+            # transfer phase or be mistaken for a completed payment.
+            continue
         async with open_db() as db:
             if tx_status == "confirmed":
-                if action_name == "approve":
-                    try:
-                        exact_amount_units, exact_token_decimals = parse_persisted_payment_intent(
-                            persisted_amount_units, persisted_token_decimals
-                        )
-                    except (TypeError, ValueError) as e:
-                        await db.execute(
-                            "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE id = ?",
-                            (f"INVALID_PAYMENT_AMOUNT:{e}", tx_id),
-                        )
-                        await db.commit()
-                        continue
-                    if plan_id is None or not await claim_transfer_after_approve(
-                        tx_id,
-                        plan_id,
-                        order_id,
-                        approve_tx,
-                        allow_startup_transfering=True,
-                    ):
-                        logger.info(
-                            "Approve resume not claimed for order %s; transfer phase is already owned",
-                            order_id,
-                        )
-                        continue
-
-                    btc_address = ""
-                    active_order_expires = None
-                    plan_next_run = None
-                    plan_interval_hours = None
-                    if plan_id:
-                        async with db.execute(
-                            "SELECT btc_address, active_order_expires, next_run, interval_hours FROM dca_plans WHERE id = ?",
-                            (plan_id,)
-                        ) as bcur:
-                            b_row = await bcur.fetchone()
-                        btc_address = (b_row[0] if b_row else "") or ""
-                        active_order_expires = b_row[1] if b_row else None
-                        plan_next_run = b_row[2] if b_row else None
-                        plan_interval_hours = b_row[3] if b_row else None
-
-                    resume_state, resume_approve_tx, resume_transfer_tx, resume_error = await resume_transfer_after_approve(
-                        network_key=network_key,
-                        user_id=tx_user_id,
-                        btc_address=btc_address,
-                        order_id=order_id,
-                        deposit_address=tx_deposit_address or "",
-                        required_amount=tx_amount,
-                        existing_approve_tx=approve_tx,
-                        amount_units=exact_amount_units,
-                        token_decimals=exact_token_decimals,
-                        plan_id=plan_id,
-                        order_expires=active_order_expires,
-                        scheduled_time=plan_next_run,
-                        interval_hours=plan_interval_hours,
-                    )
-
-                    if resume_state == "confirmed":
-                        await db.execute(
-                            "UPDATE sent_transactions SET state = 'confirmed', approve_tx_hash = ?, transfer_tx_hash = ?, error_message = NULL WHERE id = ?",
-                            (resume_approve_tx, resume_transfer_tx, tx_id)
-                        )
-                        if plan_id:
-                            async with db.execute(
-                                "SELECT interval_hours FROM dca_plans WHERE id = ?",
-                                (plan_id,)
-                            ) as pcur:
-                                plan_row = await pcur.fetchone()
-                            if plan_row:
-                                new_next_run = now + (plan_row[0] * 3600)
-                                await db.execute(
-                                    "UPDATE dca_plans SET next_run = ?, missed_count = 0 WHERE id = ?",
-                                    (new_next_run, plan_id)
-                                )
-                    else:
-                        if is_persistence_conflict_error(resume_error):
-                            await db.execute(
-                                "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE id = ? "
-                                "AND state IN ('transfering', 'approve_confirmed', 'tx_pending', 'pending', 'blocked')",
-                                (resume_error, tx_id),
-                            )
-                        else:
-                            await db.execute(
-                                "UPDATE sent_transactions SET state = ?, approve_tx_hash = ?, transfer_tx_hash = ?, error_message = ? WHERE id = ?",
-                                (resume_state, resume_approve_tx, resume_transfer_tx, resume_error, tx_id)
-                            )
-                else:
-                    await db.execute(
-                        "UPDATE sent_transactions SET state = 'confirmed', error_message = NULL WHERE id = ?",
-                        (tx_id,)
-                    )
-                    if plan_id:
-                        async with db.execute(
-                            "SELECT interval_hours FROM dca_plans WHERE id = ?",
-                            (plan_id,)
-                        ) as pcur:
-                            plan_row = await pcur.fetchone()
-                        if plan_row:
-                            new_next_run = now + (plan_row[0] * 3600)
-                            await db.execute(
-                                "UPDATE dca_plans SET next_run = ?, missed_count = 0 WHERE id = ?",
-                                (new_next_run, plan_id)
-                            )
+                await db.execute(
+                    "UPDATE sent_transactions SET state = 'confirmed', error_message = NULL WHERE id = ?",
+                    (tx_id,),
+                )
             elif tx_status == "pending":
-                if raw_tx:
-                    await rebroadcast_persisted_erc20_transaction(
-                        network_key, raw_tx, tx_hash, action_name
-                    )
                 await db.execute(
                     "UPDATE sent_transactions SET state = 'tx_pending' WHERE id = ?",
-                    (tx_id,)
+                    (tx_id,),
                 )
             else:
-                if plan_id:
-                    await mark_order_failed(
-                        plan_id,
-                        order_id,
-                        f"{action_name.capitalize()} transaction reverted on-chain",
-                        proven_transfer_failure_hash=(
-                            tx_hash if action_name == "transfer" else None
-                        ),
-                        proven_approve_failure_hash=(
-                            tx_hash if action_name == "approve" else None
-                        ),
-                    )
-                else:
-                    await db.execute(
-                        "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE id = ?",
-                        ("On-chain failure needs manual resolution without plan ownership", tx_id),
-                    )
+                await db.execute(
+                    "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE id = ?",
+                    ("On-chain failure needs manual resolution without plan ownership", tx_id),
+                )
             await db.commit()
 
 
@@ -5057,26 +5282,53 @@ async def dca_scheduler():
                     
                     try:
                         async with db.execute(
-                            "SELECT order_id, order_token, state FROM sent_transactions "
-                            "WHERE plan_id = ? AND state IN ('sending', 'tx_pending', 'pending', 'blocked', 'transfering') "
-                            "ORDER BY sent_at DESC LIMIT 1",
+                            "SELECT st.order_id, st.order_token, st.state FROM sent_transactions st "
+                            "JOIN dca_plans dp ON dp.id = st.plan_id "
+                            "WHERE st.plan_id = ? AND ("
+                            "st.state IN ('sending', 'transfering', 'approve_confirmed', 'tx_pending', 'pending', 'blocked') "
+                            "OR (st.state IN ('sent', 'confirmed', 'failed', 'expired') "
+                            "AND dp.active_order_id = st.order_id)) "
+                            "ORDER BY CASE WHEN st.state IN "
+                            "('sending', 'transfering', 'approve_confirmed', 'tx_pending', 'pending', 'blocked') "
+                            "THEN 0 ELSE 1 END, st.sent_at DESC LIMIT 1",
                             (plan_id,)
                         ) as inflight_cur:
                             inflight_row = await inflight_cur.fetchone()
                         if inflight_row:
                             inflight_order_id, inflight_order_token, inflight_state = inflight_row
+                            if inflight_state in {"sent", "confirmed", "failed", "expired"}:
+                                await reconcile_existing_order(
+                                    plan_id=plan_id,
+                                    user_id=user_id,
+                                    existing_order_id=inflight_order_id,
+                                    trigger="scheduler",
+                                    schedule_anchor=now,
+                                )
+                                continue
                             inflight_status = await get_fixedfloat_order_status_with_retry(
                                 inflight_order_id, inflight_order_token
                             )
                             if inflight_status in SUCCESS_FIXEDFLOAT_ORDER_STATUSES:
-                                await mark_order_completed(plan_id, inflight_order_id, f"fixedfloat_{inflight_status}")
+                                await reconcile_existing_order(
+                                    plan_id=plan_id,
+                                    user_id=user_id,
+                                    existing_order_id=inflight_order_id,
+                                    fixedfloat_status=inflight_status,
+                                    trigger="scheduler",
+                                    schedule_anchor=now,
+                                )
                                 continue
                             if inflight_status in FINAL_FIXEDFLOAT_ORDER_STATUSES:
                                 logger.info("Order %s expired, clearing active order", inflight_order_id)
-                                cleared = await mark_order_failed(
-                                    plan_id, inflight_order_id, f"FixedFloat order {inflight_status}"
+                                reconciliation = await reconcile_existing_order(
+                                    plan_id=plan_id,
+                                    user_id=user_id,
+                                    existing_order_id=inflight_order_id,
+                                    fixedfloat_status=inflight_status,
+                                    trigger="scheduler",
+                                    schedule_anchor=now,
                                 )
-                                if not cleared:
+                                if reconciliation.outcome != "order_failed":
                                     continue
                             elif inflight_status == "":
                                 logger.info(
@@ -5085,6 +5337,13 @@ async def dca_scheduler():
                                 )
                                 continue
                             else:
+                                await reconcile_existing_order(
+                                    plan_id=plan_id,
+                                    user_id=user_id,
+                                    existing_order_id=inflight_order_id,
+                                    trigger="scheduler",
+                                    schedule_anchor=now,
+                                )
                                 logger.info(f"Skip DCA plan_id={plan_id}: in-flight tx state={inflight_state} order={inflight_order_id}")
                                 continue
 
@@ -5111,283 +5370,53 @@ async def dca_scheduler():
                                     existing_order_id, existing_order_token
                                 )
                                 if ff_order_status in SUCCESS_FIXEDFLOAT_ORDER_STATUSES:
-                                    await mark_order_completed(plan_id, existing_order_id, f"fixedfloat_{ff_order_status}")
+                                    await reconcile_existing_order(
+                                        plan_id=plan_id,
+                                        user_id=user_id,
+                                        existing_order_id=existing_order_id,
+                                        fixedfloat_status=ff_order_status,
+                                        trigger="scheduler",
+                                        schedule_anchor=now,
+                                    )
                                     continue
                                 if ff_order_status in FINAL_FIXEDFLOAT_ORDER_STATUSES:
                                     logger.info("Order %s expired, clearing active order", existing_order_id)
-                                    cleared = await mark_order_failed(
-                                        plan_id, existing_order_id, f"FixedFloat order {ff_order_status}"
+                                    reconciliation = await reconcile_existing_order(
+                                        plan_id=plan_id,
+                                        user_id=user_id,
+                                        existing_order_id=existing_order_id,
+                                        fixedfloat_status=ff_order_status,
+                                        trigger="scheduler",
+                                        schedule_anchor=now,
                                     )
-                                    if not cleared:
+                                    if reconciliation.outcome != "order_failed":
                                         continue
                                     existing_order_id = None
                                     existing_order_expires = None
                             if existing_order_id:
                                 async with db.execute(
-                                    "SELECT id, state, sent_at, approve_tx_hash, transfer_tx_hash, error_message, "
-                                    "amount, deposit_address, amount_units, token_decimals, "
-                                    "approve_raw_tx, transfer_raw_tx "
-                                    "FROM sent_transactions "
+                                    "SELECT state FROM sent_transactions "
                                     "WHERE order_id = ? AND plan_id = ? ORDER BY sent_at DESC LIMIT 1",
                                     (existing_order_id, plan_id)
                                 ) as state_cur:
                                     state_row = await state_cur.fetchone()
 
                                 if state_row:
-                                    (
-                                        existing_tx_id, existing_state, last_attempt_time,
-                                        existing_approve_tx, existing_transfer_tx, existing_error,
-                                        existing_amount, existing_deposit_address,
-                                        existing_amount_units, existing_token_decimals,
-                                        existing_approve_raw, existing_transfer_raw,
-                                    ) = state_row
-                                    try:
-                                        pending_action, pending_tx_hash, pending_raw_tx = resolve_persisted_erc20_transaction(
-                                            existing_approve_tx,
-                                            existing_transfer_tx,
-                                            existing_approve_raw,
-                                            existing_transfer_raw,
-                                        )
-                                    except Exception as e:
-                                        await db.execute(
-                                            "UPDATE sent_transactions SET error_message = ? WHERE id = ?",
-                                            (f"ERC20 recovery blocked: invalid persisted raw transaction: {e}", existing_tx_id),
-                                        )
-                                        await _commit_scheduler_transaction(db)
-                                        continue
-
-                                    if existing_state == 'approve_confirmed' and pending_action != "transfer":
-                                        try:
-                                            exact_amount_units, exact_token_decimals = parse_persisted_payment_intent(
-                                                existing_amount_units, existing_token_decimals
-                                            )
-                                        except (TypeError, ValueError) as e:
-                                            await db.execute(
-                                                "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE id = ?",
-                                                (f"INVALID_PAYMENT_AMOUNT:{e}", existing_tx_id),
-                                            )
-                                            await _commit_scheduler_transaction(db)
-                                            continue
-                                        if not await claim_transfer_after_approve(
-                                            existing_tx_id, plan_id, existing_order_id, existing_approve_tx
-                                        ):
-                                            logger.info(f"Skip DCA plan_id={plan_id}: transfer claim not acquired for order {existing_order_id}")
-                                            continue
-                                        logger.info(f"Approve already confirmed for order {existing_order_id}; attempting transfer step")
-                                        resume_state, resume_approve_tx, resume_transfer_tx, resume_error = await resume_transfer_after_approve(
-                                            network_key=from_asset,
-                                            user_id=user_id,
-                                            btc_address=btc_address,
-                                            order_id=existing_order_id,
-                                            deposit_address=existing_deposit_address or "",
-                                            required_amount=existing_amount,
-                                            existing_approve_tx=existing_approve_tx,
-                                            amount_units=exact_amount_units,
-                                            token_decimals=exact_token_decimals,
+                                    existing_state = state_row[0]
+                                    if existing_state in {
+                                        "sending", "transfering", "approve_confirmed",
+                                        "tx_pending", "pending", "blocked", "sent",
+                                        "confirmed", "failed", "expired",
+                                    }:
+                                        await reconcile_existing_order(
                                             plan_id=plan_id,
-                                            order_expires=existing_order_expires,
-                                            scheduled_time=scheduled_time_for_cycle,
-                                            interval_hours=interval_hours,
+                                            user_id=user_id,
+                                            existing_order_id=existing_order_id,
+                                            trigger="scheduler",
+                                            schedule_anchor=now,
                                         )
-                                        if resume_state == "confirmed":
-                                            await db.execute(
-                                                "UPDATE sent_transactions SET state = 'confirmed', approve_tx_hash = ?, transfer_tx_hash = ?, error_message = NULL "
-                                                "WHERE order_id = ? AND plan_id = ?",
-                                                (resume_approve_tx, resume_transfer_tx, existing_order_id, plan_id)
-                                            )
-                                            new_next_run = now + (interval_hours * 3600)
-                                            await db.execute(
-                                                "UPDATE dca_plans SET next_run = ?, missed_count = 0 WHERE id = ?",
-                                                (new_next_run, plan_id)
-                                            )
-                                        else:
-                                            if is_persistence_conflict_error(resume_error):
-                                                await db.execute(
-                                                    "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? "
-                                                    "WHERE order_id = ? AND plan_id = ? "
-                                                    "AND state IN ('transfering', 'approve_confirmed', 'tx_pending', 'pending', 'blocked')",
-                                                    (resume_error, existing_order_id, plan_id),
-                                                )
-                                            else:
-                                                await db.execute(
-                                                    "UPDATE sent_transactions SET state = ?, approve_tx_hash = ?, transfer_tx_hash = ?, error_message = ? "
-                                                    "WHERE order_id = ? AND plan_id = ?",
-                                                    (resume_state, resume_approve_tx, resume_transfer_tx, resume_error, existing_order_id, plan_id)
-                                                )
-                                        await _commit_scheduler_transaction(db)
                                         continue
-                                    if existing_state in ('pending', 'tx_pending', 'blocked', 'transfering') or (
-                                        existing_state == 'approve_confirmed' and pending_action == "transfer"
-                                    ):
-                                        if not pending_tx_hash:
-                                            await db.execute(
-                                                "UPDATE sent_transactions SET error_message = "
-                                                "COALESCE(NULLIF(error_message, ''), ?) "
-                                                "WHERE order_id = ? AND plan_id = ?",
-                                                ("ERC20 recovery blocked: no persisted transaction hash/raw; manual review required", existing_order_id, plan_id)
-                                            )
-                                            await _commit_scheduler_transaction(db)
-                                            logger.info(f"Skip DCA plan_id={plan_id}: no tx hash for state={existing_state} order {existing_order_id}")
-                                            continue
-                                        tx_status = await get_transfer_tx_status(from_asset, pending_tx_hash)
-                                        if tx_status == "confirmed":
-                                            if pending_action == "approve":
-                                                try:
-                                                    exact_amount_units, exact_token_decimals = parse_persisted_payment_intent(
-                                                        existing_amount_units, existing_token_decimals
-                                                    )
-                                                except (TypeError, ValueError) as e:
-                                                    await db.execute(
-                                                        "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE id = ?",
-                                                        (f"INVALID_PAYMENT_AMOUNT:{e}", existing_tx_id),
-                                                    )
-                                                    await _commit_scheduler_transaction(db)
-                                                    continue
-                                                if not await claim_transfer_after_approve(
-                                                    existing_tx_id,
-                                                    plan_id,
-                                                    existing_order_id,
-                                                    existing_approve_tx,
-                                                ):
-                                                    logger.info(f"Skip DCA plan_id={plan_id}: transfer claim not acquired for order {existing_order_id}")
-                                                    continue
-                                                logger.info(f"Approve tx confirmed for order {existing_order_id}; starting transfer step")
-                                                resume_state, resume_approve_tx, resume_transfer_tx, resume_error = await resume_transfer_after_approve(
-                                                    network_key=from_asset,
-                                                    user_id=user_id,
-                                                    btc_address=btc_address,
-                                                    order_id=existing_order_id,
-                                                    deposit_address=existing_deposit_address or "",
-                                                    required_amount=existing_amount,
-                                                    existing_approve_tx=existing_approve_tx,
-                                                    amount_units=exact_amount_units,
-                                                    token_decimals=exact_token_decimals,
-                                                    plan_id=plan_id,
-                                                    order_expires=existing_order_expires,
-                                                    scheduled_time=scheduled_time_for_cycle,
-                                                    interval_hours=interval_hours,
-                                                )
-                                                if resume_state == "confirmed":
-                                                    await db.execute(
-                                                        "UPDATE sent_transactions SET state = 'confirmed', approve_tx_hash = ?, transfer_tx_hash = ?, error_message = NULL "
-                                                        "WHERE order_id = ? AND plan_id = ?",
-                                                        (resume_approve_tx, resume_transfer_tx, existing_order_id, plan_id)
-                                                    )
-                                                    new_next_run = now + (interval_hours * 3600)
-                                                    await db.execute(
-                                                        "UPDATE dca_plans SET next_run = ?, missed_count = 0 WHERE id = ?",
-                                                        (new_next_run, plan_id)
-                                                    )
-                                                else:
-                                                    if is_persistence_conflict_error(resume_error):
-                                                        await db.execute(
-                                                            "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? "
-                                                            "WHERE order_id = ? AND plan_id = ? "
-                                                            "AND state IN ('transfering', 'approve_confirmed', 'tx_pending', 'pending', 'blocked')",
-                                                            (resume_error, existing_order_id, plan_id),
-                                                        )
-                                                    else:
-                                                        await db.execute(
-                                                            "UPDATE sent_transactions SET state = ?, approve_tx_hash = ?, transfer_tx_hash = ?, error_message = ? "
-                                                            "WHERE order_id = ? AND plan_id = ?",
-                                                            (resume_state, resume_approve_tx, resume_transfer_tx, resume_error, existing_order_id, plan_id)
-                                                        )
-                                                await _commit_scheduler_transaction(db)
-                                                continue
-                                            await db.execute(
-                                                "UPDATE sent_transactions SET state = 'confirmed', error_message = NULL "
-                                                "WHERE order_id = ? AND plan_id = ?",
-                                                (existing_order_id, plan_id)
-                                            )
-                                            new_next_run = now + (interval_hours * 3600)
-                                            await db.execute(
-                                                "UPDATE dca_plans SET next_run = ?, missed_count = 0 WHERE id = ?",
-                                                (new_next_run, plan_id)
-                                            )
-                                            await _commit_scheduler_transaction(db)
-                                            logger.info(f"Pending tx confirmed for order {existing_order_id}")
-                                            continue
-                                        if tx_status == "failed":
-                                            await mark_order_failed(
-                                                plan_id,
-                                                existing_order_id,
-                                                "Transfer tx reverted on-chain",
-                                                proven_transfer_failure_hash=(
-                                                    pending_tx_hash if pending_action == "transfer" else None
-                                                ),
-                                                proven_approve_failure_hash=(
-                                                    pending_tx_hash if pending_action == "approve" else None
-                                                ),
-                                            )
-                                            logger.warning(f"Pending tx failed for order {existing_order_id}")
-                                            continue
-                                        if pending_raw_tx:
-                                            await rebroadcast_persisted_erc20_transaction(
-                                                from_asset,
-                                                pending_raw_tx,
-                                                pending_tx_hash,
-                                                pending_action,
-                                            )
-                                        await db.execute(
-                                            "UPDATE sent_transactions SET state = 'tx_pending' WHERE order_id = ? AND plan_id = ?",
-                                            (existing_order_id, plan_id)
-                                        )
-                                        await _commit_scheduler_transaction(db)
-                                        logger.info(f"Skip DCA plan_id={plan_id}: tx status still pending for order {existing_order_id}")
-                                        continue
-
-                                    if existing_order_expires and existing_order_expires > now:
-                                        if existing_state in ('sent', 'confirmed'):
-                                            # Stale active order marker - clear and skip this cycle to avoid duplicates
-                                            logger.warning(f"Active order {existing_order_id} already sent, clearing stale active order")
-                                            clear_cur = await db.execute(
-                                                "UPDATE dca_plans SET active_order_id = NULL, active_order_token = NULL, active_order_address = NULL, "
-                                                "active_order_amount = NULL, active_order_expires = NULL, execution_state = 'scheduled' "
-                                                "WHERE id = ? AND active_order_id = ?",
-                                                (plan_id, existing_order_id)
-                                            )
-                                            await _commit_scheduler_transaction(db)
-                                            if clear_cur.rowcount != 1:
-                                                logger.info("Stale sent result ignored for order %s", existing_order_id)
-                                            continue
-                                        elif existing_state == 'sending':
-                                            # Order still being sent - wait
-                                            logger.info(f"Skip DCA plan_id={plan_id}: order {existing_order_id} still sending")
-                                            continue
-                                        elif existing_state == 'blocked':
-                                            logger.info(f"Skip DCA plan_id={plan_id}: blocked order {existing_order_id}, waiting for tx status resolution")
-                                            continue
-                                        elif existing_state == 'failed':
-                                            failed_action, failed_hash, _ = select_persisted_erc20_transaction(
-                                                existing_approve_tx, existing_transfer_tx
-                                            )
-                                            if failed_hash:
-                                                failed_tx_status = await get_transfer_tx_status(from_asset, failed_hash)
-                                                if failed_tx_status == "confirmed" and failed_action == "transfer":
-                                                    await mark_order_completed(
-                                                        plan_id, existing_order_id, "persisted_transfer_confirmed"
-                                                    )
-                                                elif failed_tx_status == "failed":
-                                                    await mark_order_failed(
-                                                        plan_id,
-                                                        existing_order_id,
-                                                        "Persisted transaction reverted on-chain",
-                                                        proven_transfer_failure_hash=(
-                                                            failed_hash if failed_action == "transfer" else None
-                                                        ),
-                                                        proven_approve_failure_hash=(
-                                                            failed_hash if failed_action == "approve" else None
-                                                        ),
-                                                    )
-                                            else:
-                                                await mark_order_failed(
-                                                    plan_id,
-                                                    existing_order_id,
-                                                    existing_error or "Pre-broadcast transfer failure",
-                                                    proven_pre_broadcast=True,
-                                                )
-                                            continue
-                                    else:
+                                    if not existing_order_expires or existing_order_expires <= now:
                                         fallback_result = await finalize_expired_unavailable_order(
                                             plan_id, existing_order_id, existing_order_expires, now
                                         )
@@ -6350,10 +6379,14 @@ async def cmd_execute(message: Message):
             inflight_order_id, inflight_order_token
         )
         if inflight_status in SUCCESS_FIXEDFLOAT_ORDER_STATUSES:
-            completed = await mark_order_completed(
-                plan_id, inflight_order_id, f"fixedfloat_{inflight_status}"
+            reconciliation = await reconcile_existing_order(
+                plan_id=plan_id,
+                user_id=user_id,
+                existing_order_id=inflight_order_id,
+                fixedfloat_status=inflight_status,
+                trigger="manual",
             )
-            if not completed:
+            if reconciliation.outcome != "order_completed":
                 return
             active_order_id = None
             active_order_address = None
@@ -6361,10 +6394,14 @@ async def cmd_execute(message: Message):
             active_order_expires = None
         elif inflight_status in FINAL_FIXEDFLOAT_ORDER_STATUSES:
             logger.info("Order %s expired, clearing active order", inflight_order_id)
-            cleared = await mark_order_failed(
-                plan_id, inflight_order_id, f"FixedFloat order {inflight_status}"
+            reconciliation = await reconcile_existing_order(
+                plan_id=plan_id,
+                user_id=user_id,
+                existing_order_id=inflight_order_id,
+                fixedfloat_status=inflight_status,
+                trigger="manual",
             )
-            if not cleared:
+            if reconciliation.outcome != "order_failed":
                 await update_order_progress_message(
                     int(user_id), str(inflight_order_id),
                     f"⚠️ Для плана #{plan_number} результат выплаты ещё не определён."
@@ -6375,6 +6412,12 @@ async def cmd_execute(message: Message):
             active_order_amount = None
             active_order_expires = None
         else:
+            await reconcile_existing_order(
+                plan_id=plan_id,
+                user_id=user_id,
+                existing_order_id=inflight_order_id,
+                trigger="manual",
+            )
             await update_order_progress_message(
                 int(user_id), str(inflight_order_id),
                 f"⚠️ Для плана #{plan_number} уже идёт предыдущая покупка."
@@ -6395,10 +6438,14 @@ async def cmd_execute(message: Message):
             )
             return
         if ff_order_status in SUCCESS_FIXEDFLOAT_ORDER_STATUSES:
-            completed = await mark_order_completed(
-                plan_id, active_order_id, f"fixedfloat_{ff_order_status}"
+            reconciliation = await reconcile_existing_order(
+                plan_id=plan_id,
+                user_id=user_id,
+                existing_order_id=active_order_id,
+                fixedfloat_status=ff_order_status,
+                trigger="manual",
             )
-            if not completed:
+            if reconciliation.outcome != "order_completed":
                 return
             active_order_id = None
             active_order_address = None
@@ -6406,10 +6453,14 @@ async def cmd_execute(message: Message):
             active_order_expires = None
         elif ff_order_status in FINAL_FIXEDFLOAT_ORDER_STATUSES:
             logger.info("Order %s expired, clearing active order", active_order_id)
-            cleared = await mark_order_failed(
-                plan_id, active_order_id, f"FixedFloat order {ff_order_status}"
+            reconciliation = await reconcile_existing_order(
+                plan_id=plan_id,
+                user_id=user_id,
+                existing_order_id=active_order_id,
+                fixedfloat_status=ff_order_status,
+                trigger="manual",
             )
-            if not cleared:
+            if reconciliation.outcome != "order_failed":
                 await update_order_progress_message(
                     int(user_id), str(active_order_id),
                     f"⚠️ Для плана #{plan_number} результат выплаты ещё не определён."
@@ -6443,225 +6494,34 @@ async def cmd_execute(message: Message):
             approve_raw_tx = tx_state_row[9]
             transfer_raw_tx = tx_state_row[10]
 
-            try:
-                pending_action, pending_tx_hash, pending_raw_tx = resolve_persisted_erc20_transaction(
-                    approve_tx_hash,
-                    transfer_tx_hash,
-                    approve_raw_tx,
-                    transfer_raw_tx,
-                )
-            except Exception as e:
-                async with open_db() as db:
-                    await db.execute(
-                        "UPDATE sent_transactions SET error_message = ? WHERE id = ?",
-                        (f"ERC20 recovery blocked: invalid persisted raw transaction: {e}", tx_id),
-                    )
-                    await db.commit()
-                return
-
-            if tx_state == "approve_confirmed" and pending_action != "transfer":
-                try:
-                    exact_amount_units, exact_token_decimals = parse_persisted_payment_intent(
-                        persisted_amount_units, persisted_token_decimals
-                    )
-                except (TypeError, ValueError) as e:
-                    async with open_db() as db:
-                        await db.execute(
-                            "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE id = ?",
-                            (f"INVALID_PAYMENT_AMOUNT:{e}", tx_id),
-                        )
-                        await db.commit()
-                    return
-                if not await claim_transfer_after_approve(
-                    tx_id, plan_id, active_order_id, approve_tx_hash
-                ):
-                    await update_order_progress_message(
-                        int(user_id), str(active_order_id),
-                        f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} уже обрабатывается."
-                    )
-                    return
-                resume_state, resume_approve_tx, resume_transfer_tx, resume_error = await resume_transfer_after_approve(
-                    network_key=from_asset,
-                    user_id=user_id,
-                    btc_address=btc_address,
-                    order_id=active_order_id,
-                    deposit_address=tx_deposit_address or "",
-                    required_amount=tx_amount,
-                    existing_approve_tx=approve_tx_hash,
-                    amount_units=exact_amount_units,
-                    token_decimals=exact_token_decimals,
-                    plan_id=plan_id,
-                    order_expires=active_order_expires,
-                    scheduled_time=plan_next_run,
-                    interval_hours=interval_hours,
-                )
-                async with open_db() as db:
-                    if resume_state == "confirmed":
-                        await db.execute(
-                            "UPDATE sent_transactions SET state = 'confirmed', approve_tx_hash = ?, transfer_tx_hash = ?, error_message = NULL WHERE order_id = ? AND plan_id = ?",
-                            (resume_approve_tx, resume_transfer_tx, active_order_id, plan_id)
-                        )
-                    else:
-                        if is_persistence_conflict_error(resume_error):
-                            await db.execute(
-                                "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE order_id = ? AND plan_id = ? "
-                                "AND state IN ('transfering', 'approve_confirmed', 'tx_pending', 'pending', 'blocked')",
-                                (resume_error, active_order_id, plan_id),
-                            )
-                        else:
-                            await db.execute(
-                                "UPDATE sent_transactions SET state = ?, approve_tx_hash = ?, transfer_tx_hash = ?, error_message = ? WHERE order_id = ? AND plan_id = ?",
-                                (resume_state, resume_approve_tx, resume_transfer_tx, resume_error, active_order_id, plan_id)
-                            )
-                    await db.commit()
-                if resume_state == "confirmed":
-                    await update_order_progress_message(
-                        int(user_id), str(active_order_id),
+            reconciliation = await reconcile_existing_order(
+                plan_id=plan_id,
+                user_id=user_id,
+                existing_order_id=active_order_id,
+                trigger="manual",
+            )
+            if reconciliation.should_notify:
+                if reconciliation.outcome == "confirmed":
+                    reconciliation_text = (
                         f"✅ Оплата по ордеру {format_order_link(active_order_id)} подтверждена."
                     )
-                elif resume_state == "tx_pending":
-                    await update_order_progress_message(
-                        int(user_id), str(active_order_id),
+                elif reconciliation.outcome == "tx_pending":
+                    reconciliation_text = (
                         f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} ещё проверяется."
                     )
-                elif resume_state == "expired":
-                    return
+                elif reconciliation.outcome == "claim_contended":
+                    reconciliation_text = (
+                        f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} уже обрабатывается."
+                    )
                 else:
-                    await update_order_progress_message(
-                        int(user_id), str(active_order_id),
+                    reconciliation_text = (
                         f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} требует проверки."
                     )
-                return
+                await update_order_progress_message(
+                    int(user_id), str(active_order_id), reconciliation_text
+                )
+            return
 
-            if not pending_tx_hash:
-                async with open_db() as db:
-                    await db.execute(
-                        "UPDATE sent_transactions SET error_message = "
-                        "COALESCE(NULLIF(error_message, ''), ?) WHERE order_id = ? AND plan_id = ?",
-                        ("ERC20 recovery blocked: no persisted transaction hash/raw; manual review required", active_order_id, plan_id)
-                    )
-                    await db.commit()
-                await update_order_progress_message(
-                    int(user_id), str(active_order_id),
-                    f"⚠️ Для ордера {format_order_link(active_order_id)} требуется ручная проверка выплаты."
-                )
-                return
-            tx_status = await get_transfer_tx_status(from_asset, pending_tx_hash)
-            if tx_status == "pending":
-                if pending_raw_tx:
-                    await rebroadcast_persisted_erc20_transaction(
-                        from_asset,
-                        pending_raw_tx,
-                        pending_tx_hash,
-                        pending_action,
-                    )
-                async with open_db() as db:
-                    await db.execute(
-                        "UPDATE sent_transactions SET state = 'tx_pending' WHERE order_id = ? AND plan_id = ?",
-                        (active_order_id, plan_id)
-                    )
-                    await db.commit()
-                await update_order_progress_message(
-                    int(user_id), str(active_order_id),
-                    f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} ещё проверяется."
-                )
-                return
-            if tx_status == "confirmed":
-                if pending_action == "approve":
-                    try:
-                        exact_amount_units, exact_token_decimals = parse_persisted_payment_intent(
-                            persisted_amount_units, persisted_token_decimals
-                        )
-                    except (TypeError, ValueError) as e:
-                        async with open_db() as db:
-                            await db.execute(
-                                "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE id = ?",
-                                (f"INVALID_PAYMENT_AMOUNT:{e}", tx_id),
-                            )
-                            await db.commit()
-                        return
-                    if not await claim_transfer_after_approve(
-                        tx_id, plan_id, active_order_id, approve_tx_hash
-                    ):
-                        await update_order_progress_message(
-                            int(user_id), str(active_order_id),
-                            f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} уже обрабатывается."
-                        )
-                        return
-                    resume_state, resume_approve_tx, resume_transfer_tx, resume_error = await resume_transfer_after_approve(
-                        network_key=from_asset,
-                        user_id=user_id,
-                        btc_address=btc_address,
-                        order_id=active_order_id,
-                        deposit_address=tx_deposit_address or "",
-                        required_amount=tx_amount,
-                        existing_approve_tx=approve_tx_hash,
-                        amount_units=exact_amount_units,
-                        token_decimals=exact_token_decimals,
-                        plan_id=plan_id,
-                        order_expires=active_order_expires,
-                        scheduled_time=plan_next_run,
-                        interval_hours=interval_hours,
-                    )
-                    async with open_db() as db:
-                        if resume_state == "confirmed":
-                            await db.execute(
-                                "UPDATE sent_transactions SET state = 'confirmed', approve_tx_hash = ?, transfer_tx_hash = ?, error_message = NULL WHERE order_id = ? AND plan_id = ?",
-                                (resume_approve_tx, resume_transfer_tx, active_order_id, plan_id)
-                            )
-                        else:
-                            if is_persistence_conflict_error(resume_error):
-                                await db.execute(
-                                    "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? WHERE order_id = ? AND plan_id = ? "
-                                    "AND state IN ('transfering', 'approve_confirmed', 'tx_pending', 'pending', 'blocked')",
-                                    (resume_error, active_order_id, plan_id),
-                                )
-                            else:
-                                await db.execute(
-                                    "UPDATE sent_transactions SET state = ?, approve_tx_hash = ?, transfer_tx_hash = ?, error_message = ? WHERE order_id = ? AND plan_id = ?",
-                                    (resume_state, resume_approve_tx, resume_transfer_tx, resume_error, active_order_id, plan_id)
-                                )
-                        await db.commit()
-                    if resume_state == "confirmed":
-                        await update_order_progress_message(
-                            int(user_id), str(active_order_id),
-                            f"✅ Оплата по ордеру {format_order_link(active_order_id)} подтверждена."
-                        )
-                    elif resume_state == "tx_pending":
-                        await update_order_progress_message(
-                            int(user_id), str(active_order_id),
-                            f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} ещё проверяется."
-                        )
-                    elif resume_state == "expired":
-                        return
-                    else:
-                        await update_order_progress_message(
-                            int(user_id), str(active_order_id),
-                            f"⚠️ Выплата по ордеру {format_order_link(active_order_id)} требует проверки."
-                        )
-                    return
-                async with open_db() as db:
-                    await db.execute(
-                        "UPDATE sent_transactions SET state = 'confirmed', error_message = NULL WHERE order_id = ? AND plan_id = ?",
-                        (active_order_id, plan_id)
-                    )
-                    await db.commit()
-                await update_order_progress_message(
-                    int(user_id), str(active_order_id),
-                    f"✅ Оплата по ордеру {format_order_link(active_order_id)} подтверждена."
-                )
-                return
-            await mark_order_failed(
-                plan_id,
-                active_order_id,
-                "Transfer tx reverted on-chain",
-                proven_transfer_failure_hash=(
-                    pending_tx_hash if pending_action == "transfer" else None
-                ),
-                proven_approve_failure_hash=(
-                    pending_tx_hash if pending_action == "approve" else None
-                ),
-            )
 
     if active_order_id and active_order_expires and active_order_expires > now:
         # У этого плана уже есть активный неистёкший ордер
