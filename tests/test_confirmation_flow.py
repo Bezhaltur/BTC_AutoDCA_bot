@@ -91,6 +91,30 @@ class Harness:
             return dict(db.execute("SELECT * FROM dca_plans WHERE id = ?", (plan_id,)).fetchone())
 
 
+def _typed_snapshot(db_path, table, where_sql="", parameters=()):
+    with sqlite3.connect(db_path) as db:
+        columns = tuple(row[1] for row in db.execute(f"PRAGMA table_info({table})"))
+        selected = ", ".join(
+            [f'"{column}"' for column in columns]
+            + [f'typeof("{column}")' for column in columns]
+        )
+        rows = tuple(
+            db.execute(
+                f"SELECT {selected} FROM {table} {where_sql}", parameters
+            ).fetchall()
+        )
+    return {"columns": columns, "rows": rows}
+
+
+def _pin_sqlite_timestamps(db_path, plan_id, timestamp):
+    # SQLite's strftime() clock cannot be frozen with monkeypatch. Pin only
+    # those default timestamps; raw values and typeof() remain fully compared.
+    with sqlite3.connect(db_path) as db:
+        db.execute("UPDATE dca_plans SET created_at = ? WHERE id = ?", (timestamp, plan_id))
+        db.execute("UPDATE sent_transactions SET sent_at = ? WHERE plan_id = ?", (timestamp, plan_id))
+        db.commit()
+
+
 @pytest.fixture
 def harness(tmp_path, monkeypatch):
     db_path = str(tmp_path / "confirmation-flow.sqlite3")
@@ -281,6 +305,145 @@ def test_double_confirm_claims_once_and_creates_one_fake_order(harness, monkeypa
     assert row["execution_state"] == "scheduled"
     all_answers = [answer[0] for callback in (first, second) for answer in callback.answers]
     assert sorted(all_answers) == sorted(["Запускаю покупку.", "Этот запрос уже обработан."])
+
+
+def test_manual_and_confirmed_fresh_order_have_identical_money_state(harness, monkeypatch):
+    now = 1_700_000_100
+    scheduled_at = 1_700_000_000
+    monkeypatch.setattr(app.time, "time", lambda: now)
+
+    class ExecuteMessage:
+        from_user = SimpleNamespace(id=USER_ID)
+        text = "/execute"
+
+        async def answer(self, text, **kwargs):
+            return await harness.bot.send_message(USER_ID, text, **kwargs)
+
+    business_columns = (
+        "from_asset", "amount", "interval_hours", "btc_address", "active",
+        "deleted", "execution_state", "active_order_id", "active_order_token",
+        "active_order_address", "active_order_amount", "active_order_expires",
+        "missed_count",
+    )
+
+    manual_plan_id = asyncio.run(
+        harness.add_plan(state="scheduled", next_run=scheduled_at, missed_count=4)
+    )
+    asyncio.run(app.cmd_execute(ExecuteMessage()))
+    manual = harness.plan(manual_plan_id)
+    manual_state = tuple(manual[column] for column in business_columns)
+
+    with sqlite3.connect(harness.db_path) as db:
+        db.execute("DELETE FROM dca_plans")
+        db.commit()
+    harness.fixedfloat_calls.clear()
+    harness.claimed_states.clear()
+    harness.bot.sent.clear()
+    harness.bot.edited.clear()
+
+    confirmed_plan_id = asyncio.run(
+        harness.add_plan(
+            state="awaiting_confirmation",
+            next_run=scheduled_at,
+            message_id=199,
+            expires_at=now + 300,
+            scheduled_at=scheduled_at,
+            missed_count=4,
+        )
+    )
+    callback = FakeCallback(
+        f"dca_confirm:{confirmed_plan_id}:{scheduled_at}", message_id=199
+    )
+    asyncio.run(app.cb_dca_confirm(callback))
+    confirmed = harness.plan(confirmed_plan_id)
+    confirmed_state = tuple(confirmed[column] for column in business_columns)
+
+    assert manual_state == confirmed_state
+    assert harness.fixedfloat_calls == [(NETWORK, 25.0, BTC_ADDRESS)]
+    assert harness.claimed_states == ["creating_order"]
+    assert callback.answers == [("Запускаю покупку.", {})]
+
+
+def test_manual_and_confirmed_send_paths_have_identical_full_typed_state(
+    harness, monkeypatch
+):
+    now = 1_700_000_100
+    scheduled_at = 1_700_000_000
+    monkeypatch.setattr(app.time, "time", lambda: now)
+
+    class ExecuteMessage:
+        from_user = SimpleNamespace(id=USER_ID)
+        text = "/execute"
+
+        async def answer(self, text, **kwargs):
+            return await harness.bot.send_message(USER_ID, text, **kwargs)
+
+    with sqlite3.connect(harness.db_path) as db:
+        db.execute(
+            "INSERT INTO wallets (user_id, wallet_address) VALUES (?, ?)",
+            (USER_ID, "0x2222222222222222222222222222222222222222"),
+        )
+        db.commit()
+    app._wallet_passwords[USER_ID] = "test-password"
+
+    async def successful_send(**kwargs):
+        kwargs["persist_payment_intent"](25_000_000, 6)
+        kwargs["persist_prepared_tx"]("approve", "0xapprove", 11, "0xrawapprove")
+        kwargs["persist_prepared_tx"]("transfer", "0xtransfer", 12, "0xrawtransfer")
+        return True, "0xapprove", "0xtransfer", ""
+
+    monkeypatch.setattr(app, "auto_send_usdt", successful_send)
+
+    manual_plan_id = asyncio.run(
+        harness.add_plan(state="scheduled", next_run=scheduled_at, missed_count=4)
+    )
+    asyncio.run(app.cmd_execute(ExecuteMessage()))
+    _pin_sqlite_timestamps(harness.db_path, manual_plan_id, now)
+    manual_plan = _typed_snapshot(
+        harness.db_path, "dca_plans", "WHERE id = ?", (manual_plan_id,)
+    )
+    manual_tx = _typed_snapshot(
+        harness.db_path, "sent_transactions", "WHERE plan_id = ?", (manual_plan_id,)
+    )
+
+    with sqlite3.connect(harness.db_path) as db:
+        db.execute("DELETE FROM sent_transactions")
+        db.execute("DELETE FROM dca_plans")
+        db.execute("DELETE FROM sqlite_sequence WHERE name IN ('dca_plans', 'sent_transactions')")
+        db.commit()
+    harness.fixedfloat_calls.clear()
+    harness.claimed_states.clear()
+    harness.bot.sent.clear()
+    harness.bot.edited.clear()
+    app._order_progress_messages.clear()
+
+    confirmed_plan_id = asyncio.run(
+        harness.add_plan(
+            state="awaiting_confirmation",
+            next_run=scheduled_at,
+            message_id=199,
+            expires_at=now + 300,
+            scheduled_at=scheduled_at,
+            missed_count=4,
+        )
+    )
+    callback = FakeCallback(
+        f"dca_confirm:{confirmed_plan_id}:{scheduled_at}", message_id=199
+    )
+    asyncio.run(app.cb_dca_confirm(callback))
+    _pin_sqlite_timestamps(harness.db_path, confirmed_plan_id, now)
+    confirmed_plan = _typed_snapshot(
+        harness.db_path, "dca_plans", "WHERE id = ?", (confirmed_plan_id,)
+    )
+    confirmed_tx = _typed_snapshot(
+        harness.db_path, "sent_transactions", "WHERE plan_id = ?", (confirmed_plan_id,)
+    )
+
+    assert manual_plan == confirmed_plan
+    assert manual_tx == confirmed_tx
+    assert len(manual_plan["columns"]) == len(manual_plan["rows"][0]) // 2
+    assert len(manual_tx["columns"]) == len(manual_tx["rows"][0]) // 2
+    assert callback.answers == [("Запускаю покупку.", {})]
 
 
 def test_new_order_without_token_is_blocked_without_send_or_duplicate(harness, monkeypatch):
