@@ -128,6 +128,7 @@ def test_sent_transactions_rebuild_preserves_order_token(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "DB_PATH", str(db_path))
     asyncio.run(app.init_db())
     with sqlite3.connect(db_path) as db:
+        db.execute("ALTER TABLE dca_plans DROP COLUMN amount_text")
         db.execute("DROP TABLE completed_orders")
         db.execute(
             "CREATE TABLE completed_orders ("

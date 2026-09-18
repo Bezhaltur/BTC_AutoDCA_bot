@@ -27,6 +27,7 @@ def run_init(db_path, monkeypatch):
 def create_exact_v1(db_path, monkeypatch, *, populated=True, sequence=50):
     run_init(db_path, monkeypatch)
     with sqlite3.connect(db_path) as db:
+        db.execute("ALTER TABLE dca_plans DROP COLUMN amount_text")
         db.execute("DROP TABLE completed_orders")
         db.execute(V1_COMPLETED_ORDERS_SQL)
         if populated:
@@ -215,7 +216,7 @@ def test_populated_exact_v1_migrates_to_exact_v2_and_preserves_values(
     run_init(db_path, monkeypatch)
 
     with sqlite3.connect(db_path) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == app.CURRENT_SCHEMA_VERSION
         assert db.execute("PRAGMA foreign_key_list(completed_orders)").fetchall() == []
         assert completed_rows_and_types(db) == before_rows
         assert completed_sequence(db) == before_sequence == [(50, "integer")]
@@ -257,7 +258,7 @@ def test_fresh_and_current_unstamped_databases_end_as_v2(tmp_path, monkeypatch):
     fresh_path = tmp_path / "fresh-v2.sqlite3"
     run_init(fresh_path, monkeypatch)
     with sqlite3.connect(fresh_path) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == app.CURRENT_SCHEMA_VERSION
         assert db.execute("PRAGMA foreign_key_list(completed_orders)").fetchall() == []
 
     with sqlite3.connect(fresh_path) as db:
@@ -268,7 +269,7 @@ def test_fresh_and_current_unstamped_databases_end_as_v2(tmp_path, monkeypatch):
     run_init(fresh_path, monkeypatch)
     after = database_snapshot(fresh_path)
     assert (after[0], after[2], after[3]) == (before[0], before[2], before[3])
-    assert after[1] == 2
+    assert after[1] == app.CURRENT_SCHEMA_VERSION
     assert not any(
         sql.lstrip().upper().startswith(("CREATE", "ALTER", "DROP"))
         for sql in statements
@@ -436,7 +437,7 @@ def test_malformed_v1_fails_before_rebuild_ddl(tmp_path, monkeypatch, drift):
             "ALTER TABLE COMPLETED_ORDERS_NEW RENAME TO COMPLETED_ORDERS"
         ),
         lambda sql: sql.startswith("DELETE FROM SQLITE_SEQUENCE WHERE NAME ="),
-        lambda sql: sql == "PRAGMA USER_VERSION = 2",
+        lambda sql: sql == "PRAGMA USER_VERSION = 3",
     ],
     ids=[
         "before-copy",
@@ -543,7 +544,7 @@ def test_cancellation_after_commit_enqueue_acknowledges_committed_v2(
     assert submitted.count("COMMIT;") == 1
     assert "ROLLBACK;" not in submitted
     with sqlite3.connect(db_path) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == app.CURRENT_SCHEMA_VERSION
         assert db.execute("PRAGMA foreign_key_list(completed_orders)").fetchall() == []
         assert completed_rows_and_types(db) == before_rows
         assert completed_index_semantics(db) == before_indexes
@@ -631,7 +632,7 @@ def test_too_new_version_fails_without_mutation(tmp_path, monkeypatch):
     db_path = tmp_path / "too-new.sqlite3"
     run_init(db_path, monkeypatch)
     with sqlite3.connect(db_path) as db:
-        db.execute("PRAGMA user_version=3")
+        db.execute("PRAGMA user_version=4")
     before = database_snapshot(db_path)
     with pytest.raises(RuntimeError, match="newer than supported"):
         run_init(db_path, monkeypatch)

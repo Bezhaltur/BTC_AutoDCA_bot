@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 import threading
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -63,14 +64,15 @@ class Harness:
         async with app.aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
                 "INSERT INTO dca_plans ("
-                "user_id, from_asset, amount, interval_hours, btc_address, next_run, "
+                "user_id, from_asset, amount, amount_text, interval_hours, btc_address, next_run, "
                 "active, deleted, execution_state, confirmation_message_id, "
                 "confirmation_expires_at, confirmation_scheduled_at, missed_count, active_order_id"
-                ") VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?)",
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?)",
                 (
                     USER_ID,
                     NETWORK,
                     25.0,
+                    "25",
                     interval_hours,
                     BTC_ADDRESS,
                     next_run,
@@ -144,7 +146,7 @@ def harness(tmp_path, monkeypatch):
 
     async def fake_limits(network_key):
         assert network_key == NETWORK
-        return {"min": 1.0, "max": 500.0}
+        return {"min": Decimal("1"), "max": Decimal("500")}
 
     def fake_create_order(network_key, amount, btc_address):
         with call_lock:
@@ -359,7 +361,7 @@ def test_manual_and_confirmed_fresh_order_have_identical_money_state(harness, mo
     confirmed_state = tuple(confirmed[column] for column in business_columns)
 
     assert manual_state == confirmed_state
-    assert harness.fixedfloat_calls == [(NETWORK, 25.0, BTC_ADDRESS)]
+    assert harness.fixedfloat_calls == [(NETWORK, "25", BTC_ADDRESS)]
     assert harness.claimed_states == ["creating_order"]
     assert callback.answers == [("Запускаю покупку.", {})]
 
