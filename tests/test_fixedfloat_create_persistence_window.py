@@ -1,6 +1,9 @@
+import ast
 import asyncio
+import inspect
 import sqlite3
 import threading
+import textwrap
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -91,6 +94,41 @@ def _transaction_rows(db_path, plan_id):
         ]
 
 
+def _typed_snapshot(db_path, table, where_sql="", parameters=()):
+    with sqlite3.connect(db_path) as db:
+        columns = [
+            row[1] for row in db.execute(f"PRAGMA table_info({table})").fetchall()
+        ]
+        selected = ", ".join(
+            [f'"{column}"' for column in columns]
+            + [f'typeof("{column}")' for column in columns]
+        )
+        return {
+            "columns": tuple(columns),
+            "rows": tuple(
+                db.execute(
+                    f"SELECT {selected} FROM {table} {where_sql}", parameters
+                ).fetchall()
+            ),
+        }
+
+
+def _typed_row(snapshot):
+    assert len(snapshot["rows"]) == 1
+    columns = snapshot["columns"]
+    row = snapshot["rows"][0]
+    values = row[: len(columns)]
+    types = row[len(columns) :]
+    return dict(zip(columns, zip(values, types)))
+
+
+def _assert_complete_typed_row(snapshot, expected):
+    actual = _typed_row(snapshot)
+    assert tuple(actual) == snapshot["columns"]
+    assert set(expected) == set(snapshot["columns"])
+    assert actual == expected
+
+
 @pytest.fixture
 def create_window(tmp_path, monkeypatch):
     db_path = str(tmp_path / "create-window.sqlite3")
@@ -120,10 +158,10 @@ def create_window(tmp_path, monkeypatch):
     with sqlite3.connect(db_path) as db:
         cur = db.execute(
             "INSERT INTO dca_plans ("
-            "user_id, from_asset, amount, interval_hours, btc_address, next_run, "
+            "user_id, from_asset, amount, interval_hours, btc_address, next_run, created_at, "
             "active, deleted, execution_state"
-            ") VALUES (?, ?, 25.0, 24, ?, ?, 1, 0, 'scheduled')",
-            (USER_ID, NETWORK, BTC_ADDRESS, NOW),
+            ") VALUES (?, ?, 25.0, 24, ?, ?, ?, 1, 0, 'scheduled')",
+            (USER_ID, NETWORK, BTC_ADDRESS, NOW, NOW),
         )
         plan_id = int(cur.lastrowid)
         db.commit()
@@ -890,3 +928,537 @@ def test_fixedfloat_create_request_has_no_established_idempotency_identifier(mon
             },
         )
     ]
+
+
+def test_shared_new_order_core_returns_typed_result_and_events_after_commits(
+    create_window, monkeypatch
+):
+    _install_successful_create(monkeypatch, create_window)
+    _seed_wallet(create_window)
+    send_calls = []
+    events = []
+
+    async def successful_payment(**kwargs):
+        send_calls.append(kwargs["order_id"])
+        kwargs["persist_payment_intent"](25_000_000, 6)
+        kwargs["persist_prepared_tx"](
+            "transfer", "0x" + "ef" * 32, 31, "0x02f86c" + "33" * 32
+        )
+        return True, None, "0x" + "ef" * 32, ""
+
+    async def capture_event(event):
+        # A real writer probe proves progress never runs while the core owns a
+        # write transaction or writer lock.
+        async with app.open_db() as probe:
+            await probe.execute("BEGIN IMMEDIATE")
+            await probe.rollback()
+        events.append(event.kind)
+
+    monkeypatch.setattr(app, "auto_send_usdt", successful_payment)
+    result = asyncio.run(
+        app.execute_new_order(
+            app.NewOrderExecutionRequest(
+                plan_id=create_window.plan_id,
+                user_id=USER_ID,
+                trigger="manual",
+            ),
+            on_progress=capture_event,
+        )
+    )
+
+    assert result == app.NewOrderExecutionResult(
+        outcome="sent",
+        reason_code="auto_send_succeeded",
+        plan_id=create_window.plan_id,
+        order_id="external-order-1",
+        tx_state="sent",
+        required_amount="25.000000",
+        deposit_address=DEPOSIT_ADDRESS,
+        order_expires=NOW + 3600,
+        approve_tx_hash=None,
+        transfer_tx_hash="0x" + "ef" * 32,
+        external_create_attempted=True,
+        active_gate_retained=True,
+        should_notify=True,
+        notification_kind="sent",
+        schedule_effect="missed_count_reset",
+        error_message="",
+    )
+    assert events == ["creating_order", "order_identified", "awaiting_payment"]
+    assert create_window.external_creates == [1]
+    assert send_calls == ["external-order-1"]
+    # SQLite's strftime() clock is independent from the frozen Python clock.
+    # Pin the sole timestamp so the complete raw-value/type snapshot is exact.
+    with sqlite3.connect(create_window.db_path) as db:
+        db.execute(
+            "UPDATE sent_transactions SET sent_at = ? WHERE plan_id = ?",
+            (NOW, create_window.plan_id),
+        )
+        db.commit()
+    plan_snapshot = _typed_snapshot(
+        create_window.db_path,
+        "dca_plans",
+        "WHERE id = ? ORDER BY id",
+        (create_window.plan_id,),
+    )
+    tx_snapshot = _typed_snapshot(
+        create_window.db_path,
+        "sent_transactions",
+        "WHERE plan_id = ? ORDER BY id",
+        (create_window.plan_id,),
+    )
+    _assert_complete_typed_row(
+        plan_snapshot,
+        {
+            "id": (create_window.plan_id, "integer"),
+            "user_id": (USER_ID, "integer"),
+            "from_asset": (NETWORK, "text"),
+            "amount": (25.0, "real"),
+            "interval_hours": (24, "integer"),
+            "btc_address": (BTC_ADDRESS, "text"),
+            "next_run": (NOW, "integer"),
+            "active": (1, "integer"),
+            "created_at": (NOW, "integer"),
+            "active_order_id": ("external-order-1", "text"),
+            "active_order_token": ("external-token-1", "text"),
+            "active_order_address": (DEPOSIT_ADDRESS, "text"),
+            "active_order_amount": ("25.000000 USDTARB", "text"),
+            "active_order_expires": (NOW + 3600, "integer"),
+            "deleted": (0, "integer"),
+            "execution_state": ("scheduled", "text"),
+            "last_tx_hash": (None, "null"),
+            "skip_notified": (0, "integer"),
+            "skip_reason": (None, "null"),
+            "missed_count": (0, "integer"),
+            "last_missed_at": (None, "null"),
+            "last_execution_attempt_at": (NOW, "integer"),
+            "confirmation_message_id": (None, "null"),
+            "confirmation_expires_at": (None, "null"),
+            "confirmation_scheduled_at": (None, "null"),
+            "order_expired_notified": (0, "integer"),
+        },
+    )
+    _assert_complete_typed_row(
+        tx_snapshot,
+        {
+            "id": (1, "integer"),
+            "user_id": (USER_ID, "integer"),
+            "plan_id": (create_window.plan_id, "integer"),
+            "order_id": ("external-order-1", "text"),
+            "order_token": ("external-token-1", "text"),
+            "network_key": (NETWORK, "text"),
+            "approve_tx_hash": (None, "null"),
+            "approve_tx_nonce": (None, "null"),
+            "approve_raw_tx": (None, "null"),
+            "transfer_tx_hash": ("0x" + "ef" * 32, "text"),
+            "transfer_tx_nonce": (31, "integer"),
+            "transfer_raw_tx": ("0x02f86c" + "33" * 32, "text"),
+            "amount": (25.0, "real"),
+            "amount_units": ("25000000", "text"),
+            "token_decimals": (6, "integer"),
+            "deposit_address": (DEPOSIT_ADDRESS, "text"),
+            "state": ("sent", "text"),
+            "error_message": (None, "null"),
+            "sent_at": (NOW, "integer"),
+        },
+    )
+    row = _transaction_rows(create_window.db_path, create_window.plan_id)[0]
+    assert (row["state"], row["amount_units"], row["token_decimals"]) == (
+        "sent",
+        "25000000",
+        6,
+    )
+
+
+def test_progress_callback_failure_cannot_change_durable_money_state(
+    create_window, monkeypatch
+):
+    _install_successful_create(monkeypatch, create_window)
+    callback_calls = []
+
+    async def failing_callback(event):
+        callback_calls.append(event.kind)
+        raise RuntimeError("telegram unavailable")
+
+    result = asyncio.run(
+        app.execute_new_order(
+            app.NewOrderExecutionRequest(
+                plan_id=create_window.plan_id,
+                user_id=USER_ID,
+                trigger="manual",
+            ),
+            on_progress=failing_callback,
+        )
+    )
+
+    assert result.outcome == "manual_payment_required"
+    assert callback_calls == ["creating_order", "order_identified"]
+    assert create_window.external_creates == [1]
+    plan = _plan_row(create_window.db_path, create_window.plan_id)
+    assert plan["active_order_id"] == "external-order-1"
+    assert plan["active_order_token"] == "external-token-1"
+    assert plan["execution_state"] == "scheduled"
+
+
+def test_manual_payment_notification_failure_preserves_baseline_schedule_ordering(
+    create_window, monkeypatch
+):
+    _install_successful_create(monkeypatch, create_window)
+    with sqlite3.connect(create_window.db_path) as db:
+        db.execute(
+            "UPDATE dca_plans SET missed_count = 7, next_run = ? WHERE id = ?",
+            (NOW + 123, create_window.plan_id),
+        )
+        db.commit()
+    before = _typed_row(
+        _typed_snapshot(
+            create_window.db_path,
+            "dca_plans",
+            "WHERE id = ?",
+            (create_window.plan_id,),
+        )
+    )
+    notifications = []
+
+    async def fail_manual_notification_once(user_id, order_id, text):
+        notifications.append((user_id, order_id, text))
+        if len(notifications) == 1:
+            raise RuntimeError("telegram notification unavailable")
+
+    monkeypatch.setattr(app, "update_order_progress_message", fail_manual_notification_once)
+    asyncio.run(app.cmd_execute(create_window.message))
+
+    expected = dict(before)
+    expected.update(
+        {
+            "active_order_id": ("external-order-1", "text"),
+            "active_order_token": ("external-token-1", "text"),
+            "active_order_address": (DEPOSIT_ADDRESS, "text"),
+            "active_order_amount": ("25.000000 USDTARB", "text"),
+            "active_order_expires": (NOW + 3600, "integer"),
+            "execution_state": ("scheduled", "text"),
+            "last_execution_attempt_at": (NOW, "integer"),
+        }
+    )
+    after = _typed_snapshot(
+        create_window.db_path,
+        "dca_plans",
+        "WHERE id = ?",
+        (create_window.plan_id,),
+    )
+    _assert_complete_typed_row(after, expected)
+    assert _typed_row(after)["missed_count"] == (7, "integer")
+    assert _typed_row(after)["next_run"] == (NOW + 123, "integer")
+    assert _typed_snapshot(
+        create_window.db_path,
+        "sent_transactions",
+        "WHERE plan_id = ?",
+        (create_window.plan_id,),
+    )["rows"] == ()
+    assert len(notifications) == 2
+
+
+@pytest.mark.parametrize(
+    ("send_result", "expected_outcome", "expected_reason"),
+    [
+        ((False, None, "0x" + "aa" * 32, "TX_PENDING:0xabc"), "tx_pending", "broadcast_pending"),
+        ((False, None, None, "connection timeout"), "blocked", "retryable_without_transaction_evidence"),
+        ((False, None, None, "Invalid private key format"), "failed", "terminal_auto_send_failure"),
+        ((False, None, None, "PERSISTENCE_CONFLICT:claimed"), "tx_pending", "persistence_conflict"),
+    ],
+)
+def test_shared_core_preserves_send_result_mapping(
+    create_window, monkeypatch, send_result, expected_outcome, expected_reason
+):
+    _install_successful_create(monkeypatch, create_window)
+    _seed_wallet(create_window)
+    send_calls = []
+
+    async def characterized_send(**kwargs):
+        send_calls.append(kwargs["order_id"])
+        return send_result
+
+    monkeypatch.setattr(app, "auto_send_usdt", characterized_send)
+    result = asyncio.run(
+        app.execute_new_order(
+            app.NewOrderExecutionRequest(
+                plan_id=create_window.plan_id,
+                user_id=USER_ID,
+                trigger="manual",
+            )
+        )
+    )
+
+    assert (result.outcome, result.reason_code) == (expected_outcome, expected_reason)
+    assert create_window.external_creates == [1]
+    assert send_calls == ["external-order-1"]
+    tx_row = _transaction_rows(create_window.db_path, create_window.plan_id)[0]
+    assert tx_row["state"] == expected_outcome
+    assert tx_row["error_message"] == send_result[3]
+
+
+def test_shared_core_create_error_retains_gate_and_reports_attempt(create_window, monkeypatch):
+    attempts = []
+
+    def timed_out_create(*args, **kwargs):
+        attempts.append("create")
+        raise TimeoutError("FixedFloat response timeout")
+
+    monkeypatch.setattr(app, "create_fixedfloat_order", timed_out_create)
+    request = app.NewOrderExecutionRequest(
+        plan_id=create_window.plan_id,
+        user_id=USER_ID,
+        trigger="manual",
+    )
+    first = asyncio.run(app.execute_new_order(request))
+    second = asyncio.run(app.execute_new_order(request))
+
+    assert first.outcome == "create_error"
+    assert first.external_create_attempted is True
+    assert first.active_gate_retained is True
+    assert first.error_message == "FixedFloat response timeout"
+    assert second.outcome == "claim_contended"
+    assert attempts == ["create"]
+    assert _plan_row(create_window.db_path, create_window.plan_id)["execution_state"] == "creating_order"
+
+
+def test_shared_core_reports_active_order_persistence_failure_with_gate_retained(
+    create_window, monkeypatch
+):
+    _install_successful_create(monkeypatch, create_window)
+    production_open_db = app.open_db
+
+    class PersistenceErrorProxy:
+        def __init__(self, db):
+            self._db = db
+
+        def __getattr__(self, name):
+            return getattr(self._db, name)
+
+        def execute(self, sql, parameters=None):
+            if "UPDATE dca_plans SET active_order_id" in sql:
+                raise sqlite3.OperationalError("injected active-order persistence failure")
+            if parameters is None:
+                return self._db.execute(sql)
+            return self._db.execute(sql, parameters)
+
+    @asynccontextmanager
+    async def failing_open_db():
+        async with production_open_db() as db:
+            yield PersistenceErrorProxy(db)
+
+    monkeypatch.setattr(app, "open_db", failing_open_db)
+    result = asyncio.run(
+        app.execute_new_order(
+            app.NewOrderExecutionRequest(
+                plan_id=create_window.plan_id,
+                user_id=USER_ID,
+                trigger="manual",
+            )
+        )
+    )
+    monkeypatch.setattr(app, "open_db", production_open_db)
+
+    assert result.outcome == "active_order_persistence_failed"
+    assert result.external_create_attempted is True
+    assert result.active_gate_retained is True
+    assert "injected active-order persistence failure" in result.error_message
+    plan = _plan_row(create_window.db_path, create_window.plan_id)
+    assert plan["execution_state"] == "creating_order"
+    assert plan["active_order_id"] is None
+    assert create_window.external_creates == [1]
+
+    second = asyncio.run(
+        app.execute_new_order(
+            app.NewOrderExecutionRequest(
+                plan_id=create_window.plan_id,
+                user_id=USER_ID,
+                trigger="manual",
+            )
+        )
+    )
+    assert second.outcome == "claim_contended"
+    assert create_window.external_creates == [1]
+
+
+def test_shared_core_insert_conflict_retains_active_order_and_never_sends(
+    create_window, monkeypatch
+):
+    _install_successful_create(monkeypatch, create_window)
+    _seed_wallet(create_window)
+    with sqlite3.connect(create_window.db_path) as db:
+        db.execute(
+            "INSERT INTO sent_transactions "
+            "(user_id, plan_id, order_id, order_token, network_key, amount, deposit_address, state) "
+            "VALUES (?, NULL, 'external-order-1', 'historical-token', ?, 1.0, ?, 'confirmed')",
+            (USER_ID, NETWORK, DEPOSIT_ADDRESS),
+        )
+        db.commit()
+
+    async def forbidden_send(**kwargs):
+        raise AssertionError("insert conflict reached blockchain send")
+
+    monkeypatch.setattr(app, "auto_send_usdt", forbidden_send)
+    result = asyncio.run(
+        app.execute_new_order(
+            app.NewOrderExecutionRequest(
+                plan_id=create_window.plan_id,
+                user_id=USER_ID,
+                trigger="manual",
+            )
+        )
+    )
+
+    assert result.outcome == "sent_transaction_insert_failed"
+    assert result.active_gate_retained is True
+    assert "UNIQUE constraint failed" in result.error_message
+    plan = _plan_row(create_window.db_path, create_window.plan_id)
+    assert plan["active_order_id"] == "external-order-1"
+    assert plan["active_order_token"] == "external-token-1"
+    assert create_window.external_creates == [1]
+
+
+@pytest.mark.parametrize(
+    (
+        "case",
+        "expected_outcome",
+        "expected_reason",
+        "create_attempted",
+        "gate_retained",
+        "should_notify",
+        "schedule_effect",
+    ),
+    [
+        ("claim_contended", "claim_contended", "plan_claim_not_acquired", False, False, True, "unchanged"),
+        ("create_gate_failed", "create_gate_failed", "durable_create_gate_not_acquired", False, False, True, "unchanged"),
+        ("create_ambiguous", "create_error", "fixedfloat_create_error", True, True, True, "unchanged"),
+        ("invalid_response", "invalid_response", "invalid_response_type", True, True, True, "unchanged"),
+        ("token_missing", "missing_token", "fixedfloat_security_token_unavailable", True, True, True, "unchanged"),
+        ("invalid_exact_amount", "invalid_exact_amount", "invalid_authoritative_payment_amount", True, True, True, "unchanged"),
+        ("manual_payment", "manual_payment_required", "wallet_or_unlock_unavailable", True, True, True, "missed_count_reset"),
+        ("tx_insert_conflict", "sent_transaction_insert_failed", "payment_row_not_persisted", True, True, True, "unchanged"),
+        ("transfer_contended", "transfer_claim_contended", "auto_send_claim_not_acquired", True, True, False, "unchanged"),
+        ("sent", "sent", "auto_send_succeeded", True, True, True, "missed_count_reset"),
+        ("tx_pending", "tx_pending", "broadcast_pending", True, True, True, "unchanged"),
+        ("blocked", "blocked", "retryable_without_transaction_evidence", True, True, True, "unchanged"),
+        ("failed", "failed", "terminal_auto_send_failure", True, True, True, "unchanged"),
+    ],
+)
+def test_new_order_result_contract_matrix(
+    create_window,
+    monkeypatch,
+    case,
+    expected_outcome,
+    expected_reason,
+    create_attempted,
+    gate_retained,
+    should_notify,
+    schedule_effect,
+):
+    _install_successful_create(monkeypatch, create_window)
+
+    if case == "claim_contended":
+        async def reject_claim(*args, **kwargs):
+            return False
+        monkeypatch.setattr(app, "claim_plan_execution", reject_claim)
+    elif case == "create_gate_failed":
+        async def reject_gate(*args, **kwargs):
+            return False
+        monkeypatch.setattr(app, "mark_plan_order_creation_started", reject_gate)
+    elif case == "create_ambiguous":
+        def ambiguous_create(*args, **kwargs):
+            create_window.external_creates.append(1)
+            raise TimeoutError("ambiguous create")
+        monkeypatch.setattr(app, "create_fixedfloat_order", ambiguous_create)
+    elif case == "invalid_response":
+        def invalid_create(*args, **kwargs):
+            create_window.external_creates.append(1)
+            return None
+        monkeypatch.setattr(app, "create_fixedfloat_order", invalid_create)
+    elif case in {"token_missing", "invalid_exact_amount"}:
+        def incomplete_create(*args, **kwargs):
+            create_window.external_creates.append(1)
+            response = _order_response(1)
+            if case == "token_missing":
+                response.pop("token")
+            else:
+                response["from"]["amount"] = "not-a-decimal"
+            return response
+        monkeypatch.setattr(app, "create_fixedfloat_order", incomplete_create)
+    elif case != "manual_payment":
+        _seed_wallet(create_window)
+
+    if case == "tx_insert_conflict":
+        with sqlite3.connect(create_window.db_path) as db:
+            db.execute(
+                "INSERT INTO sent_transactions "
+                "(user_id, plan_id, order_id, order_token, network_key, amount, deposit_address, state) "
+                "VALUES (?, NULL, 'external-order-1', 'old-token', ?, 1.0, ?, 'confirmed')",
+                (USER_ID, NETWORK, DEPOSIT_ADDRESS),
+            )
+            db.commit()
+    elif case == "transfer_contended":
+        async def reject_transfer(*args, **kwargs):
+            return False
+        monkeypatch.setattr(app, "claim_auto_send_execution", reject_transfer)
+    elif case in {"sent", "tx_pending", "blocked", "failed"}:
+        send_results = {
+            "sent": (True, "0xapprove", "0xtransfer", ""),
+            "tx_pending": (False, None, "0xtransfer", "TX_PENDING:0xtransfer"),
+            "blocked": (False, None, None, "connection timeout"),
+            "failed": (False, None, None, "invalid private key"),
+        }
+
+        async def characterized_send(**kwargs):
+            return send_results[case]
+
+        monkeypatch.setattr(app, "auto_send_usdt", characterized_send)
+
+    result = asyncio.run(
+        app.execute_new_order(
+            app.NewOrderExecutionRequest(
+                plan_id=create_window.plan_id,
+                user_id=USER_ID,
+                trigger="manual",
+            )
+        )
+    )
+
+    assert result.outcome == expected_outcome
+    assert result.reason_code == expected_reason
+    assert result.external_create_attempted is create_attempted
+    assert result.active_gate_retained is gate_retained
+    assert result.should_notify is should_notify
+    assert result.notification_kind == expected_outcome
+    assert result.schedule_effect == schedule_effect
+    assert len(create_window.external_creates) == int(create_attempted)
+
+
+def test_scheduler_has_confirmation_only_fresh_order_routing():
+    source = inspect.getsource(app.dca_scheduler)
+    tree = ast.parse(textwrap.dedent(source))
+
+    confirmation_then_continue = False
+    for node in ast.walk(tree):
+        for _field, value in ast.iter_fields(node):
+            if not isinstance(value, list):
+                continue
+            for current, following in zip(value, value[1:]):
+                if not isinstance(current, ast.Expr) or not isinstance(current.value, ast.Await):
+                    continue
+                call = current.value.value
+                if (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Name)
+                    and call.func.id == "create_dca_confirmation_request"
+                    and isinstance(following, ast.Continue)
+                ):
+                    confirmation_then_continue = True
+
+    assert confirmation_then_continue is True
+    assert "create_fixedfloat_order" not in source
+    assert "execute_new_order" not in source
+    assert "claim_plan_execution" not in source
+    assert "claim_auto_send_execution" not in source
+    assert "await cmd_execute(" in inspect.getsource(app.cb_dca_confirm)
+    assert "await execute_new_order(" in inspect.getsource(app.cmd_execute)

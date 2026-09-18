@@ -2348,6 +2348,47 @@ class ReconciliationResult:
     schedule_effect: str
 
 
+@dataclass(frozen=True)
+class NewOrderExecutionRequest:
+    plan_id: int
+    user_id: int
+    trigger: str
+
+
+@dataclass(frozen=True)
+class NewOrderEvent:
+    kind: str
+    plan_id: int
+    order_id: Optional[str] = None
+    network_key: Optional[str] = None
+    required_amount: Optional[str] = None
+    deposit_address: Optional[str] = None
+    order_expires: Optional[int] = None
+    approve_tx_hash: Optional[str] = None
+    transfer_tx_hash: Optional[str] = None
+    error_message: str = ""
+
+
+@dataclass(frozen=True)
+class NewOrderExecutionResult:
+    outcome: str
+    reason_code: str
+    plan_id: int
+    order_id: Optional[str]
+    tx_state: Optional[str]
+    required_amount: Optional[str]
+    deposit_address: Optional[str]
+    order_expires: Optional[int]
+    approve_tx_hash: Optional[str]
+    transfer_tx_hash: Optional[str]
+    external_create_attempted: bool
+    active_gate_retained: bool
+    should_notify: bool
+    notification_kind: str
+    schedule_effect: str
+    error_message: str = ""
+
+
 async def reconcile_existing_order(
     *,
     plan_id: int,
@@ -5464,491 +5505,6 @@ async def dca_scheduler():
                         )
                         continue
 
-                        logger.info(f"Выполнение DCA для plan_id={plan_id}, user_id={user_id}: {amount} {from_asset}")
-                        
-                        # Проверяем лимиты перед созданием ордера
-                        try:
-                            limits = await get_fixedfloat_limits(from_asset)
-                            min_limit = limits["min"]
-                            max_limit = limits["max"]
-                            effective_max = min(max_limit, 500.0)
-                            
-                            if amount < min_limit or amount > effective_max:
-                                logger.warning(f"Сумма {amount} вне лимитов для {from_asset}: min={min_limit:.2f}, max={effective_max:.2f}")
-                                # Отправляем уведомление пользователю
-                                await bot.send_message(
-                                    user_id,
-                                    f"❌ Ошибка выполнения DCA плана:\n\n"
-                                    f"Сумма {format_amount(amount)} USDT вне допустимых лимитов для {from_asset}\n"
-                                    f"Минимум: {format_amount(min_limit)} USDT\n"
-                                    f"Максимум: {format_amount(effective_max)} USDT\n\n"
-                                    f"💡 Обнови план с корректной суммой"
-                                )
-                                # Откладываем на следующий интервал
-                                new_next_run = now + (interval_hours * 3600)
-                                await db.execute(
-                                    "UPDATE dca_plans SET next_run = ? WHERE id = ?",
-                                    (new_next_run, plan_id)
-                                )
-                                await _commit_scheduler_transaction(db)
-                                continue
-                        except RuntimeError as e:
-                            error_msg = str(e)
-                            logger.error(f"Ошибка проверки лимитов для plan_id={plan_id}: {e}")
-                            # Если сеть недоступна, пропускаем этот запуск
-                            if "недоступна" in error_msg.lower() or "311" in error_msg or "312" in error_msg:
-                                await bot.send_message(
-                                    user_id,
-                                    f"⚠️ Сеть {from_asset} недоступна на FixedFloat в данный момент\n\n"
-                                    f"План будет повторён через {interval_hours}ч"
-                                )
-                                new_next_run = now + (interval_hours * 3600)
-                                await db.execute(
-                                    "UPDATE dca_plans SET next_run = ? WHERE id = ?",
-                                    (new_next_run, plan_id)
-                                )
-                                await _commit_scheduler_transaction(db)
-                                continue
-                        
-                        plan_claimed = await claim_plan_execution(plan_id)
-                        if not plan_claimed:
-                            logger.info(f"Skip DCA plan_id={plan_id}: atomic claim not acquired")
-                            continue
-
-                        if not await mark_plan_order_creation_started(plan_id):
-                            await release_plan_claim(plan_id)
-                            plan_claimed = False
-                            logger.warning(
-                                "Skip DCA plan_id=%s: durable order-create gate not acquired",
-                                plan_id,
-                            )
-                            continue
-
-                        # Создаём ордер на обмен
-                        order_data = await asyncio.to_thread(
-                            create_fixedfloat_order,
-                            from_asset,
-                            amount,
-                            btc_address
-                        )
-
-                        if not isinstance(order_data, dict):
-                            await release_plan_claim(plan_id)
-                            plan_claimed = False
-                            logger.error(
-                                "FixedFloat create response incomplete for plan_id=%s: invalid response type",
-                                plan_id,
-                            )
-                            await bot.send_message(
-                                user_id,
-                                "❌ FixedFloat вернул неполный ответ при создании ордера. "
-                                "Выполнение остановлено безопасно."
-                            )
-                            continue
-
-                        order_id = str(order_data.get("id") or "").strip()
-                        order_token = str(order_data.get("token") or "").strip() or None
-                        from_obj = order_data.get("from", {}) or {}
-                        deposit_code = from_obj.get("code")
-                        deposit_address = from_obj.get("address")
-                        deposit_amount = from_obj.get("amount")
-
-                        if not order_id:
-                            await release_plan_claim(plan_id)
-                            plan_claimed = False
-                            logger.error(
-                                "FixedFloat create response incomplete for plan_id=%s: order id unavailable",
-                                plan_id,
-                            )
-                            await bot.send_message(
-                                user_id,
-                                "❌ FixedFloat вернул неполный ответ без ID ордера. "
-                                "Выполнение остановлено безопасно."
-                            )
-                            continue
-                        
-                        # Получаем timestamp истечения ордера из ответа FixedFloat.
-                        order_expires = extract_order_expires_at(order_data)
-                        
-                        # ВАЖНО: Сохраняем активный ордер в БД для предотвращения дубликатов
-                        persist_order_cur = await db.execute(
-                            "UPDATE dca_plans SET active_order_id = ?, active_order_token = ?, active_order_address = ?, "
-                            "active_order_amount = ?, active_order_expires = ?, order_expired_notified = 0, execution_state = 'scheduled', "
-                            "confirmation_message_id = NULL, confirmation_expires_at = NULL, confirmation_scheduled_at = NULL, "
-                            "last_execution_attempt_at = ? WHERE id = ? AND execution_state = 'creating_order' "
-                            "AND active_order_id IS NULL",
-                            (order_id, order_token, deposit_address, f"{deposit_amount} {deposit_code}", order_expires, now, plan_id)
-                        )
-                        if persist_order_cur.rowcount != 1:
-                            await db.rollback()
-                            raise RuntimeError(
-                                f"Cannot persist FixedFloat order gate for plan={plan_id}, order={order_id}"
-                            )
-                        await _commit_scheduler_transaction(db)
-                        plan_claimed = False
-
-                        if not order_token:
-                            logger.error(
-                                "FixedFloat create response incomplete for plan_id=%s, order_id=%s: security token unavailable; order kept active",
-                                plan_id,
-                                order_id,
-                            )
-                            await bot.send_message(
-                                user_id,
-                                f"❌ FixedFloat создал ордер {escape_html(order_id)}, но не вернул security token. "
-                                "Ордер сохранён и заблокирован для ручной проверки; средства не отправлялись."
-                            )
-                            continue
-
-                        try:
-                            required_amount = require_exact_fixedfloat_amount(deposit_amount)
-                        except (TypeError, ValueError) as e:
-                            logger.error(
-                                "FixedFloat order %s has invalid authoritative amount: %s",
-                                order_id,
-                                e,
-                            )
-                            await bot.send_message(
-                                user_id,
-                                f"❌ INVALID_PAYMENT_AMOUNT:{escape_html(e)}. Средства не отправлялись.",
-                            )
-                            continue
-                        
-                        # Проверяем есть ли настроенный кошелёк для автоматической отправки (single wallet)
-                        async with db.execute(
-                            "SELECT wallet_address FROM wallets WHERE user_id = ?",
-                            (user_id,)
-                        ) as cur:
-                            wallet_row = await cur.fetchone()
-                        
-                        # Проверяем есть ли пароль в памяти (user_id key)
-                        wallet_password = _wallet_passwords.get(user_id)
-                        
-                        if wallet_row and wallet_password:
-                            # Create transaction record in 'sending' state BEFORE attempting send
-                            await db.execute(
-                                "INSERT INTO sent_transactions (user_id, plan_id, order_id, order_token, network_key, amount, deposit_address, state) VALUES (?, ?, ?, ?, ?, ?, ?, 'sending')",
-                                (user_id, plan_id, order_id, order_token, from_asset, required_amount, deposit_address)
-                            )
-                            await _commit_scheduler_transaction(db)
-                            
-                            await update_order_progress_message(
-                                int(user_id), str(order_id),
-                                build_order_state_message(
-                                    status_title="⏳ Ожидается оплата",
-                                    plan_number=plan_number,
-                                    order_id=order_id,
-                                    amount=required_amount,
-                                    network_key=from_asset,
-                                    btc_address=btc_address,
-                                    payment_address=deposit_address,
-                                    deadline_text=format_order_deadline(order_expires),
-                                    reason_text="",
-                                ),
-                            )
-                            
-                            if is_order_expired(order_expires):
-                                await mark_order_expired_before_send(
-                                    plan_id=plan_id,
-                                    user_id=user_id,
-                                    order_id=order_id,
-                                    scheduled_time=scheduled_time_for_cycle,
-                                    interval_hours=interval_hours,
-                                )
-                                continue
-
-                            if not await claim_auto_send_execution(plan_id, order_id):
-                                continue
-
-                            # Автоматическая отправка USDT
-                            try:
-                                success, approve_tx, transfer_tx, error_msg = await auto_send_usdt(
-                                    network_key=from_asset,
-                                    user_id=user_id,
-                                    wallet_password=wallet_password,
-                                    deposit_address=deposit_address,
-                                    required_amount=required_amount,
-                                    btc_address=btc_address,
-                                    order_id=order_id,
-                                    dry_run=DRY_RUN,
-                                    persist_prepared_tx=make_prepared_tx_persister(plan_id, order_id),
-                                    persist_payment_intent=make_payment_intent_persister(plan_id, order_id),
-                                )
-                                if approve_tx or transfer_tx:
-                                    _balances_cache.clear()
-                            except Exception as send_error:
-                                # RPC/Network error - mark as blocked, don't advance schedule
-                                error_str = str(send_error)
-                                logger.error(f"RPC/Network error during auto-send: {error_str}")
-                                human_error = humanize_auto_send_error(error_str, from_asset)
-                                
-                                # Check if it's a retryable error (RPC, timeout, connection)
-                                is_retryable = is_retryable_network_error(error_str)
-                                
-                                if is_retryable:
-                                    # Mark as blocked - will retry when DCA interval reached
-                                    await db.execute(
-                                        "UPDATE sent_transactions SET state = 'blocked', error_message = ? WHERE order_id = ? AND plan_id = ?",
-                                        (error_str[:500], order_id, plan_id)
-                                    )
-                                    await _commit_scheduler_transaction(db)
-                                    
-                                    await update_order_progress_message(
-                                        int(user_id), str(order_id),
-                                        build_order_state_message(
-                                            status_title="⚠️ Требуется проверка выплаты",
-                                            plan_number=plan_number,
-                                            order_id=order_id,
-                                            amount=required_amount,
-                                            network_key=from_asset,
-                                            btc_address=btc_address,
-                                            deadline_text=format_order_deadline(order_expires),
-                                            reason_text=human_error,
-                                        ),
-                                    )
-                                    # DO NOT advance schedule - will retry
-                                    continue
-                                else:
-                                    # Non-retryable error - mark as failed, advance schedule
-                                    await db.execute(
-                                        "UPDATE sent_transactions SET state = 'failed', error_message = ? WHERE order_id = ? AND plan_id = ?",
-                                        (error_str[:500], order_id, plan_id)
-                                    )
-                                    await _commit_scheduler_transaction(db)
-
-                                    if is_order_expired(order_expires):
-                                        await mark_order_expired_before_send(
-                                            plan_id=plan_id,
-                                            user_id=user_id,
-                                            order_id=order_id,
-                                            scheduled_time=scheduled_time_for_cycle,
-                                            interval_hours=interval_hours,
-                                            manual_send_blocked=True,
-                                        )
-                                        continue
-                                    if is_insufficient_auto_send_error(error_str):
-                                        await record_plan_skip_metadata(plan_id, "insufficient", now)
-
-                                    await update_order_progress_message(
-                                        int(user_id), str(order_id),
-                                        build_auto_send_failed_notification(
-                                            order_id=order_id,
-                                            plan_number=plan_number,
-                                            network_key=from_asset,
-                                            required_amount=required_amount,
-                                            btc_address=btc_address,
-                                            deposit_address=deposit_address,
-                                            order_expires=order_expires,
-                                            error_msg=error_str,
-                                        ),
-                                    )
-                                    # Advance schedule for failed transactions
-                                    new_next_run = now + (interval_hours * 3600)
-                                    await db.execute(
-                                        "UPDATE dca_plans SET next_run = ? WHERE id = ?",
-                                        (new_next_run, plan_id)
-                                    )
-                                    await _commit_scheduler_transaction(db)
-                                    continue
-                            
-                            if success:
-                                # Update transaction record with hashes and 'sent' state
-                                await db.execute(
-                                    "UPDATE sent_transactions SET approve_tx_hash = ?, transfer_tx_hash = ?, state = 'sent', error_message = NULL WHERE order_id = ? AND plan_id = ?",
-                                    (approve_tx, transfer_tx, order_id, plan_id)
-                                )
-                                await _commit_scheduler_transaction(db)
-                                
-                                msg = (
-                                    build_order_state_message(
-                                        status_title="✅ Оплата получена",
-                                        plan_number=plan_number,
-                                        order_id=order_id,
-                                        amount=required_amount,
-                                        network_key=from_asset,
-                                        btc_address=btc_address,
-                                        payment_address=deposit_address,
-                                        reason_text="USDT отправлены. Ожидаем перевод BTC.",
-                                    )
-                                )
-                                
-                                if DRY_RUN:
-                                    msg += f"\n⚠️ DRY RUN MODE - transactions not broadcast"
-                                
-                                await update_order_progress_message(int(user_id), str(order_id), msg)
-                                
-                                logger.info(f"Auto-send successful: order_id={order_id}, approve_tx={approve_tx}, transfer_tx={transfer_tx}")
-                                
-                                # Advance schedule ONLY on successful send
-                                new_next_run = now + (interval_hours * 3600)
-                                await db.execute(
-                                    "UPDATE dca_plans SET next_run = ?, missed_count = 0 WHERE id = ?",
-                                    (new_next_run, plan_id)
-                                )
-                                await _commit_scheduler_transaction(db)
-                            else:
-                                # Check if error is retryable
-                                is_retryable = is_retryable_network_error(error_msg)
-                                human_error = humanize_auto_send_error(error_msg, from_asset)
-                                if is_persistence_conflict_error(error_msg):
-                                    await db.execute(
-                                        "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? "
-                                        "WHERE order_id = ? AND plan_id = ? "
-                                        "AND state IN ('transfering', 'approve_confirmed', 'tx_pending', 'pending', 'blocked')",
-                                        (error_msg[:500], order_id, plan_id),
-                                    )
-                                    await _commit_scheduler_transaction(db)
-                                    await update_order_progress_message(
-                                        int(user_id), str(order_id),
-                                        build_order_state_message(
-                                            status_title="⚠️ Требуется проверка выплаты",
-                                            plan_number=plan_number,
-                                            order_id=order_id,
-                                            amount=required_amount,
-                                            network_key=from_asset,
-                                            btc_address=btc_address,
-                                            reason_text="Сохранённая транзакция уже обрабатывается.",
-                                        ),
-                                    )
-                                    continue
-                                if is_pending_tx_error(error_msg):
-                                    await db.execute(
-                                        "UPDATE sent_transactions SET approve_tx_hash = ?, transfer_tx_hash = ?, state = 'tx_pending', error_message = ? "
-                                        "WHERE order_id = ? AND plan_id = ?",
-                                        (approve_tx, transfer_tx, error_msg[:500], order_id, plan_id)
-                                    )
-                                    await _commit_scheduler_transaction(db)
-                                    await update_order_progress_message(
-                                        int(user_id), str(order_id),
-                                        build_order_state_message(
-                                            status_title="⚠️ Требуется проверка выплаты",
-                                            plan_number=plan_number,
-                                            order_id=order_id,
-                                            amount=required_amount,
-                                            network_key=from_asset,
-                                            btc_address=btc_address,
-                                            reason_text="Транзакция отправлена, но подтверждение сети ещё не получено.",
-                                        ),
-                                    )
-                                    continue
-                                
-                                if is_retryable:
-                                    if transfer_tx or approve_tx:
-                                        await db.execute(
-                                            "UPDATE sent_transactions SET state = 'tx_pending', approve_tx_hash = ?, transfer_tx_hash = ?, error_message = ? "
-                                            "WHERE order_id = ? AND plan_id = ?",
-                                            (approve_tx, transfer_tx, error_msg[:500], order_id, plan_id)
-                                        )
-                                        await _commit_scheduler_transaction(db)
-                                        await update_order_progress_message(
-                                            int(user_id), str(order_id),
-                                            build_order_state_message(
-                                                status_title="⚠️ Требуется проверка выплаты",
-                                                plan_number=plan_number,
-                                                order_id=order_id,
-                                                amount=required_amount,
-                                                network_key=from_asset,
-                                                btc_address=btc_address,
-                                                reason_text="Транзакция отправлена, но подтверждение сети ещё не получено.",
-                                            ),
-                                        )
-                                    else:
-                                        # No tx hash available; keep blocked for manual/scheduler retry policy
-                                        await db.execute(
-                                            "UPDATE sent_transactions SET state = 'blocked', error_message = ? WHERE order_id = ? AND plan_id = ?",
-                                            (error_msg[:500], order_id, plan_id)
-                                        )
-                                        await _commit_scheduler_transaction(db)
-                                        await update_order_progress_message(
-                                            int(user_id), str(order_id),
-                                            build_order_state_message(
-                                                status_title="⚠️ Требуется проверка выплаты",
-                                                plan_number=plan_number,
-                                                order_id=order_id,
-                                                amount=required_amount,
-                                                network_key=from_asset,
-                                                btc_address=btc_address,
-                                                deadline_text=format_order_deadline(order_expires),
-                                                reason_text=human_error,
-                                            ),
-                                        )
-                                    continue
-                                else:
-                                    # Non-retryable error - mark as failed
-                                    await db.execute(
-                                        "UPDATE sent_transactions SET state = 'failed', error_message = ? WHERE order_id = ? AND plan_id = ?",
-                                        (error_msg[:500], order_id, plan_id)
-                                    )
-                                    await _commit_scheduler_transaction(db)
-
-                                    if is_order_expired(order_expires):
-                                        await mark_order_expired_before_send(
-                                            plan_id=plan_id,
-                                            user_id=user_id,
-                                            order_id=order_id,
-                                            scheduled_time=scheduled_time_for_cycle,
-                                            interval_hours=interval_hours,
-                                            manual_send_blocked=True,
-                                        )
-                                        continue
-                                    if is_insufficient_auto_send_error(error_msg):
-                                        await record_plan_skip_metadata(plan_id, "insufficient", now)
-
-                                    error_notification = build_auto_send_failed_notification(
-                                        order_id=order_id,
-                                        plan_number=plan_number,
-                                        network_key=from_asset,
-                                        required_amount=required_amount,
-                                        btc_address=btc_address,
-                                        deposit_address=deposit_address,
-                                        order_expires=order_expires,
-                                        error_msg=error_msg,
-                                    )
-                                    await update_order_progress_message(int(user_id), str(order_id), error_notification)
-                                    logger.error(f"Auto-send failed for order {order_id}: {error_msg}")
-                                    
-                                    # Advance schedule ONLY for failed (non-retryable) errors
-                                    new_next_run = now + (interval_hours * 3600)
-                                    await db.execute(
-                                        "UPDATE dca_plans SET next_run = ? WHERE id = ?",
-                                        (new_next_run, plan_id)
-                                    )
-                                    await _commit_scheduler_transaction(db)
-                        else:
-                            # Wallet not configured - ask to send manually
-                            if is_order_expired(order_expires):
-                                await mark_order_expired_before_send(
-                                    plan_id=plan_id,
-                                    user_id=user_id,
-                                    order_id=order_id,
-                                    scheduled_time=scheduled_time_for_cycle,
-                                    interval_hours=interval_hours,
-                                    manual_send_blocked=True,
-                                )
-                                continue
-                            await update_order_progress_message(
-                                int(user_id), str(order_id),
-                                build_order_payment_notification(
-                                    order_id=order_id,
-                                    plan_number=plan_number,
-                                    network_key=from_asset,
-                                    amount=deposit_amount,
-                                    btc_address=btc_address,
-                                    deposit_address=deposit_address,
-                                    order_expires=order_expires,
-                                    action_text="Оплатите ордер на указанный адрес.",
-                                ),
-                            )
-                            # Advance schedule for manual send case (order created, user notified)
-                            new_next_run = now + (interval_hours * 3600)
-                            await db.execute(
-                                "UPDATE dca_plans SET next_run = ? WHERE id = ?",
-                                (new_next_run, plan_id)
-                            )
-                            await _commit_scheduler_transaction(db)
-                        
-                        logger.info(f"DCA execution completed for plan_id={plan_id}, user_id={user_id}, order_id={order_id}")
-                        
                     except Exception as e:
                         if hasattr(e, "scheduler_transaction_rollback_error"):
                             raise
@@ -5985,6 +5541,330 @@ async def dca_scheduler():
 # ============================================================================
 # TELEGRAM КОМАНДЫ - обработчики команд от пользователей
 # ============================================================================
+
+
+async def execute_new_order(
+    request: NewOrderExecutionRequest,
+    *,
+    on_progress: Optional[Callable[[NewOrderEvent], Awaitable[None]]] = None,
+) -> NewOrderExecutionResult:
+    """Execute one fresh-order attempt without depending on Telegram objects."""
+    plan_id = int(request.plan_id)
+    user_id = int(request.user_id)
+    plan_claimed = False
+    creation_gate_started = False
+    external_create_attempted = False
+    order_id: Optional[str] = None
+    required_amount: Optional[str] = None
+    deposit_address: Optional[str] = None
+    order_expires: Optional[int] = None
+
+    async def emit(kind: str, **values: Any) -> None:
+        if on_progress is None:
+            return
+        event = NewOrderEvent(kind=kind, plan_id=plan_id, **values)
+        try:
+            await on_progress(event)
+        except Exception:
+            logger.warning(
+                "New-order progress callback failed: plan_id=%s, event=%s",
+                plan_id,
+                kind,
+                exc_info=True,
+            )
+
+    def result(
+        outcome: str,
+        reason_code: str,
+        *,
+        tx_state: Optional[str] = None,
+        approve_tx_hash: Optional[str] = None,
+        transfer_tx_hash: Optional[str] = None,
+        active_gate_retained: Optional[bool] = None,
+        should_notify: bool = True,
+        notification_kind: Optional[str] = None,
+        schedule_effect: str = "unchanged",
+        error_message: str = "",
+    ) -> NewOrderExecutionResult:
+        retained = bool(order_id or creation_gate_started) if active_gate_retained is None else active_gate_retained
+        return NewOrderExecutionResult(
+            outcome=outcome,
+            reason_code=reason_code,
+            plan_id=plan_id,
+            order_id=order_id,
+            tx_state=tx_state,
+            required_amount=required_amount,
+            deposit_address=deposit_address,
+            order_expires=order_expires,
+            approve_tx_hash=approve_tx_hash,
+            transfer_tx_hash=transfer_tx_hash,
+            external_create_attempted=external_create_attempted,
+            active_gate_retained=retained,
+            should_notify=should_notify,
+            notification_kind=notification_kind or outcome,
+            schedule_effect=schedule_effect,
+            error_message=error_message,
+        )
+
+    async with open_db() as db:
+        async with db.execute(
+            "SELECT from_asset, amount, interval_hours, btc_address, next_run "
+            "FROM dca_plans WHERE id = ? AND user_id = ? AND deleted = 0",
+            (plan_id, user_id),
+        ) as cur:
+            plan_row = await cur.fetchone()
+    if not plan_row:
+        return result(
+            "plan_unavailable", "plan_not_found_or_not_owned", active_gate_retained=False
+        )
+    from_asset, amount, interval_hours, btc_address, plan_next_run = plan_row
+
+    try:
+        plan_claimed = await claim_plan_execution(plan_id, user_id)
+        if not plan_claimed:
+            return result(
+                "claim_contended", "plan_claim_not_acquired", active_gate_retained=False
+            )
+
+        if not await mark_plan_order_creation_started(plan_id, user_id):
+            await release_plan_claim(plan_id)
+            plan_claimed = False
+            return result(
+                "create_gate_failed", "durable_create_gate_not_acquired", active_gate_retained=False
+            )
+        creation_gate_started = True
+        await emit("creating_order", network_key=from_asset)
+
+        external_create_attempted = True
+        try:
+            data = await asyncio.to_thread(
+                create_fixedfloat_order,
+                from_asset,
+                amount,
+                btc_address,
+            )
+        except Exception as exc:
+            plan_claimed = False
+            return result(
+                "create_error",
+                "fixedfloat_create_error",
+                error_message=str(exc),
+            )
+        if not data or not isinstance(data, dict):
+            plan_claimed = False
+            return result("invalid_response", "invalid_response_type")
+
+        order_id = str(data.get("id") or "").strip() or None
+        order_token = str(data.get("token") or "").strip() or None
+        from_obj = data.get("from", {}) or {}
+        deposit_code = from_obj.get("code")
+        deposit_amount = from_obj.get("amount")
+        deposit_address = from_obj.get("address")
+        if not order_id:
+            plan_claimed = False
+            return result("missing_order_id", "fixedfloat_order_id_unavailable")
+
+        await emit("order_identified", order_id=order_id, network_key=from_asset)
+        order_expires = extract_order_expires_at(data)
+
+        try:
+            async with open_db() as db:
+                persist_order_cur = await db.execute(
+                    "UPDATE dca_plans SET active_order_id = ?, active_order_token = ?, active_order_address = ?, "
+                    "active_order_amount = ?, active_order_expires = ?, order_expired_notified = 0, execution_state = 'scheduled', "
+                    "confirmation_message_id = NULL, confirmation_expires_at = NULL, confirmation_scheduled_at = NULL, "
+                    "last_execution_attempt_at = ? WHERE id = ? AND user_id = ? "
+                    "AND execution_state = 'creating_order' AND active_order_id IS NULL",
+                    (
+                        order_id,
+                        order_token,
+                        deposit_address,
+                        f"{deposit_amount} {deposit_code}",
+                        order_expires,
+                        int(time.time()),
+                        plan_id,
+                        user_id,
+                    ),
+                )
+                if persist_order_cur.rowcount != 1:
+                    await db.rollback()
+                    raise RuntimeError(
+                        f"Cannot persist FixedFloat order gate for plan={plan_id}, order={order_id}"
+                    )
+                await db.commit()
+                plan_claimed = False
+        except Exception as exc:
+            plan_claimed = False
+            return result(
+                "active_order_persistence_failed",
+                "active_order_gate_not_persisted",
+                error_message=str(exc),
+            )
+
+        if not order_token:
+            return result("missing_token", "fixedfloat_security_token_unavailable")
+        try:
+            required_amount = require_exact_fixedfloat_amount(deposit_amount)
+        except (TypeError, ValueError) as exc:
+            return result(
+                "invalid_exact_amount",
+                "invalid_authoritative_payment_amount",
+                error_message=f"INVALID_PAYMENT_AMOUNT:{exc}",
+            )
+
+        async with open_db() as db:
+            async with db.execute(
+                "SELECT wallet_address FROM wallets WHERE user_id = ?",
+                (user_id,),
+            ) as cur:
+                wallet_row = await cur.fetchone()
+
+        wallet_password = _wallet_passwords.get(user_id)
+        if not wallet_row or not wallet_password:
+            if is_order_expired(order_expires):
+                return result("expired_before_send", "order_expired_before_manual_payment")
+            return result(
+                "manual_payment_required",
+                "wallet_or_unlock_unavailable",
+                schedule_effect="missed_count_reset",
+            )
+
+        try:
+            async with open_db() as db:
+                await db.execute(
+                    "INSERT INTO sent_transactions "
+                    "(user_id, plan_id, order_id, order_token, network_key, amount, deposit_address, state) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'sending')",
+                    (
+                        user_id,
+                        plan_id,
+                        order_id,
+                        order_token,
+                        from_asset,
+                        required_amount,
+                        deposit_address,
+                    ),
+                )
+                await db.commit()
+        except Exception as exc:
+            return result(
+                "sent_transaction_insert_failed",
+                "payment_row_not_persisted",
+                error_message=str(exc),
+            )
+
+        await emit(
+            "awaiting_payment",
+            order_id=order_id,
+            network_key=from_asset,
+            required_amount=required_amount,
+            deposit_address=deposit_address,
+            order_expires=order_expires,
+        )
+
+        if is_order_expired(order_expires):
+            return result("expired_before_send", "order_expired_before_transfer_claim", tx_state="sending")
+
+        if not await claim_auto_send_execution(plan_id, order_id):
+            return result(
+                "transfer_claim_contended",
+                "auto_send_claim_not_acquired",
+                tx_state="sending",
+                should_notify=False,
+            )
+
+        try:
+            success, approve_tx, transfer_tx, error_msg = await auto_send_usdt(
+                network_key=from_asset,
+                user_id=user_id,
+                wallet_password=wallet_password,
+                deposit_address=deposit_address,
+                required_amount=required_amount,
+                btc_address=btc_address,
+                order_id=order_id,
+                dry_run=DRY_RUN,
+                persist_prepared_tx=make_prepared_tx_persister(plan_id, order_id),
+                persist_payment_intent=make_payment_intent_persister(plan_id, order_id),
+            )
+        except Exception as exc:
+            return result(
+                "auto_send_error",
+                "auto_send_raised",
+                tx_state="transfering",
+                error_message=str(exc),
+            )
+        if approve_tx or transfer_tx:
+            _balances_cache.clear()
+
+        if success:
+            async with open_db() as db:
+                await db.execute(
+                    "UPDATE sent_transactions SET approve_tx_hash = ?, transfer_tx_hash = ?, "
+                    "state = 'sent', error_message = NULL WHERE order_id = ? AND plan_id = ?",
+                    (approve_tx, transfer_tx, order_id, plan_id),
+                )
+                await db.execute(
+                    "UPDATE dca_plans SET missed_count = 0 WHERE id = ?",
+                    (plan_id,),
+                )
+                await db.commit()
+            return result(
+                "sent",
+                "auto_send_succeeded",
+                tx_state="sent",
+                approve_tx_hash=approve_tx,
+                transfer_tx_hash=transfer_tx,
+                schedule_effect="missed_count_reset",
+            )
+
+        if is_persistence_conflict_error(error_msg):
+            state = "tx_pending"
+            reason_code = "persistence_conflict"
+        elif is_pending_tx_error(error_msg):
+            state = "tx_pending"
+            reason_code = "broadcast_pending"
+        elif is_retryable_network_error(error_msg):
+            if approve_tx or transfer_tx:
+                state = "tx_pending"
+                reason_code = "retryable_with_transaction_evidence"
+            else:
+                state = "blocked"
+                reason_code = "retryable_without_transaction_evidence"
+        else:
+            state = "failed"
+            reason_code = "terminal_auto_send_failure"
+
+        async with open_db() as db:
+            if is_persistence_conflict_error(error_msg):
+                await db.execute(
+                    "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? "
+                    "WHERE order_id = ? AND plan_id = ? "
+                    "AND state IN ('transfering', 'approve_confirmed', 'tx_pending', 'pending', 'blocked')",
+                    (error_msg[:500], order_id, plan_id),
+                )
+            else:
+                await db.execute(
+                    "UPDATE sent_transactions SET approve_tx_hash = ?, transfer_tx_hash = ?, "
+                    "state = ?, error_message = ? WHERE order_id = ? AND plan_id = ?",
+                    (approve_tx, transfer_tx, state, error_msg[:500], order_id, plan_id),
+                )
+            await db.commit()
+
+        schedule_effect = "record_insufficient" if is_insufficient_auto_send_error(error_msg) else "unchanged"
+        return result(
+            state,
+            reason_code,
+            tx_state=state,
+            approve_tx_hash=approve_tx,
+            transfer_tx_hash=transfer_tx,
+            notification_kind=state,
+            schedule_effect=schedule_effect,
+            error_message=error_msg,
+        )
+    except Exception:
+        if plan_claimed and not creation_gate_started:
+            await release_plan_claim(plan_id)
+        raise
 
 
 @dp.message(Command("start"))
@@ -6348,7 +6228,6 @@ async def cmd_execute(message: Message):
     
     from_asset, amount, interval_hours, btc_address, active_order_id, active_order_token, active_order_address, active_order_amount, active_order_expires, plan_next_run, execution_state = row
     plan_number = await get_plan_display_number(user_id, plan_id)
-    plan_claimed = False
 
     if execution_state == "creating_order":
         await message.answer(
@@ -6594,368 +6473,219 @@ async def cmd_execute(message: Message):
                 )
             return
         
-        plan_claimed = await claim_plan_execution(plan_id, user_id)
-        if not plan_claimed:
+        async def on_new_order_progress(event: NewOrderEvent) -> None:
+            nonlocal progress_msg, order_id
+            if event.kind == "creating_order":
+                progress_msg = await message.answer(
+                    f"⏳ Создаю ордер {from_asset} на FixedFloat..."
+                )
+            elif event.kind == "order_identified":
+                order_id = event.order_id
+                if order_id and progress_msg is not None:
+                    track_order_progress_message(
+                        str(order_id), int(user_id), int(progress_msg.message_id)
+                    )
+            elif event.kind == "awaiting_payment" and event.order_id:
+                await update_order_progress_message(
+                    int(user_id),
+                    str(event.order_id),
+                    build_order_state_message(
+                        status_title="⏳ Ожидается оплата",
+                        plan_number=plan_number,
+                        order_id=event.order_id,
+                        amount=event.required_amount,
+                        network_key=from_asset,
+                        btc_address=btc_address,
+                        payment_address=event.deposit_address,
+                        deadline_text=format_order_deadline(event.order_expires),
+                        reason_text="",
+                    ),
+                )
+
+        trigger = "confirmation" if isinstance(message, CallbackExecuteMessage) else "manual"
+        execution = await execute_new_order(
+            NewOrderExecutionRequest(plan_id=plan_id, user_id=int(user_id), trigger=trigger),
+            on_progress=on_new_order_progress,
+        )
+        order_id = execution.order_id
+
+        async def edit_progress(text: str, **kwargs: Any) -> None:
+            if progress_msg is not None:
+                await bot.edit_message_text(
+                    chat_id=int(user_id),
+                    message_id=int(progress_msg.message_id),
+                    text=text,
+                    parse_mode="HTML",
+                    **kwargs,
+                )
+            else:
+                await message.answer(text, parse_mode="HTML", **kwargs)
+
+        if execution.outcome in {"plan_unavailable", "claim_contended"}:
             await message.answer("⚠️ План уже выполняется другим процессом. Повтори через несколько секунд.")
             return
-
-        if not await mark_plan_order_creation_started(plan_id, user_id):
-            await release_plan_claim(plan_id)
-            plan_claimed = False
+        if execution.outcome == "create_gate_failed":
             await message.answer(
                 "⚠️ Не удалось безопасно зафиксировать попытку создания ордера. "
                 "Новый ордер не создаётся."
             )
             return
-
-        progress_msg = await message.answer(f"⏳ Создаю ордер {from_asset} на FixedFloat...")
-        
-        # Создаём ордер через универсальную функцию
-        data = await asyncio.to_thread(
-            create_fixedfloat_order,
-            from_asset,
-            amount,
-            btc_address
-        )
-
-        if not data or not isinstance(data, dict):
-            if plan_claimed:
-                await release_plan_claim(plan_id)
-                plan_claimed = False
-            await bot.edit_message_text(
-                chat_id=int(user_id),
-                message_id=progress_msg.message_id,
-                text="❌ FixedFloat вернул неполный ответ при создании ордера. Выполнение остановлено безопасно.",
-                parse_mode="HTML",
+        if execution.outcome == "invalid_response":
+            await edit_progress(
+                "❌ FixedFloat вернул неполный ответ при создании ордера. Выполнение остановлено безопасно."
             )
             return
-
-        # Парсим ответ
-        order_id = str(data.get("id") or "").strip()
-        order_token = str(data.get("token") or "").strip() or None
-        from_obj = data.get("from", {}) or {}
-        deposit_code = from_obj.get("code")
-        deposit_amount = from_obj.get("amount")
-        deposit_address = from_obj.get("address")
-        if not order_id:
-            await release_plan_claim(plan_id)
-            plan_claimed = False
+        if execution.outcome == "missing_order_id":
             logger.error(
                 "FixedFloat create response incomplete for user_id=%s, plan_id=%s: order id unavailable",
                 user_id,
                 plan_id,
             )
-            await bot.edit_message_text(
-                chat_id=int(user_id),
-                message_id=progress_msg.message_id,
-                text="❌ FixedFloat вернул неполный ответ без ID ордера. Выполнение остановлено безопасно.",
-                parse_mode="HTML",
+            await edit_progress(
+                "❌ FixedFloat вернул неполный ответ без ID ордера. Выполнение остановлено безопасно."
             )
             return
-        if order_id:
-            track_order_progress_message(str(order_id), int(user_id), int(progress_msg.message_id))
-        
-        # Сохраняем информацию об активном ордере в БД
-        order_expires = extract_order_expires_at(data)
-        async with open_db() as db:
-            persist_order_cur = await db.execute(
-                "UPDATE dca_plans SET active_order_id = ?, active_order_token = ?, active_order_address = ?, "
-                "active_order_amount = ?, active_order_expires = ?, order_expired_notified = 0, execution_state = 'scheduled', "
-                "confirmation_message_id = NULL, confirmation_expires_at = NULL, confirmation_scheduled_at = NULL, "
-                "last_execution_attempt_at = ? WHERE id = ? AND user_id = ? "
-                "AND execution_state = 'creating_order' AND active_order_id IS NULL",
-                (order_id, order_token, deposit_address, f"{deposit_amount} {deposit_code}", order_expires, int(time.time()), plan_id, user_id)
+        if execution.outcome == "missing_token":
+            logger.error(
+                "FixedFloat create response incomplete for user_id=%s, plan_id=%s, order_id=%s: security token unavailable; order kept active",
+                user_id,
+                plan_id,
+                order_id,
             )
-            if persist_order_cur.rowcount != 1:
-                await db.rollback()
-                raise RuntimeError(
-                    f"Cannot persist FixedFloat order gate for plan={plan_id}, order={order_id}"
-                )
-            await db.commit()
-            plan_claimed = False
-
-            if not order_token:
-                logger.error(
-                    "FixedFloat create response incomplete for user_id=%s, plan_id=%s, order_id=%s: security token unavailable; order kept active",
-                    user_id,
-                    plan_id,
-                    order_id,
-                )
-                await bot.edit_message_text(
-                    chat_id=int(user_id),
-                    message_id=progress_msg.message_id,
-                    text=(
-                        f"❌ FixedFloat создал ордер {escape_html(order_id)}, но не вернул security token. "
-                        "Ордер сохранён и заблокирован для ручной проверки; средства не отправлялись."
-                    ),
-                    parse_mode="HTML",
-                )
-                return
-
-            try:
-                required_amount = require_exact_fixedfloat_amount(deposit_amount)
-            except (TypeError, ValueError) as e:
-                error_msg = f"INVALID_PAYMENT_AMOUNT:{e}"
-                logger.error(
-                    "FixedFloat order %s has invalid authoritative amount: %s",
-                    order_id,
-                    e,
-                )
-                await bot.edit_message_text(
-                    chat_id=int(user_id),
-                    message_id=progress_msg.message_id,
-                    text=(
-                        f"❌ Ордер {format_order_link(order_id)} сохранён, но сумма оплаты некорректна. "
-                        f"Средства не отправлялись.\n\n<code>{escape_html(error_msg)}</code>"
-                    ),
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
-                return
-            
-            # Проверяем есть ли настроенный кошелёк для автоматической отправки
-            async with db.execute(
-                "SELECT wallet_address FROM wallets WHERE user_id = ?",
-                (user_id,)
-            ) as cur:
-                wallet_row = await cur.fetchone()
-            
-            # Проверяем есть ли пароль в памяти
-            wallet_password = _wallet_passwords.get(user_id)
-        
-        if wallet_row and wallet_password:
-
-            async with open_db() as db:
-                await db.execute(
-                    "INSERT INTO sent_transactions (user_id, plan_id, order_id, order_token, network_key, amount, deposit_address, state) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'sending')",
-                    (user_id, plan_id, order_id, order_token, from_asset, required_amount, deposit_address)
-                )
-                await db.commit()
-            
-            await update_order_progress_message(
-                int(user_id),
-                str(order_id),
-                build_order_state_message(
-                    status_title="⏳ Ожидается оплата",
-                    plan_number=plan_number,
-                    order_id=order_id,
-                    amount=required_amount,
-                    network_key=from_asset,
-                    btc_address=btc_address,
-                    payment_address=deposit_address,
-                    deadline_text=format_order_deadline(order_expires),
-                    reason_text="",
-                ),
+            await edit_progress(
+                f"❌ FixedFloat создал ордер {escape_html(order_id)}, но не вернул security token. "
+                "Ордер сохранён и заблокирован для ручной проверки; средства не отправлялись."
             )
-            
-            if is_order_expired(order_expires):
-                await mark_order_expired_before_send(
-                    plan_id=plan_id,
-                    user_id=user_id,
-                    order_id=order_id,
-                    scheduled_time=plan_next_run,
-                    interval_hours=interval_hours,
-                )
-                return
-
-            if not await claim_auto_send_execution(plan_id, order_id):
-                return
-
-            # Автоматическая отправка USDT
-            success, approve_tx, transfer_tx, error_msg = await auto_send_usdt(
-                network_key=from_asset,
+            return
+        if execution.outcome == "invalid_exact_amount":
+            logger.error(
+                "FixedFloat order %s has invalid authoritative amount: %s",
+                order_id,
+                execution.error_message,
+            )
+            await edit_progress(
+                f"❌ Ордер {format_order_link(order_id)} сохранён, но сумма оплаты некорректна. "
+                f"Средства не отправлялись.\n\n<code>{escape_html(execution.error_message)}</code>",
+                disable_web_page_preview=True,
+            )
+            return
+        if execution.outcome in {
+            "create_error",
+            "active_order_persistence_failed",
+            "sent_transaction_insert_failed",
+            "auto_send_error",
+        }:
+            raise RuntimeError(execution.error_message)
+        if execution.outcome == "expired_before_send":
+            await mark_order_expired_before_send(
+                plan_id=plan_id,
                 user_id=user_id,
-                wallet_password=wallet_password,
-                deposit_address=deposit_address,
-                required_amount=required_amount,
-                btc_address=btc_address,
-                order_id=order_id,
-                dry_run=DRY_RUN,
-                persist_prepared_tx=make_prepared_tx_persister(plan_id, order_id),
-                persist_payment_intent=make_payment_intent_persister(plan_id, order_id),
+                order_id=str(order_id),
+                scheduled_time=plan_next_run,
+                interval_hours=interval_hours,
+                manual_send_blocked=True,
             )
-            if approve_tx or transfer_tx:
-                _balances_cache.clear()
-            
-            if success:
-                # Сохраняем информацию о транзакции
-                async with open_db() as db:
-                    await db.execute(
-                        "UPDATE sent_transactions SET approve_tx_hash = ?, transfer_tx_hash = ?, state = 'sent', error_message = NULL "
-                        "WHERE order_id = ? AND plan_id = ?",
-                        (approve_tx, transfer_tx, order_id, plan_id)
-                    )
-                    await db.execute(
-                        "UPDATE dca_plans SET missed_count = 0 WHERE id = ?",
-                        (plan_id,)
-                    )
-                    await db.commit()
-                
-                msg = (
-                    build_order_state_message(
-                        status_title="✅ Оплата получена",
-                        plan_number=plan_number,
-                        order_id=order_id,
-                        amount=required_amount,
-                        network_key=from_asset,
-                        btc_address=btc_address,
-                        payment_address=deposit_address,
-                        reason_text="USDT отправлены. Ожидаем перевод BTC.",
-                    )
-                )
-                
-                if DRY_RUN:
-                    msg += f"\n⚠️ DRY RUN MODE - транзакции не были отправлены"
-                
-                await update_order_progress_message(int(user_id), str(order_id), msg)
-                
-                logger.info(f"Auto-send successful: order_id={order_id}, approve_tx={approve_tx}, transfer_tx={transfer_tx}")
-            else:
-                async with open_db() as db:
-                    if is_persistence_conflict_error(error_msg):
-                        await db.execute(
-                            "UPDATE sent_transactions SET state = 'tx_pending', error_message = ? "
-                            "WHERE order_id = ? AND plan_id = ? "
-                            "AND state IN ('transfering', 'approve_confirmed', 'tx_pending', 'pending', 'blocked')",
-                            (error_msg[:500], order_id, plan_id),
-                        )
-                    elif is_pending_tx_error(error_msg):
-                        await db.execute(
-                            "UPDATE sent_transactions SET approve_tx_hash = ?, transfer_tx_hash = ?, state = 'tx_pending', error_message = ? "
-                            "WHERE order_id = ? AND plan_id = ?",
-                            (approve_tx, transfer_tx, error_msg[:500], order_id, plan_id)
-                        )
-                    elif is_retryable_network_error(error_msg):
-                        if approve_tx or transfer_tx:
-                            await db.execute(
-                                "UPDATE sent_transactions SET approve_tx_hash = ?, transfer_tx_hash = ?, state = 'tx_pending', error_message = ? "
-                                "WHERE order_id = ? AND plan_id = ?",
-                                (approve_tx, transfer_tx, error_msg[:500], order_id, plan_id)
-                            )
-                        else:
-                            await db.execute(
-                                "UPDATE sent_transactions SET approve_tx_hash = ?, transfer_tx_hash = ?, state = 'blocked', error_message = ? "
-                                "WHERE order_id = ? AND plan_id = ?",
-                                (approve_tx, transfer_tx, error_msg[:500], order_id, plan_id)
-                            )
-                    else:
-                        await db.execute(
-                            "UPDATE sent_transactions SET approve_tx_hash = ?, transfer_tx_hash = ?, state = 'failed', error_message = ? "
-                            "WHERE order_id = ? AND plan_id = ?",
-                            (approve_tx, transfer_tx, error_msg[:500], order_id, plan_id)
-                        )
-                    await db.commit()
-
-                if is_persistence_conflict_error(error_msg):
-                    await update_order_progress_message(
-                        int(user_id), str(order_id),
-                        build_order_state_message(
-                            status_title="⚠️ Требуется проверка выплаты",
-                            plan_number=plan_number,
-                            order_id=order_id,
-                            amount=required_amount,
-                            network_key=from_asset,
-                            btc_address=btc_address,
-                            reason_text="Сохранённая транзакция уже обрабатывается.",
-                        ),
-                    )
-                    return
-                if is_pending_tx_error(error_msg):
-                    await update_order_progress_message(
-                        int(user_id), str(order_id),
-                        build_order_state_message(
-                            status_title="⚠️ Требуется проверка выплаты",
-                            plan_number=plan_number,
-                            order_id=order_id,
-                            amount=required_amount,
-                            network_key=from_asset,
-                            btc_address=btc_address,
-                            reason_text="Транзакция отправлена, но подтверждение сети ещё не получено.",
-                        ),
-                    )
-                    return
-                if is_retryable_network_error(error_msg) and (approve_tx or transfer_tx):
-                    await update_order_progress_message(
-                        int(user_id), str(order_id),
-                        build_order_state_message(
-                            status_title="⚠️ Требуется проверка выплаты",
-                            plan_number=plan_number,
-                            order_id=order_id,
-                            amount=required_amount,
-                            network_key=from_asset,
-                            btc_address=btc_address,
-                            reason_text="Транзакция отправлена, но подтверждение сети ещё не получено.",
-                        ),
-                    )
-                    return
-
-                # Ошибка автоматической отправки - уведомляем пользователя
-                if is_order_expired(order_expires):
-                    await mark_order_expired_before_send(
-                        plan_id=plan_id,
-                        user_id=user_id,
-                        order_id=order_id,
-                        scheduled_time=plan_next_run,
-                        interval_hours=interval_hours,
-                        manual_send_blocked=True,
-                    )
-                    return
-                if is_insufficient_auto_send_error(error_msg):
-                    await record_plan_skip_metadata(plan_id, "insufficient")
-                error_notification = build_auto_send_failed_notification(
-                    order_id=order_id,
-                    plan_number=plan_number,
-                    network_key=from_asset,
-                    required_amount=required_amount,
-                    btc_address=btc_address,
-                    deposit_address=deposit_address,
-                    order_expires=order_expires,
-                    error_msg=error_msg,
-                )
-                await update_order_progress_message(
-                    int(user_id), str(order_id),
-                    error_notification,
-                )
-                logger.error(f"Auto-send failed for order {order_id}: {error_msg}")
-        else:
-            # Кошелёк не настроен - просим отправить вручную
-            if is_order_expired(order_expires):
-                await mark_order_expired_before_send(
-                    plan_id=plan_id,
-                    user_id=user_id,
-                    order_id=order_id,
-                    scheduled_time=plan_next_run,
-                    interval_hours=interval_hours,
-                    manual_send_blocked=True,
-                )
-                return
+            return
+        if execution.outcome == "transfer_claim_contended":
+            return
+        if execution.outcome == "manual_payment_required":
             await update_order_progress_message(
                 int(user_id),
                 str(order_id),
                 build_order_payment_notification(
-                    order_id=order_id,
+                    order_id=str(order_id),
                     plan_number=plan_number,
                     network_key=from_asset,
-                    amount=deposit_amount,
+                    amount=execution.required_amount,
                     btc_address=btc_address,
-                    deposit_address=deposit_address,
-                    order_expires=order_expires,
+                    deposit_address=execution.deposit_address,
+                    order_expires=execution.order_expires,
                     action_text="Оплатите ордер на указанный адрес.",
                 ),
             )
             async with open_db() as db:
                 await db.execute(
                     "UPDATE dca_plans SET missed_count = 0 WHERE id = ?",
-                    (plan_id,)
+                    (plan_id,),
                 )
                 await db.commit()
-        
-        logger.info(f"Ручной ордер создан: user_id={user_id}, plan_id={plan_id}, order_id={order_id}")
+        elif execution.outcome == "sent":
+            msg = build_order_state_message(
+                status_title="✅ Оплата получена",
+                plan_number=plan_number,
+                order_id=str(order_id),
+                amount=execution.required_amount,
+                network_key=from_asset,
+                btc_address=btc_address,
+                payment_address=execution.deposit_address,
+                reason_text="USDT отправлены. Ожидаем перевод BTC.",
+            )
+            if DRY_RUN:
+                msg += "\n⚠️ DRY RUN MODE - транзакции не были отправлены"
+            await update_order_progress_message(int(user_id), str(order_id), msg)
+            logger.info(
+                "Auto-send successful: order_id=%s, approve_tx=%s, transfer_tx=%s",
+                order_id,
+                execution.approve_tx_hash,
+                execution.transfer_tx_hash,
+            )
+        elif execution.outcome == "tx_pending":
+            reason_text = (
+                "Сохранённая транзакция уже обрабатывается."
+                if execution.reason_code == "persistence_conflict"
+                else "Транзакция отправлена, но подтверждение сети ещё не получено."
+            )
+            await update_order_progress_message(
+                int(user_id),
+                str(order_id),
+                build_order_state_message(
+                    status_title="⚠️ Требуется проверка выплаты",
+                    plan_number=plan_number,
+                    order_id=str(order_id),
+                    amount=execution.required_amount,
+                    network_key=from_asset,
+                    btc_address=btc_address,
+                    reason_text=reason_text,
+                ),
+            )
+            return
+        elif execution.outcome in {"blocked", "failed"}:
+            if is_order_expired(execution.order_expires):
+                await mark_order_expired_before_send(
+                    plan_id=plan_id,
+                    user_id=user_id,
+                    order_id=str(order_id),
+                    scheduled_time=plan_next_run,
+                    interval_hours=interval_hours,
+                    manual_send_blocked=True,
+                )
+                return
+            if execution.schedule_effect == "record_insufficient":
+                await record_plan_skip_metadata(plan_id, "insufficient")
+            await update_order_progress_message(
+                int(user_id),
+                str(order_id),
+                build_auto_send_failed_notification(
+                    order_id=str(order_id),
+                    plan_number=plan_number,
+                    network_key=from_asset,
+                    required_amount=execution.required_amount,
+                    btc_address=btc_address,
+                    deposit_address=execution.deposit_address,
+                    order_expires=execution.order_expires,
+                    error_msg=execution.error_message,
+                ),
+            )
+            logger.error("Auto-send failed for order %s: %s", order_id, execution.error_message)
+
+        logger.info(
+            "Ручной ордер создан: user_id=%s, plan_id=%s, order_id=%s",
+            user_id,
+            plan_id,
+            order_id,
+        )
         
     except Exception as e:
-        if plan_claimed:
-            await release_plan_claim(plan_id)
         logger.error(f"Ошибка создания ордера для user_id={user_id}: {e}")
         if order_id:
             await update_order_progress_message(
