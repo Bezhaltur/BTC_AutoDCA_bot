@@ -36,6 +36,7 @@ def run_init(db_path, monkeypatch):
 def create_legacy_sent_db(db_path, monkeypatch, *, plan_id, seed_parent):
     run_init(db_path, monkeypatch)
     with sqlite3.connect(db_path) as db:
+        db.execute("ALTER TABLE dca_plans DROP COLUMN amount_text")
         db.execute("DROP TABLE completed_orders")
         db.execute(V1_COMPLETED_SQL)
         db.execute("DROP TABLE sent_transactions")
@@ -306,7 +307,7 @@ def test_fresh_init_has_no_foreign_key_violations(tmp_path, monkeypatch):
     db_path = tmp_path / "fresh.sqlite3"
     run_init(db_path, monkeypatch)
     with sqlite3.connect(db_path) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == app.CURRENT_SCHEMA_VERSION
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -316,6 +317,7 @@ def test_v1_to_v2_migration_succeeds_with_foreign_keys_enabled(
     db_path = tmp_path / "v1.sqlite3"
     run_init(db_path, monkeypatch)
     with sqlite3.connect(db_path) as db:
+        db.execute("ALTER TABLE dca_plans DROP COLUMN amount_text")
         db.execute("DROP TABLE completed_orders")
         db.execute(V1_COMPLETED_SQL)
         db.execute("INSERT INTO dca_plans(id,user_id) VALUES(7,10001)")
@@ -325,7 +327,7 @@ def test_v1_to_v2_migration_succeeds_with_foreign_keys_enabled(
         db.execute("PRAGMA user_version=1")
     run_init(db_path, monkeypatch)
     with sqlite3.connect(db_path) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == app.CURRENT_SCHEMA_VERSION
         assert db.execute("SELECT id,user_id,order_id FROM completed_orders").fetchall() == [
             (1, 10001, "done")
         ]
@@ -339,7 +341,7 @@ def test_supported_legacy_rebuild_with_valid_parent_succeeds(
     create_legacy_sent_db(db_path, monkeypatch, plan_id=7, seed_parent=True)
     run_init(db_path, monkeypatch)
     with sqlite3.connect(db_path) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == app.CURRENT_SCHEMA_VERSION
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
         assert db.execute(
             "SELECT plan_id,order_id,transfer_raw_tx,amount_units FROM sent_transactions"

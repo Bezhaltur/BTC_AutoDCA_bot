@@ -17,6 +17,7 @@ def init_current_db(db_path, monkeypatch):
 
 def remove_unique_index(db_path):
     with sqlite3.connect(db_path) as db:
+        db.execute("ALTER TABLE dca_plans DROP COLUMN amount_text")
         db.execute("DROP TABLE completed_orders")
         db.execute(
             "CREATE TABLE completed_orders ("

@@ -3,6 +3,7 @@ import asyncio
 import inspect
 import sqlite3
 import threading
+from decimal import Decimal
 import textwrap
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -150,7 +151,7 @@ def create_window(tmp_path, monkeypatch):
 
     async def fake_limits(network_key):
         assert network_key == NETWORK
-        return {"min": 1.0, "max": 500.0}
+        return {"min": Decimal("1"), "max": Decimal("500")}
 
     monkeypatch.setattr(app, "get_fixedfloat_limits", fake_limits)
     asyncio.run(app.init_db())
@@ -158,9 +159,9 @@ def create_window(tmp_path, monkeypatch):
     with sqlite3.connect(db_path) as db:
         cur = db.execute(
             "INSERT INTO dca_plans ("
-            "user_id, from_asset, amount, interval_hours, btc_address, next_run, created_at, "
+            "user_id, from_asset, amount, amount_text, interval_hours, btc_address, next_run, created_at, "
             "active, deleted, execution_state"
-            ") VALUES (?, ?, 25.0, 24, ?, ?, ?, 1, 0, 'scheduled')",
+            ") VALUES (?, ?, 25.0, '25', 24, ?, ?, ?, 1, 0, 'scheduled')",
             (USER_ID, NETWORK, BTC_ADDRESS, NOW, NOW),
         )
         plan_id = int(cur.lastrowid)
@@ -177,7 +178,7 @@ def create_window(tmp_path, monkeypatch):
 
 def _install_successful_create(monkeypatch, harness):
     def create_order(network_key, amount, btc_address):
-        assert (network_key, amount, btc_address) == (NETWORK, 25.0, BTC_ADDRESS)
+        assert (network_key, amount, btc_address) == (NETWORK, "25", BTC_ADDRESS)
         harness.external_creates.append(len(harness.external_creates) + 1)
         return _order_response(len(harness.external_creates))
 
@@ -912,7 +913,7 @@ def test_fixedfloat_create_request_has_no_established_idempotency_identifier(mon
         return _order_response(1)
 
     monkeypatch.setattr(app, "ff_request", capture_request)
-    result = app.create_fixedfloat_order(NETWORK, 25.0, BTC_ADDRESS)
+    result = app.create_fixedfloat_order(NETWORK, "25", BTC_ADDRESS)
 
     assert result["id"] == "external-order-1"
     assert captured == [
@@ -923,7 +924,7 @@ def test_fixedfloat_create_request_has_no_established_idempotency_identifier(mon
                 "fromCcy": app.get_fixedfloat_symbol(NETWORK),
                 "toCcy": "BTC",
                 "direction": "from",
-                "amount": 25.0,
+                "amount": "25",
                 "toAddress": BTC_ADDRESS,
             },
         )
@@ -1014,6 +1015,7 @@ def test_shared_new_order_core_returns_typed_result_and_events_after_commits(
             "user_id": (USER_ID, "integer"),
             "from_asset": (NETWORK, "text"),
             "amount": (25.0, "real"),
+            "amount_text": ("25", "text"),
             "interval_hours": (24, "integer"),
             "btc_address": (BTC_ADDRESS, "text"),
             "next_run": (NOW, "integer"),

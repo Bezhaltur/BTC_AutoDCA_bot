@@ -36,6 +36,7 @@ DCA_CONFIRMATION = [
     "order_expired_notified INTEGER DEFAULT 0",
 ]
 DCA_TOKEN = ["active_order_token TEXT"]
+DCA_EXACT_AMOUNT = ["amount_text TEXT"]
 
 SENT_CORE = [
     "id INTEGER PRIMARY KEY",
@@ -128,6 +129,9 @@ def create_current_then_unstamp(db_path, monkeypatch):
 
 def recreate_completed_v1(db_path):
     with sqlite3.connect(db_path) as db:
+        dca_columns = {row[1] for row in db.execute("PRAGMA table_info(dca_plans)")}
+        if "amount_text" in dca_columns:
+            db.execute("ALTER TABLE dca_plans DROP COLUMN amount_text")
         db.execute("DROP TABLE completed_orders")
         db.execute(
             "CREATE TABLE completed_orders ("
@@ -218,10 +222,10 @@ def recreate_nullable_sent_generation(db_path, extra_definitions):
         return selected, tuple(values[name] for name in selected)
 
 
-def test_fresh_database_becomes_exact_v2(tmp_path, monkeypatch):
+def test_fresh_database_becomes_exact_v3(tmp_path, monkeypatch):
     db_path = tmp_path / "fresh.sqlite3"
     run_init(db_path, monkeypatch)
-    assert user_version(db_path) == app.CURRENT_SCHEMA_VERSION == 2
+    assert user_version(db_path) == app.CURRENT_SCHEMA_VERSION == 3
     before = schema_snapshot(db_path)
     run_init(db_path, monkeypatch)
     assert schema_snapshot(db_path) == before
@@ -234,17 +238,17 @@ def test_current_unstamped_schema_is_stamp_only(tmp_path, monkeypatch):
     statements = []
     install_trace(monkeypatch, statements)
     run_init(db_path, monkeypatch)
-    assert user_version(db_path) == 2
+    assert user_version(db_path) == 3
     after = schema_snapshot(db_path)
     assert (after[0], after[2], after[3]) == (before[0], before[2], before[3])
     ddl = [sql.upper() for sql in statements if sql.lstrip().upper().startswith(
         ("CREATE", "ALTER", "DROP")
     )]
     assert ddl == []
-    assert any("PRAGMA USER_VERSION = 2" in sql.upper() for sql in statements)
+    assert any("PRAGMA USER_VERSION = 3" in sql.upper() for sql in statements)
 
 
-def test_exact_stamped_v2_is_validation_only(tmp_path, monkeypatch):
+def test_exact_stamped_v3_is_validation_only(tmp_path, monkeypatch):
     db_path = tmp_path / "stamped-v2.sqlite3"
     run_init(db_path, monkeypatch)
     before = schema_snapshot(db_path)
@@ -265,7 +269,7 @@ def test_exact_stamped_v2_is_validation_only(tmp_path, monkeypatch):
         "default", "primary-key", "table-option", "generated",
     ],
 )
-def test_stamped_v2_schema_drift_fails_without_mutation(
+def test_stamped_v3_schema_drift_fails_without_mutation(
     tmp_path, monkeypatch, drift
 ):
     db_path = tmp_path / f"v2-drift-{drift}.sqlite3"
@@ -330,7 +334,7 @@ def test_too_new_version_fails_closed(tmp_path, monkeypatch):
     db_path = tmp_path / "too-new.sqlite3"
     run_init(db_path, monkeypatch)
     with sqlite3.connect(db_path) as db:
-        db.execute("PRAGMA user_version = 3")
+        db.execute("PRAGMA user_version = 4")
     before = schema_snapshot(db_path)
     with pytest.raises(RuntimeError, match="newer than supported"):
         run_init(db_path, monkeypatch)
@@ -389,7 +393,7 @@ def test_each_supported_nullable_whole_database_fingerprint_migrates(
     assert sent_columns == app._CURRENT_SENT_TRANSACTION_COLUMNS
     assert not any("SENT_TRANSACTIONS_NEW" in sql.upper() for sql in statements)
     assert not any("DROP TABLE SENT_TRANSACTIONS" in sql.upper() for sql in statements)
-    assert user_version(db_path) == 2
+    assert user_version(db_path) == 3
 
 
 @pytest.mark.parametrize("include_state", [False, True])
@@ -437,7 +441,7 @@ def test_each_notnull_sent_column_allowlist_variant_migrates(
         ) if row[1] == "transfer_tx_hash")
     assert row == ("0xapprove", "0xtransfer", None, None)
     assert nullable == 0
-    assert user_version(db_path) == 2
+    assert user_version(db_path) == 3
 
 
 def test_canonical_notnull_schema_with_fk_defaults_and_index_migrates(
@@ -482,7 +486,7 @@ def test_canonical_notnull_schema_with_fk_defaults_and_index_migrates(
         "secret-token", "0xapprove", 10, "0xapprove-raw", "0xtransfer", 11,
         "0xtransfer-raw", "25000001", 6, "tx_pending", "preserve-error",
     )
-    assert user_version(db_path) == 2
+    assert user_version(db_path) == 3
 
 
 @pytest.mark.parametrize(
@@ -679,12 +683,12 @@ def test_exact_known_schema_accepts_safe_keyword_case_and_whitespace(
     install_trace(monkeypatch, statements)
     run_init(db_path, monkeypatch)
     after = schema_snapshot(db_path)
-    assert user_version(db_path) == 2
+    assert user_version(db_path) == 3
     assert (after[0], after[2], after[3]) == (before[0], before[2], before[3])
     assert not any(sql.lstrip().upper().startswith(("CREATE", "ALTER", "DROP")) for sql in statements)
 
 
-def test_prod_like_physical_order_is_stamped_without_rebuild(tmp_path, monkeypatch):
+def test_prod_like_physical_order_adds_only_exact_amount_column(tmp_path, monkeypatch):
     db_path = tmp_path / "prod-like.sqlite3"
     with sqlite3.connect(db_path) as db:
         db.executescript(
@@ -728,7 +732,15 @@ def test_prod_like_physical_order_is_stamped_without_rebuild(tmp_path, monkeypat
     install_trace(monkeypatch, statements)
     run_init(db_path, monkeypatch)
     after = schema_snapshot(db_path)
-    assert user_version(db_path) == 2
-    assert (after[0], after[2], after[3]) == (before[0], before[2], before[3])
+    assert user_version(db_path) == 3
+    assert after[3] == before[3]
+    assert after[2] == before[2]
+    with sqlite3.connect(db_path) as db:
+        columns = {row[1] for row in db.execute("PRAGMA table_info(dca_plans)")}
+        assert "amount_text" in columns
     assert not any("SENT_TRANSACTIONS_NEW" in sql.upper() for sql in statements)
     assert not any("DROP TABLE SENT_TRANSACTIONS" in sql.upper() for sql in statements)
+    ddl = [sql.upper() for sql in statements if sql.lstrip().upper().startswith(
+        ("CREATE", "ALTER", "DROP")
+    )]
+    assert ddl == ["ALTER TABLE DCA_PLANS ADD COLUMN AMOUNT_TEXT TEXT"]

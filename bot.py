@@ -13,6 +13,7 @@ import math
 import time
 import re
 import sqlite3
+from decimal import Decimal, InvalidOperation
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -284,7 +285,13 @@ bot = Bot(
 )
 dp = Dispatcher(storage=MemoryStorage())
 DB_PATH = resolve_project_path(os.getenv("DATABASE_PATH", ""), DEFAULT_DB_PATH)
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
+# Internal product-safety bound for canonical plan text. This is not claimed to
+# be a FixedFloat provider limit; it bounds accepted input while preserving the
+# long exact decimal values covered by this application.
+PLAN_AMOUNT_MAX_EXACT_SCALE = 18
+PLAN_AMOUNT_MIN = Decimal("10")
+PLAN_AMOUNT_MAX = Decimal("500")
 DB_BUSY_TIMEOUT_MS = 5000
 
 
@@ -388,6 +395,52 @@ def format_amount(x: float) -> str:
         return "0.00"
     value = float(x)
     return f"{value:.2f}"
+
+
+def canonicalize_plan_amount(amount_text: str) -> str:
+    """Validate and canonicalize an exact plan amount without binary floats."""
+    if not isinstance(amount_text, str):
+        raise TypeError("plan amount must be an exact decimal string")
+    if not re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", amount_text):
+        raise ValueError("plan amount must use plain decimal notation")
+    fractional = amount_text.partition(".")[2]
+    if len(fractional) > PLAN_AMOUNT_MAX_EXACT_SCALE:
+        raise ValueError(
+            f"plan amount supports at most {PLAN_AMOUNT_MAX_EXACT_SCALE} decimal places"
+        )
+    try:
+        amount = Decimal(amount_text)
+    except InvalidOperation as exc:
+        raise ValueError("plan amount must be a valid decimal") from exc
+    if not amount.is_finite() or amount <= 0:
+        raise ValueError("plan amount must be finite and positive")
+    canonical = format(amount, "f")
+    if "." in canonical:
+        canonical = canonical.rstrip("0").rstrip(".")
+    return canonical
+
+
+def parse_persisted_plan_amount(amount_text: Any) -> Decimal:
+    """Return a verified exact plan amount; legacy REAL is never accepted."""
+    if amount_text is None:
+        raise ValueError("legacy plan amount requires user reconfirmation")
+    canonical = canonicalize_plan_amount(amount_text)
+    if canonical != amount_text:
+        raise ValueError("persisted plan amount is not canonical")
+    return Decimal(canonical)
+
+
+def parse_fixedfloat_decimal(value: Any, field_name: str) -> Decimal:
+    """Parse an exact FixedFloat numeric response without accepting binary floats."""
+    if isinstance(value, bool) or isinstance(value, float):
+        raise ValueError(f"FixedFloat {field_name} must be an exact decimal value")
+    try:
+        parsed = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid FixedFloat {field_name}") from exc
+    if not parsed.is_finite() or parsed <= 0:
+        raise ValueError(f"FixedFloat {field_name} must be finite and positive")
+    return parsed
 
 
 def normalize_network_key(value: str) -> str:
@@ -547,9 +600,17 @@ def extract_order_expires_at(order_data: dict, fallback_now: Optional[int] = Non
             return expires_at
 
     time_left = (order_data.get("time", {}) or {}).get("left", 0)
-    if not isinstance(time_left, (int, float)) or time_left < 0:
-        time_left = 0
-    return int(fallback_now) + int(time_left)
+    if isinstance(time_left, bool) or not isinstance(
+        time_left, (int, float, Decimal)
+    ):
+        return int(fallback_now)
+    try:
+        numeric_time_left = Decimal(str(time_left))
+    except (InvalidOperation, TypeError, ValueError):
+        return int(fallback_now)
+    if not numeric_time_left.is_finite() or numeric_time_left < 0:
+        return int(fallback_now)
+    return int(fallback_now) + int(numeric_time_left)
 
 
 def normalize_code(value: str) -> str:
@@ -1313,7 +1374,7 @@ async def skip_missed_dca_cycle(
     plan_number = await get_plan_display_number(user_id, plan_id)
     async with open_db() as db:
         async with db.execute(
-            "SELECT from_asset, amount, btc_address FROM dca_plans WHERE id = ?",
+            "SELECT from_asset, COALESCE(amount_text, amount), btc_address FROM dca_plans WHERE id = ?",
             (plan_id,)
         ) as cur:
             plan_details = await cur.fetchone()
@@ -1363,7 +1424,7 @@ async def mark_order_expired_before_send(
     async with open_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         async with db.execute(
-            "SELECT next_run, interval_hours, from_asset, amount, btc_address, active_order_token "
+            "SELECT next_run, interval_hours, from_asset, COALESCE(amount_text, amount), btc_address, active_order_token "
             "FROM dca_plans WHERE id = ?",
             (plan_id,)
         ) as cur:
@@ -1548,7 +1609,7 @@ async def notify_and_clear_expired_order(plan_id: int, order_id: str) -> bool:
             )
             return False
         async with db.execute(
-            "SELECT user_id, from_asset, amount, btc_address, order_expired_notified, active_order_token "
+            "SELECT user_id, from_asset, COALESCE(amount_text, amount), btc_address, order_expired_notified, active_order_token "
             "FROM dca_plans WHERE id = ? AND active_order_id = ?",
             (plan_id, order_id)
         ) as cur:
@@ -2958,7 +3019,7 @@ async def cb_dca_confirm(callback: CallbackQuery):
     async with open_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         async with db.execute(
-            "SELECT from_asset, amount, interval_hours, next_run, confirmation_message_id, confirmation_expires_at "
+            "SELECT from_asset, COALESCE(amount_text, amount), interval_hours, next_run, confirmation_message_id, confirmation_expires_at "
             "FROM dca_plans WHERE id = ? AND user_id = ? AND execution_state = 'awaiting_confirmation' "
             "AND confirmation_scheduled_at = ? AND active_order_id IS NULL AND active = 1 AND deleted = 0",
             (plan_id, user_id, scheduled_at),
@@ -3054,7 +3115,7 @@ async def notify_offline_startup_status() -> None:
     try:
         async with open_db() as db:
             async with db.execute(
-                "SELECT user_id, id, from_asset, amount, btc_address, next_run, skip_reason, missed_count, last_missed_at "
+                "SELECT user_id, id, from_asset, COALESCE(amount_text, amount), btc_address, next_run, skip_reason, missed_count, last_missed_at "
                 "FROM dca_plans "
                 "WHERE deleted = 0 AND execution_state = 'skipped' "
                 "AND COALESCE(skip_notified, 0) = 0 ORDER BY user_id, id"
@@ -3067,7 +3128,7 @@ async def notify_offline_startup_status() -> None:
                 active_user_rows = await users_cur.fetchall()
 
             async with db.execute(
-                "SELECT user_id, id, from_asset, amount, btc_address, interval_hours, next_run, "
+                "SELECT user_id, id, from_asset, COALESCE(amount_text, amount), btc_address, interval_hours, next_run, "
                 "COALESCE(missed_count, 0), last_execution_attempt_at "
                 "FROM dca_plans WHERE active = 1 AND deleted = 0 "
                 "AND execution_state != 'awaiting_confirmation' ORDER BY user_id, id"
@@ -3233,6 +3294,22 @@ def ff_sign(data_str: str) -> str:
     ).hexdigest()
 
 
+def serialize_fixedfloat_request(method: str, params: dict) -> str:
+    """Serialize flat FixedFloat params, preserving an exact create amount as JSON number."""
+    parts = []
+    for key, value in params.items():
+        encoded_key = json.dumps(str(key), ensure_ascii=False)
+        if method == "create" and key == "amount":
+            canonical_amount = canonicalize_plan_amount(value)
+            encoded_value = canonical_amount
+        else:
+            encoded_value = json.dumps(
+                value, separators=(",", ":"), ensure_ascii=False
+            )
+        parts.append(f"{encoded_key}:{encoded_value}")
+    return "{" + ",".join(parts) + "}"
+
+
 def ff_request(method: str, params=None) -> dict:
     """
     Универсальный синхронный POST-запрос к FixedFloat API.
@@ -3280,7 +3357,7 @@ def ff_request(method: str, params=None) -> dict:
             elif "POLYGON" in from_ccy.upper():
                 network_key = "USDT-POLYGON"
             
-            amount = float(params.get("amount", 0))
+            amount = canonicalize_plan_amount(params.get("amount"))
             btc_address = params.get("toAddress", "")
             mock_response = get_mock_fixedfloat_order(network_key, amount, btc_address)
             logger.info(f"[MOCK] FixedFloat ответ: {method}, order_id={mock_response['data']['id']}")
@@ -3298,7 +3375,7 @@ def ff_request(method: str, params=None) -> dict:
         params = {}
 
     url = f"{FF_API_URL}/{method}"
-    data_str = json.dumps(params, separators=(",", ":"), ensure_ascii=False)
+    data_str = serialize_fixedfloat_request(method, params)
 
     headers = {
         "Accept": "application/json",
@@ -3318,7 +3395,7 @@ def ff_request(method: str, params=None) -> dict:
     logger.info(f"FixedFloat ответ: status={resp.status_code}")
 
     try:
-        data = resp.json()
+        data = resp.json(parse_float=Decimal)
     except ValueError as e:
         logger.error(f"Ошибка парсинга JSON ответа от FixedFloat: {e}, response text: {resp.text[:200]}")
         raise RuntimeError(f"Неверный формат ответа от FixedFloat API: {e}")
@@ -3404,14 +3481,14 @@ async def get_fixedfloat_limits(network_key: str) -> dict:
             raise RuntimeError(f"Не удалось получить лимиты для {network_key}")
         rate = None
         try:
-            to_amount_float = float(to_amount)
-            rate = (50.0 / to_amount_float) if to_amount_float else None
-        except (TypeError, ValueError):
+            to_amount_decimal = parse_fixedfloat_decimal(to_amount, "to.amount")
+            rate = Decimal("50") / to_amount_decimal
+        except (TypeError, ValueError, InvalidOperation):
             rate = None
         
         result = {
-            "min": float(min_amt),
-            "max": float(max_amt),
+            "min": parse_fixedfloat_decimal(min_amt, "from.min"),
+            "max": parse_fixedfloat_decimal(max_amt, "from.max"),
             "rate": rate,
         }
         _fixedfloat_limits_cache[network_key] = {"ts": now_ts, "data": result}
@@ -3449,7 +3526,7 @@ async def update_network_codes():
         logger.error(f"Ошибка обновления кодов сетей: {e}")
 
 
-def create_fixedfloat_order(network_key: str, amount_usdt: float, btc_address: str) -> dict:
+def create_fixedfloat_order(network_key: str, amount_usdt: str, btc_address: str) -> dict:
     """
     Универсальная функция создания ордера на обмен USDT -> BTC через FixedFloat.
     
@@ -3470,7 +3547,7 @@ def create_fixedfloat_order(network_key: str, amount_usdt: float, btc_address: s
         "fromCcy": from_ccy,  # из какой валюты
         "toCcy": "BTC",  # в какую валюту
         "direction": "from",  # фиксируем исходную сумму
-        "amount": float(amount_usdt),
+        "amount": canonicalize_plan_amount(amount_usdt),
         "toAddress": btc_address,  # куда отправить BTC
     }
     
@@ -3646,17 +3723,20 @@ _DCA_PLAN_CONFIRMATION_COLUMNS = frozenset(
     }
 )
 _DCA_PLAN_TOKEN_COLUMNS = frozenset({"active_order_token"})
+_DCA_PLAN_EXACT_AMOUNT_COLUMNS = frozenset({"amount_text"})
+_V2_DCA_PLAN_COLUMNS = (
+    _DCA_PLAN_BASE_COLUMNS | _DCA_PLAN_CONFIRMATION_COLUMNS | _DCA_PLAN_TOKEN_COLUMNS
+)
 _SUPPORTED_DCA_PLAN_COLUMN_SETS = frozenset(
     {
         _DCA_PLAN_BASE_COLUMNS,
         _DCA_PLAN_BASE_COLUMNS | _DCA_PLAN_CONFIRMATION_COLUMNS,
-        _DCA_PLAN_BASE_COLUMNS
-        | _DCA_PLAN_CONFIRMATION_COLUMNS
-        | _DCA_PLAN_TOKEN_COLUMNS,
+        _V2_DCA_PLAN_COLUMNS,
+        _V2_DCA_PLAN_COLUMNS | _DCA_PLAN_EXACT_AMOUNT_COLUMNS,
     }
 )
 _CURRENT_DCA_PLAN_COLUMNS = (
-    _DCA_PLAN_BASE_COLUMNS | _DCA_PLAN_CONFIRMATION_COLUMNS | _DCA_PLAN_TOKEN_COLUMNS
+    _V2_DCA_PLAN_COLUMNS | _DCA_PLAN_EXACT_AMOUNT_COLUMNS
 )
 
 _NULLABLE_SENT_TRANSACTION_GENERATIONS = (
@@ -3682,7 +3762,8 @@ _CURRENT_SENT_TRANSACTION_COLUMNS = _NULLABLE_SENT_TRANSACTION_GENERATIONS[-1]
 _DCA_PLAN_GENERATIONS = {
     _DCA_PLAN_BASE_COLUMNS: "dca_base",
     _DCA_PLAN_BASE_COLUMNS | _DCA_PLAN_CONFIRMATION_COLUMNS: "dca_confirmation",
-    _CURRENT_DCA_PLAN_COLUMNS: "dca_current",
+    _V2_DCA_PLAN_COLUMNS: "dca_current",
+    _CURRENT_DCA_PLAN_COLUMNS: "dca_exact_amount",
 }
 _NULLABLE_SENT_GENERATIONS = {
     _NULLABLE_SENT_TRANSACTION_GENERATIONS[0]: "sent_nullable_state",
@@ -3775,6 +3856,8 @@ _SUPPORTED_UNVERSIONED_DATABASE_FINGERPRINTS = frozenset(
         ),
         # The only unstamped v2 shape is the exact current whole database.
         ("dca_current", "sent_nullable_exact", True, "wallets_current", "completed_v2"),
+        # The only unstamped v3 shape is the exact current whole database.
+        ("dca_exact_amount", "sent_nullable_exact", True, "wallets_current", "completed_v2"),
     }
 )
 
@@ -3793,6 +3876,7 @@ _DCA_PLAN_COLUMN_SHAPES = {
     "user_id": ("INTEGER", 0, 0, None),
     "from_asset": ("TEXT", 0, 0, None),
     "amount": ("REAL", 0, 0, None),
+    "amount_text": ("TEXT", 0, 0, None),
     "interval_hours": ("INTEGER", 0, 0, None),
     "btc_address": ("TEXT", 0, 0, None),
     "next_run": ("INTEGER", 0, 0, None),
@@ -3912,6 +3996,7 @@ _DCA_PLAN_COLUMN_SQL = {
     "user_id": r"INTEGER",
     "from_asset": r"TEXT",
     "amount": r"REAL",
+    "amount_text": r"TEXT",
     "interval_hours": r"INTEGER",
     "btc_address": r"TEXT",
     "next_run": r"INTEGER",
@@ -4724,7 +4809,7 @@ async def _classify_unversioned_schema(db):
         )
     if (
         sent_kind == "nullable"
-        and dca_columns == _CURRENT_DCA_PLAN_COLUMNS
+        and dca_columns in {_V2_DCA_PLAN_COLUMNS, _CURRENT_DCA_PLAN_COLUMNS}
         and names == _CURRENT_SENT_TRANSACTION_COLUMNS
         and has_index
     ):
@@ -4735,7 +4820,7 @@ async def _classify_unversioned_schema(db):
 async def _assert_v1_schema(db) -> None:
     await _assert_expected_database_objects(db, allow_missing_sent_index=False)
     dca_columns = await _assert_dca_plans_source(db)
-    if dca_columns != _CURRENT_DCA_PLAN_COLUMNS:
+    if dca_columns != _V2_DCA_PLAN_COLUMNS:
         raise RuntimeError("Schema version 1 requires the current dca_plans generation")
     await _assert_wallets_schema(db)
     await _assert_completed_orders_schema(db, version=1)
@@ -4751,7 +4836,7 @@ async def _assert_v1_schema(db) -> None:
 async def _assert_v2_schema(db) -> None:
     await _assert_expected_database_objects(db, allow_missing_sent_index=False)
     dca_columns = await _assert_dca_plans_source(db)
-    if dca_columns != _CURRENT_DCA_PLAN_COLUMNS:
+    if dca_columns != _V2_DCA_PLAN_COLUMNS:
         raise RuntimeError("Schema version 2 requires the current dca_plans generation")
     await _assert_wallets_schema(db)
     await _assert_completed_orders_schema(db, version=2)
@@ -4764,6 +4849,33 @@ async def _assert_v2_schema(db) -> None:
     await _assert_no_duplicate_orders(db)
 
 
+async def _assert_v3_schema(db) -> None:
+    await _assert_expected_database_objects(db, allow_missing_sent_index=False)
+    dca_columns = await _assert_dca_plans_source(db)
+    if dca_columns != _CURRENT_DCA_PLAN_COLUMNS:
+        raise RuntimeError("Schema version 3 requires exact plan amount storage")
+    await _assert_wallets_schema(db)
+    await _assert_completed_orders_schema(db, version=2)
+    sent_columns = await _read_table_xinfo(db, "sent_transactions")
+    names, has_index = await _inspect_supported_nullable_sent_transactions(
+        db, sent_columns
+    )
+    if names != _CURRENT_SENT_TRANSACTION_COLUMNS or not has_index:
+        raise RuntimeError("Schema version 3 requires the current sent_transactions generation")
+    async with db.execute(
+        "SELECT id, amount_text FROM dca_plans WHERE amount_text IS NOT NULL ORDER BY id"
+    ) as cursor:
+        exact_amount_rows = await cursor.fetchall()
+    for plan_id, amount_text in exact_amount_rows:
+        try:
+            parse_persisted_plan_amount(amount_text)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Plan {plan_id} has invalid exact amount storage"
+            ) from exc
+    await _assert_no_duplicate_orders(db)
+
+
 async def _database_has_user_objects(db) -> bool:
     async with db.execute(
         "SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' LIMIT 1"
@@ -4771,13 +4883,14 @@ async def _database_has_user_objects(db) -> bool:
         return await cursor.fetchone() is not None
 
 
-async def _create_fresh_v2_schema(db) -> None:
+async def _create_fresh_v3_schema(db) -> None:
     await db.execute('''
         CREATE TABLE dca_plans (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             from_asset TEXT,
             amount REAL,
+            amount_text TEXT,
             interval_hours INTEGER,
             btc_address TEXT,
             next_run INTEGER,
@@ -5045,6 +5158,26 @@ async def _migrate_v1_to_v2(db) -> None:
     _assert_completed_orders_rows_preserved(source_rows, rebuilt_rows)
 
 
+async def _migrate_v2_to_v3(db) -> None:
+    """Add exact plan amount storage without promoting legacy REAL values."""
+    await _assert_v2_schema(db)
+    async with db.execute(
+        "SELECT id, amount, typeof(amount) FROM dca_plans ORDER BY id"
+    ) as cursor:
+        source_amounts = await cursor.fetchall()
+    await db.execute("ALTER TABLE dca_plans ADD COLUMN amount_text TEXT")
+    async with db.execute(
+        "SELECT id, amount, typeof(amount), amount_text, typeof(amount_text) "
+        "FROM dca_plans ORDER BY id"
+    ) as cursor:
+        migrated_amounts = await cursor.fetchall()
+    if [tuple(row[:3]) for row in migrated_amounts] != [tuple(row) for row in source_amounts]:
+        raise RuntimeError("v2 to v3 migration changed legacy plan amounts")
+    if any(row[3] is not None or str(row[4]).lower() != "null" for row in migrated_amounts):
+        raise RuntimeError("v2 to v3 migration promoted legacy REAL plan amounts")
+    await _assert_v3_schema(db)
+
+
 async def _migrate_unversioned_schema(db, classification) -> None:
     kind, dca_columns, sent_columns, has_sent_index, completed_generation = classification
     if kind != "current":
@@ -5180,10 +5313,17 @@ async def init_db():
                 raise RuntimeError(f"Invalid database schema version {schema_version}")
 
             if schema_version == CURRENT_SCHEMA_VERSION:
-                await _assert_v2_schema(db)
+                await _assert_v3_schema(db)
+            elif schema_version == 2:
+                await _migrate_v2_to_v3(db)
+                await _assert_v3_schema(db)
+                await db.execute(
+                    f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"
+                )
             elif schema_version == 1:
                 await _migrate_v1_to_v2(db)
-                await _assert_v2_schema(db)
+                await _migrate_v2_to_v3(db)
+                await _assert_v3_schema(db)
                 await db.execute(
                     f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"
                 )
@@ -5191,9 +5331,13 @@ async def init_db():
                 if await _database_has_user_objects(db):
                     classification = await _classify_unversioned_schema(db)
                     await _migrate_unversioned_schema(db, classification)
+                    async with db.execute("PRAGMA table_xinfo(dca_plans)") as cursor:
+                        dca_names = {str(row[1]) for row in await cursor.fetchall()}
+                    if "amount_text" not in dca_names:
+                        await _migrate_v2_to_v3(db)
                 else:
-                    await _create_fresh_v2_schema(db)
-                await _assert_v2_schema(db)
+                    await _create_fresh_v3_schema(db)
+                await _assert_v3_schema(db)
                 await db.execute(
                     f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"
                 )
@@ -5285,7 +5429,7 @@ async def dca_scheduler():
                 # Получаем все активные планы, которые пора выполнить (с ID!)
                 # Только НЕ удаленные планы
                 async with db.execute(
-                    "SELECT id, user_id, from_asset, amount, interval_hours, btc_address, next_run, "
+                    "SELECT id, user_id, from_asset, amount, amount_text, interval_hours, btc_address, next_run, "
                     "execution_state, confirmation_expires_at "
                     "FROM dca_plans WHERE active = 1 AND deleted = 0 AND next_run <= ?",
                     (now,)
@@ -5293,7 +5437,8 @@ async def dca_scheduler():
                     plans = await cursor.fetchall()
                 
                 for plan in plans:
-                    plan_id, user_id, from_asset, amount, interval_hours, btc_address, next_run, execution_state, confirmation_expires_at = plan
+                    plan_id, user_id, from_asset, legacy_amount, amount_text, interval_hours, btc_address, next_run, execution_state, confirmation_expires_at = plan
+                    amount = amount_text if amount_text is not None else legacy_amount
                     plan_number = await get_plan_display_number(user_id, plan_id)
                     plan_claimed = False
                     order_id = None
@@ -5483,6 +5628,21 @@ async def dca_scheduler():
                                         continue
                                     if fallback_result == "completed":
                                         continue
+                        if amount_text is None:
+                            logger.warning(
+                                "Skip DCA plan_id=%s: exact plan amount requires user reconfirmation",
+                                plan_id,
+                            )
+                            continue
+                        try:
+                            parse_persisted_plan_amount(amount_text)
+                        except (TypeError, ValueError):
+                            logger.error(
+                                "Skip DCA plan_id=%s: persisted exact plan amount is invalid",
+                                plan_id,
+                            )
+                            continue
+
                         if next_run is not None and now > scheduled_time_for_cycle:
                             overdue_seconds = now - scheduled_time_for_cycle
                             if overdue_seconds > DCA_EXECUTION_WINDOW_SECONDS:
@@ -5608,7 +5768,7 @@ async def execute_new_order(
 
     async with open_db() as db:
         async with db.execute(
-            "SELECT from_asset, amount, interval_hours, btc_address, next_run "
+            "SELECT from_asset, amount_text, interval_hours, btc_address, next_run "
             "FROM dca_plans WHERE id = ? AND user_id = ? AND deleted = 0",
             (plan_id, user_id),
         ) as cur:
@@ -5617,7 +5777,16 @@ async def execute_new_order(
         return result(
             "plan_unavailable", "plan_not_found_or_not_owned", active_gate_retained=False
         )
-    from_asset, amount, interval_hours, btc_address, plan_next_run = plan_row
+    from_asset, amount_text, interval_hours, btc_address, plan_next_run = plan_row
+    try:
+        exact_plan_amount = parse_persisted_plan_amount(amount_text)
+    except (TypeError, ValueError) as exc:
+        return result(
+            "legacy_amount_unverified",
+            "exact_plan_amount_reconfirmation_required",
+            active_gate_retained=False,
+            error_message=str(exc),
+        )
 
     try:
         plan_claimed = await claim_plan_execution(plan_id, user_id)
@@ -5640,7 +5809,7 @@ async def execute_new_order(
             data = await asyncio.to_thread(
                 create_fixedfloat_order,
                 from_asset,
-                amount,
+                format(exact_plan_amount, "f"),
                 btc_address,
             )
         except Exception as exc:
@@ -6184,7 +6353,7 @@ async def cmd_execute(message: Message):
     # Получаем список всех планов пользователя (в том же порядке что и в /status)
     async with open_db() as db:
         async with db.execute(
-            "SELECT id, from_asset, amount, interval_hours FROM dca_plans WHERE user_id = ? AND deleted = 0 ORDER BY id",
+            "SELECT id, from_asset, COALESCE(amount_text, amount), interval_hours FROM dca_plans WHERE user_id = ? AND deleted = 0 ORDER BY id",
             (user_id,),
         ) as cur:
             plans = await cur.fetchall()
@@ -6215,7 +6384,7 @@ async def cmd_execute(message: Message):
     # Получаем конкретный план по ID (только не удаленные)
     async with open_db() as db:
         async with db.execute(
-            "SELECT from_asset, amount, interval_hours, btc_address, active_order_id, active_order_token, active_order_address, "
+            "SELECT from_asset, amount, amount_text, interval_hours, btc_address, active_order_id, active_order_token, active_order_address, "
             "active_order_amount, active_order_expires, next_run, execution_state "
             "FROM dca_plans WHERE id = ? AND user_id = ? AND deleted = 0",
             (plan_id, user_id)
@@ -6226,7 +6395,7 @@ async def cmd_execute(message: Message):
         await message.answer("❌ План не найден или не принадлежит тебе")
         return
     
-    from_asset, amount, interval_hours, btc_address, active_order_id, active_order_token, active_order_address, active_order_amount, active_order_expires, plan_next_run, execution_state = row
+    from_asset, amount, amount_text, interval_hours, btc_address, active_order_id, active_order_token, active_order_address, active_order_amount, active_order_expires, plan_next_run, execution_state = row
     plan_number = await get_plan_display_number(user_id, plan_id)
 
     if execution_state == "creating_order":
@@ -6427,6 +6596,15 @@ async def cmd_execute(message: Message):
             )
             return
 
+    try:
+        amount = parse_persisted_plan_amount(amount_text)
+    except (TypeError, ValueError):
+        await message.answer(
+            "⚠️ Сумма этого legacy-плана не имеет подтверждённого точного значения. "
+            "Создай план заново через /setdca; новый FixedFloat ордер не создаётся."
+        )
+        return
+
     order_id = None
     progress_msg = None
     try:
@@ -6437,7 +6615,7 @@ async def cmd_execute(message: Message):
             max_limit = limits["max"]
             
             # Ограничиваем максимальный лимит бота (500 USD)
-            effective_max = min(max_limit, 500.0)
+            effective_max = min(max_limit, PLAN_AMOUNT_MAX)
             
             if amount < min_limit:
                 await message.answer(
@@ -6457,7 +6635,10 @@ async def cmd_execute(message: Message):
                 )
                 return
             
-            logger.info(f"Лимиты для {from_asset}: min={min_limit:.2f}, max={effective_max:.2f}, amount={amount:.2f}")
+            logger.info(
+                "Лимиты для %s: min=%s, max=%s, amount=%s",
+                from_asset, min_limit, effective_max, format(amount, "f"),
+            )
         except RuntimeError as e:
             error_msg = str(e)
             if "недоступна" in error_msg.lower() or "311" in error_msg or "312" in error_msg:
@@ -6521,6 +6702,12 @@ async def cmd_execute(message: Message):
             else:
                 await message.answer(text, parse_mode="HTML", **kwargs)
 
+        if execution.outcome == "legacy_amount_unverified":
+            await message.answer(
+                "⚠️ Сумма этого legacy-плана требует подтверждения через новый /setdca. "
+                "FixedFloat ордер не создан."
+            )
+            return
         if execution.outcome in {"plan_unavailable", "claim_contended"}:
             await message.answer("⚠️ План уже выполняется другим процессом. Повтори через несколько секунд.")
             return
@@ -6715,7 +6902,7 @@ async def cmd_status(message: Message):
     
     async with open_db() as db:
         async with db.execute(
-            "SELECT id, from_asset, amount, interval_hours, btc_address, next_run, active, "
+            "SELECT id, from_asset, COALESCE(amount_text, amount), interval_hours, btc_address, next_run, active, "
             "active_order_id, active_order_token, active_order_address, active_order_amount, active_order_expires, "
             "execution_state, confirmation_expires_at "
             "FROM dca_plans WHERE user_id = ? AND deleted = 0 ORDER BY id", 
@@ -7566,7 +7753,8 @@ async def cmd_setdca(message: Message):
         
         # Нормализация названия сети
         from_asset = from_asset.upper().replace("_", "-")
-        amount = float(amount_str)
+        amount_text = canonicalize_plan_amount(amount_str)
+        amount = Decimal(amount_text)
         interval = int(interval_str)
         
         # Валидация параметров
@@ -7580,7 +7768,7 @@ async def cmd_setdca(message: Message):
             return
         
         # Базовая проверка диапазона
-        if amount < 10 or amount > 500:
+        if amount < PLAN_AMOUNT_MIN or amount > PLAN_AMOUNT_MAX:
             await message.answer(
                 "❌ Неверная сумма\n\n"
                 "Максимум: 500 USDT (ограничено настройками бота)\n\n"
@@ -7595,7 +7783,7 @@ async def cmd_setdca(message: Message):
             max_limit = limits["max"]
             
             # Ограничиваем максимальный лимит бота (500 USD)
-            effective_max = min(max_limit, 500.0)
+            effective_max = min(max_limit, PLAN_AMOUNT_MAX)
             
             if amount < min_limit:
                 await message.answer(
@@ -7615,7 +7803,10 @@ async def cmd_setdca(message: Message):
                 )
                 return
             
-            logger.info(f"Лимиты для {from_asset}: min={min_limit:.2f}, max={effective_max:.2f}, amount={amount:.2f}")
+            logger.info(
+                "Лимиты для %s: min=%s, max=%s, amount=%s",
+                from_asset, min_limit, effective_max, amount_text,
+            )
         except RuntimeError as e:
             # Если не удалось получить лимиты, проверяем базовый диапазон
             error_msg = str(e)
@@ -7669,12 +7860,38 @@ async def cmd_setdca(message: Message):
             ) as cur:
                 count_row = await cur.fetchone()
                 plans_count = count_row[0] if count_row else 0
+
+            # A legacy REAL amount is not exact enough for equality matching.
+            # Nevertheless, an unresolved external order/payment owned by the
+            # same pre-existing plan slot must block a parallel fresh owner.
+            # This mirrors the scheduler's unresolved transaction state set
+            # without promoting or comparing the legacy REAL value.
+            async with db.execute(
+                "SELECT dp.id, dp.active_order_id FROM dca_plans dp "
+                "WHERE dp.user_id = ? AND dp.from_asset = ? "
+                "AND dp.interval_hours = ? AND dp.amount_text IS NULL AND ("
+                "dp.active_order_id IS NOT NULL OR EXISTS ("
+                "SELECT 1 FROM sent_transactions st WHERE st.plan_id = dp.id "
+                "AND st.state IN ('sending', 'transfering', 'approve_confirmed', "
+                "'tx_pending', 'pending', 'blocked'))) "
+                "ORDER BY dp.id LIMIT 1",
+                (user_id, from_asset, interval),
+            ) as cur:
+                legacy_unresolved_sibling = await cur.fetchone()
+
+            if legacy_unresolved_sibling:
+                await message.answer(
+                    "⚠️ У legacy-плана с этой сетью и интервалом есть "
+                    "незавершённый ордер или перевод. Сначала дождись его "
+                    "завершения или выполни ручную проверку; новый план не создан."
+                )
+                return
             
             # Проверяем не существует ли уже такой же НЕ удаленный план (сеть + сумма + интервал)
             async with db.execute(
                 "SELECT id, active_order_id, active_order_expires FROM dca_plans "
-                "WHERE user_id = ? AND from_asset = ? AND amount = ? AND interval_hours = ? AND deleted = 0",
-                (user_id, from_asset, amount, interval)
+                "WHERE user_id = ? AND from_asset = ? AND amount_text = ? AND interval_hours = ? AND deleted = 0",
+                (user_id, from_asset, amount_text, interval)
             ) as cur:
                 duplicate = await cur.fetchone()
             
@@ -7717,10 +7934,10 @@ async def cmd_setdca(message: Message):
             # в удалённых планах
             async with db.execute(
                 "SELECT active_order_id, active_order_address, active_order_amount, active_order_expires, btc_address "
-                "FROM dca_plans WHERE user_id = ? AND from_asset = ? AND amount = ? AND interval_hours = ? "
+                "FROM dca_plans WHERE user_id = ? AND from_asset = ? AND amount_text = ? AND interval_hours = ? "
                 "AND active_order_id IS NOT NULL AND deleted = 1 "
                 "ORDER BY active_order_expires DESC LIMIT 1",
-                (user_id, from_asset, amount, interval)
+                (user_id, from_asset, amount_text, interval)
             ) as cur:
                 existing_order = await cur.fetchone()
             
@@ -7742,27 +7959,27 @@ async def cmd_setdca(message: Message):
                     # Создаём план без наследования ордера
                     cursor = await db.execute('''
                         INSERT INTO dca_plans 
-                        (user_id, from_asset, amount, interval_hours, btc_address, next_run, active)
-                        VALUES (?, ?, ?, ?, ?, ?, 1)
-                    ''', (user_id, from_asset, amount, interval, btc_address, next_run))
+                        (user_id, from_asset, amount, amount_text, interval_hours, btc_address, next_run, active)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                    ''', (user_id, from_asset, amount_text, amount_text, interval, btc_address, next_run))
                     new_plan_id = cursor.lastrowid
                 else:
                     # BTC адрес совпадает - наследуем ордер
                     cursor = await db.execute('''
                         INSERT INTO dca_plans 
-                        (user_id, from_asset, amount, interval_hours, btc_address, next_run, active,
+                        (user_id, from_asset, amount, amount_text, interval_hours, btc_address, next_run, active,
                          active_order_id, active_order_address, active_order_amount, active_order_expires)
-                        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
-                    ''', (user_id, from_asset, amount, interval, btc_address, next_run,
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                    ''', (user_id, from_asset, amount_text, amount_text, interval, btc_address, next_run,
                           order_id, order_address, order_amount, order_expires))
                     new_plan_id = cursor.lastrowid
             else:
                 # Нет активного ордера - создаём чистый план
                 cursor = await db.execute('''
                     INSERT INTO dca_plans 
-                    (user_id, from_asset, amount, interval_hours, btc_address, next_run, active)
-                    VALUES (?, ?, ?, ?, ?, ?, 1)
-                ''', (user_id, from_asset, amount, interval, btc_address, next_run))
+                    (user_id, from_asset, amount, amount_text, interval_hours, btc_address, next_run, active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                ''', (user_id, from_asset, amount_text, amount_text, interval, btc_address, next_run))
                 new_plan_id = cursor.lastrowid
             
             await db.commit()

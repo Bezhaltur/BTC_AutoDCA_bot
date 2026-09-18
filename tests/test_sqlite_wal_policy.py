@@ -183,7 +183,7 @@ def test_fresh_database_enables_wal_then_reopens_with_full_sync(
     asyncio.run(app.ensure_wal_mode())
 
     with sqlite3.connect(db_path) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == app.CURRENT_SCHEMA_VERSION
         assert db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
@@ -684,7 +684,7 @@ def test_wal_pragma_operational_error_stops_startup_fail_closed(
     before = schema_and_data_snapshot(db_path)
     with sqlite3.connect(db_path) as db:
         assert db.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == app.CURRENT_SCHEMA_VERSION
 
     wal_error = sqlite3.OperationalError("injected journal_mode WAL failure")
 
@@ -735,7 +735,7 @@ def test_wal_pragma_operational_error_stops_startup_fail_closed(
     )
     assert schema_and_data_snapshot(db_path) == before
     with sqlite3.connect(db_path, timeout=0.1) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == app.CURRENT_SCHEMA_VERSION
         assert db.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
         db.execute("BEGIN IMMEDIATE")
         db.rollback()

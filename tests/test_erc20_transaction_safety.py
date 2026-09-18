@@ -1461,6 +1461,7 @@ def test_init_db_preserves_legacy_row_and_adds_nullable_intent_columns(tmp_path,
     monkeypatch.setattr(app, "DB_PATH", db_path)
     asyncio.run(app.init_db())
     with sqlite3.connect(db_path) as db:
+        db.execute("ALTER TABLE dca_plans DROP COLUMN amount_text")
         db.execute("DROP TABLE completed_orders")
         db.execute(
             "CREATE TABLE completed_orders ("
