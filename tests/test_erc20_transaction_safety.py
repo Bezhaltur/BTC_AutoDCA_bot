@@ -244,7 +244,9 @@ def test_unknown_receipt_error_keeps_transfer_pending(monkeypatch):
     monkeypatch.setattr(
         sender, "get_usdt_balance_units", lambda *_args: 100_000_000
     )
-    monkeypatch.setattr(sender, "get_native_balance", lambda *_args: 10.0)
+    monkeypatch.setattr(
+        sender, "get_native_balance_wei", lambda *_args: 10 * 10**18
+    )
     monkeypatch.setattr(sender, "estimate_gas_for_transfer", lambda *_args: 75_000)
     monkeypatch.setattr(sender, "build_gas_params", lambda *_args: {"gasPrice": 1})
 
@@ -273,7 +275,9 @@ def test_unknown_receipt_error_keeps_transfer_pending(monkeypatch):
     assert persisted == [("transfer", transfer_hash, 9, "0xdeadbeef")]
 
 
-def configure_direct_send(monkeypatch, *, receipt_status=1, native_balance=2e-13):
+def configure_direct_send(
+    monkeypatch, *, receipt_status=1, native_balance_wei=200_000
+):
     class ReceiptEth:
         def wait_for_transaction_receipt(self, _tx_hash, timeout):
             assert timeout == 120
@@ -294,7 +298,9 @@ def configure_direct_send(monkeypatch, *, receipt_status=1, native_balance=2e-13
     monkeypatch.setattr(
         sender, "get_usdt_balance_units", lambda *_args: 100_000_000
     )
-    monkeypatch.setattr(sender, "get_native_balance", lambda *_args: native_balance)
+    monkeypatch.setattr(
+        sender, "get_native_balance_wei", lambda *_args: native_balance_wei
+    )
     monkeypatch.setattr(sender, "estimate_gas_for_transfer", lambda *_args: 75_000)
     monkeypatch.setattr(sender, "build_gas_params", lambda *_args: {"gasPrice": 1})
     sender._SEND_LOCKS.clear()

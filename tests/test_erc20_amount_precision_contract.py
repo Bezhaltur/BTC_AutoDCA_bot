@@ -123,7 +123,9 @@ def _configure_exact_transfer_runtime(
     )
     monkeypatch.setattr(sender, "get_usdt_token_decimals", lambda *_args: token_decimals)
     monkeypatch.setattr(sender, "get_usdt_balance_units", lambda *_args: balance_units)
-    monkeypatch.setattr(sender, "get_native_balance", lambda *_args: 1.0)
+    monkeypatch.setattr(
+        sender, "get_native_balance_wei", lambda *_args: 10**18
+    )
     monkeypatch.setattr(sender, "estimate_gas_for_transfer", lambda *_args: 75_000)
     monkeypatch.setattr(sender, "build_gas_params", lambda *_args: {"gasPrice": 1})
     monkeypatch.setattr(erc20, "get_usdt_contract", lambda *_args: contract)
@@ -385,7 +387,9 @@ def test_one_unit_less_balance_stops_production_auto_send(monkeypatch):
     monkeypatch.setattr(sender, "get_network_config", lambda _network: {"native_token": "ETH"})
     monkeypatch.setattr(sender, "get_usdt_token_decimals", lambda *_args: 6)
     monkeypatch.setattr(sender, "get_usdt_balance_units", lambda *_args: 16_000_001)
-    monkeypatch.setattr(sender, "get_native_balance", lambda *_args: 1.0)
+    monkeypatch.setattr(
+        sender, "get_native_balance_wei", lambda *_args: 10**18
+    )
     monkeypatch.setattr(
         sender, "transfer_usdt", lambda *_args: transfer_calls.append(_args)
     )
@@ -502,7 +506,9 @@ def test_restart_uses_persisted_units_without_reading_legacy_real(monkeypatch):
         sender, "get_usdt_balance_units", lambda *_args: 16_000_002
     )
     monkeypatch.setattr(sender, "get_usdt_token_decimals", lambda *_args: 6)
-    monkeypatch.setattr(sender, "get_native_balance", lambda *_args: 1.0)
+    monkeypatch.setattr(
+        sender, "get_native_balance_wei", lambda *_args: 10**18
+    )
     monkeypatch.setattr(sender, "estimate_gas_for_transfer", lambda *_args: 75_000)
     monkeypatch.setattr(sender, "build_gas_params", lambda *_args: {"gasPrice": 1})
 

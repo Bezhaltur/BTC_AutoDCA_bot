@@ -46,8 +46,9 @@ POLYGON_RPC_URLS = [
     "https://1rpc.io/matic",
 ]
 LEGACY_GAS_NETWORKS = {"USDT-BSC"}
-GAS_MULTIPLIER = 1.2
-DEFAULT_PRIORITY_FEE_GWEI = 0.1
+GAS_FEE_MARGIN_NUMERATOR = 6
+GAS_FEE_MARGIN_DENOMINATOR = 5
+DEFAULT_PRIORITY_FEE_WEI = 100_000_000
 POA_MIDDLEWARE_FLAG_ATTR = "_dca_poa_middleware_enabled"
 RPC_TIMEOUT_SECONDS = 10
 RPC_CONNECT_MAX_ATTEMPTS = 3
@@ -479,13 +480,21 @@ def build_gas_params(w3: Web3, network_key: str) -> dict:
     try:
         priority_fee = int(w3.eth.max_priority_fee)
     except Exception as e:
-        priority_fee = int(w3.to_wei(DEFAULT_PRIORITY_FEE_GWEI, "gwei"))
+        priority_fee = DEFAULT_PRIORITY_FEE_WEI
         logger.warning(
             f"Failed to fetch max_priority_fee on {network_key}, "
-            f"using default {DEFAULT_PRIORITY_FEE_GWEI} gwei: {e}"
+            f"using default {DEFAULT_PRIORITY_FEE_WEI} wei: {e}"
         )
 
-    max_fee = int((base_fee * 2 + priority_fee) * GAS_MULTIPLIER)
+    fee_base = base_fee * 2 + priority_fee
+    # 6/5 is the existing 1.2 safety factor.  Ceiling is intentional so the
+    # integer fee cap is never rounded below the intended value by a fraction
+    # of one wei.
+    max_fee = (
+        fee_base * GAS_FEE_MARGIN_NUMERATOR
+        + GAS_FEE_MARGIN_DENOMINATOR
+        - 1
+    ) // GAS_FEE_MARGIN_DENOMINATOR
     if max_fee < base_fee:
         max_fee = base_fee * 2
 
@@ -556,6 +565,21 @@ def get_usdt_balance_units(w3: Web3, network_key: str, address: str) -> int:
         raise RuntimeError(f"Failed to get USDT balance units: {e}")
 
 
+def get_native_balance_wei(w3: Web3, address: str) -> int:
+    """Return the native-token balance in raw wei for business decisions."""
+    try:
+        balance_wei = w3.eth.get_balance(Web3.to_checksum_address(address))
+        if isinstance(balance_wei, bool) or not isinstance(balance_wei, int):
+            raise TypeError("native balance RPC result must be an integer")
+        if balance_wei < 0:
+            raise ValueError("native balance RPC result cannot be negative")
+        return balance_wei
+    except Exception as e:
+        masked_addr = f"{address[:6]}...{address[-4:]}" if len(address) > 10 else address
+        logger.error(f"Error getting native balance for {masked_addr}: {e}")
+        raise RuntimeError(f"Failed to get native balance: {e}")
+
+
 def get_native_balance(w3: Web3, address: str) -> float:
     """
     Get native token balance (ETH/BNB/POLYGON).
@@ -568,11 +592,13 @@ def get_native_balance(w3: Web3, address: str) -> float:
         Native token balance in ETH/BNB/POLYGON
     """
     try:
-        balance_wei = w3.eth.get_balance(Web3.to_checksum_address(address))
+        balance_wei = get_native_balance_wei(w3, address)
         balance = Web3.from_wei(balance_wei, "ether")
         masked_addr = f"{address[:6]}...{address[-4:]}" if len(address) > 10 else address
         logger.info(f"Native balance check: {masked_addr} = {float(balance):.6f}")
         return float(balance)
+    except RuntimeError:
+        raise
     except Exception as e:
         masked_addr = f"{address[:6]}...{address[-4:]}" if len(address) > 10 else address
         logger.error(f"Error getting native balance for {masked_addr}: {e}")
