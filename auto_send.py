@@ -18,7 +18,7 @@ from erc20 import (
     decimal_amount_to_units,
     get_usdt_balance_units,
     get_usdt_token_decimals,
-    get_native_balance,
+    get_native_balance_wei,
     has_sufficient_token_balance,
     validate_decimal_amount_text,
     transfer_usdt,
@@ -29,14 +29,31 @@ from wallet import load_keystore, decrypt_private_key
 
 logger = logging.getLogger(__name__)
 
-# Gas price multiplier for safety margin
-GAS_PRICE_MULTIPLIER = 1.2
-# Minimum native token balance multiplier (for safety)
-MIN_NATIVE_MULTIPLIER = 1.5
+NATIVE_RESERVE_NUMERATOR = 9
+NATIVE_RESERVE_DENOMINATOR = 5
 
 HEX_PRIVATE_KEY_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _SEND_LOCKS = {}
 _SEND_LOCKS_GUARD = asyncio.Lock()
+
+
+def calculate_required_native_balance_wei(gas: int, fee_per_gas: int) -> int:
+    """Return ceil(gas * fee_per_gas * 9/5) entirely in integer wei.
+
+    The 9/5 factor preserves the existing intended 1.2 * 1.5 safety reserve.
+    Rounding up to a whole wei is deliberately conservative.
+    """
+    for name, value in (("gas", gas), ("fee_per_gas", fee_per_gas)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be an integer")
+        if value < 0:
+            raise ValueError(f"{name} cannot be negative")
+    base_cost_wei = gas * fee_per_gas
+    return (
+        base_cost_wei * NATIVE_RESERVE_NUMERATOR
+        + NATIVE_RESERVE_DENOMINATOR
+        - 1
+    ) // NATIVE_RESERVE_DENOMINATOR
 
 
 async def _get_wallet_send_lock(network_key: str, wallet_address: str) -> asyncio.Lock:
@@ -201,9 +218,11 @@ async def auto_send_usdt(
             usdt_balance = Decimal(str(balance_units)) / (
                 Decimal("10") ** token_decimals
             )
-            native_balance = await asyncio.to_thread(get_native_balance, w3, wallet_address)
+            native_balance_wei = await asyncio.to_thread(
+                get_native_balance_wei, w3, wallet_address
+            )
             logger.info(f"✓ USDT balance: {usdt_balance:.6f} USDT")
-            logger.info(f"✓ Native balance: {native_balance:.6f} {config['native_token']}")
+            logger.info(f"✓ Native balance: {native_balance_wei} wei")
         except PreparedTransactionConflict as e:
             logger.warning("Payment intent persistence conflict: %s", e)
             return (False, None, None, f"PERSISTENCE_CONFLICT:{e}")
@@ -240,42 +259,63 @@ async def auto_send_usdt(
             )
             total_gas = transfer_gas
             
+            # This preflight quote is intentionally not reused by transfer_usdt,
+            # which keeps the existing behavior of refreshing fee fields while
+            # constructing the actual transaction.  This check guarantees exact
+            # integer arithmetic, not equality with that later RPC quote.
             gas_params = await asyncio.to_thread(build_gas_params, w3, network_key)
             if "gasPrice" in gas_params:
                 gas_price_wei = int(gas_params["gasPrice"])
-                gas_label = f"{w3.from_wei(gas_price_wei, 'gwei'):.2f} Gwei"
             else:
                 gas_price_wei = int(gas_params["maxFeePerGas"])
                 priority_fee_wei = int(gas_params.get("maxPriorityFeePerGas", 0))
-                gas_label = (
-                    f"maxFee={w3.from_wei(gas_price_wei, 'gwei'):.2f} Gwei, "
-                    f"priority={w3.from_wei(priority_fee_wei, 'gwei'):.2f} Gwei"
-                )
-            total_gas_cost_wei = total_gas * gas_price_wei * GAS_PRICE_MULTIPLIER
-            total_gas_cost = w3.from_wei(total_gas_cost_wei, "ether")
-            min_native_required = float(total_gas_cost) * MIN_NATIVE_MULTIPLIER
-            
-            logger.info(f"✓ Gas estimation complete:")
-            logger.info(f"  Transfer gas: {transfer_gas}")
-            logger.info(f"  Total gas: {total_gas}")
-            logger.info(f"  Gas params: {gas_label}")
-            logger.info(f"  Estimated cost: {total_gas_cost:.6f} {config['native_token']}")
-            logger.info(f"  Required (with margin): {min_native_required:.6f} {config['native_token']}")
+            base_gas_cost_wei = total_gas * gas_price_wei
+            min_native_required_wei = calculate_required_native_balance_wei(
+                total_gas, gas_price_wei
+            )
         except Exception as e:
             logger.error(f"✗ Failed to estimate gas: {e}")
             return (False, None, None, f"Failed to estimate gas: {e}")
         
         # Check 5: Native token balance sufficient
         logger.info(f"Check 5: Verifying native token balance sufficient...")
-        if native_balance < min_native_required:
-            logger.error(f"✗ Insufficient native token: required={min_native_required:.6f}, available={native_balance:.6f}")
+        if native_balance_wei < min_native_required_wei:
+            min_native_required = w3.from_wei(min_native_required_wei, "ether")
+            native_balance = w3.from_wei(native_balance_wei, "ether")
+            native_shortage = w3.from_wei(
+                min_native_required_wei - native_balance_wei, "ether"
+            )
+            logger.error(
+                "✗ Insufficient native token: required=%s wei, available=%s wei",
+                min_native_required_wei,
+                native_balance_wei,
+            )
             return (
                 False, None, None,
                 f"Insufficient {config['native_token']} balance for gas.\n"
                 f"Required: {min_native_required:.6f} {config['native_token']}\n"
                 f"Available: {native_balance:.6f} {config['native_token']}\n"
-                f"Shortage: {min_native_required - native_balance:.6f} {config['native_token']}"
+                f"Shortage: {native_shortage:.6f} {config['native_token']}"
             )
+
+        # Presentation conversions happen only after the integer-wei decision.
+        if "gasPrice" in gas_params:
+            gas_label = f"{w3.from_wei(gas_price_wei, 'gwei'):.2f} Gwei"
+        else:
+            gas_label = (
+                f"maxFee={w3.from_wei(gas_price_wei, 'gwei'):.2f} Gwei, "
+                f"priority={w3.from_wei(priority_fee_wei, 'gwei'):.2f} Gwei"
+            )
+        gas_cost_with_margin_wei = (base_gas_cost_wei * 6 + 4) // 5
+        total_gas_cost = w3.from_wei(gas_cost_with_margin_wei, "ether")
+        min_native_required = w3.from_wei(min_native_required_wei, "ether")
+
+        logger.info(f"✓ Gas estimation complete:")
+        logger.info(f"  Transfer gas: {transfer_gas}")
+        logger.info(f"  Total gas: {total_gas}")
+        logger.info(f"  Gas params: {gas_label}")
+        logger.info(f"  Estimated cost: {total_gas_cost:.6f} {config['native_token']}")
+        logger.info(f"  Required (with margin): {min_native_required:.6f} {config['native_token']}")
         logger.info(f"✓ Native token balance sufficient")
         logger.info(f"=== All checks passed, proceeding with transactions ===")
         
