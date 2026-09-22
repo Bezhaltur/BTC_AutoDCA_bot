@@ -31,8 +31,8 @@ def plan_db(tmp_path, monkeypatch):
     with sqlite3.connect(db_path) as db:
         db.execute(
             "INSERT INTO dca_plans "
-            "(user_id, from_asset, amount, interval_hours, btc_address, next_run, active) "
-            "VALUES (?, 'USDT-ARB', 25, 24, 'bc1qtest', 4000000000, 1)",
+            "(user_id, from_asset, amount, amount_text, interval_hours, btc_address, next_run, active) "
+            "VALUES (?, 'USDT-ARB', 25, '25', 24, 'bc1qtest', 4000000000, 1)",
             (USER_ID,),
         )
     return db_path
