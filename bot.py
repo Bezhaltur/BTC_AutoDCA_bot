@@ -1995,9 +1995,9 @@ async def get_transfer_tx_status(network_key: str, tx_hash: str) -> str:
     try:
         w3 = await asyncio.to_thread(get_web3_instance, network_key)
         receipt = await asyncio.to_thread(w3.eth.get_transaction_receipt, tx_hash)
-        if receipt and getattr(receipt, "status", 0) == 1:
+        if receipt and getattr(receipt, "status", None) == 1:
             return "confirmed"
-        if receipt:
+        if receipt and getattr(receipt, "status", None) == 0:
             return "failed"
     except TransactionNotFound:
         return "pending"
@@ -2275,11 +2275,17 @@ async def mark_order_failed(
     proven_transfer_failure_hash: Optional[str] = None,
     proven_approve_failure_hash: Optional[str] = None,
     proven_pre_broadcast: bool = False,
+    expected_receipt_evidence: Optional[tuple] = None,
     commit_fn: Optional[Callable[[Any], Awaitable[None]]] = None,
 ) -> bool:
     """Mark order as failed and clear active marker."""
     async with open_db() as db:
         await db.execute("BEGIN IMMEDIATE")
+        if expected_receipt_evidence is not None and not await _receipt_evidence_is_current(
+            db, plan_id, order_id, expected_receipt_evidence
+        ):
+            await db.rollback()
+            return False
         if not await _active_order_gate_can_be_released(
             db,
             plan_id,
@@ -2473,6 +2479,141 @@ class NewOrderExecutionResult:
     error_message: str = ""
 
 
+# Terminal failed + artifacts/gate lifecycle is a separate follow-up.
+# Do not observe active send owners or reopen historical terminal rows here.
+RECEIPT_OBSERVATION_STATES = frozenset({"tx_pending", "blocked"})
+
+
+async def _read_receipt_evidence(db, plan_id: int, order_id: str):
+    async with db.execute(
+        "SELECT id, state, network_key, transfer_tx_hash, transfer_raw_tx, "
+        "transfer_tx_nonce, amount_units, token_decimals FROM sent_transactions "
+        "WHERE plan_id = ? AND order_id = ? ORDER BY sent_at DESC, id DESC LIMIT 1",
+        (plan_id, order_id),
+    ) as cur:
+        return await cur.fetchone()
+
+
+async def _receipt_evidence_is_current(db, plan_id, order_id, expected) -> bool:
+    current = await _read_receipt_evidence(db, plan_id, order_id)
+    return (
+        current == expected
+        and current is not None
+        and not is_terminal_sent_transaction_state(current[1])
+    )
+
+
+async def _apply_transfer_receipt(
+    *, plan_id, order_id, evidence, tx_hash, tx_status, commit_fn,
+    should_notify=False, advance_schedule=False, schedule_anchor=None, interval_hours=None,
+) -> ReconciliationResult:
+    """Apply a definitive receipt using recovery semantics and a transaction-local guard."""
+    if tx_status not in {"confirmed", "failed"}:
+        raise ValueError("A definitive transfer receipt is required")
+    tx_id, tx_state = evidence[:2]
+    if tx_status == "confirmed":
+        schedule_effect = "unchanged"
+        async with open_db() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            if not await _receipt_evidence_is_current(db, plan_id, order_id, evidence):
+                await db.rollback()
+                return ReconciliationResult(
+                    "stale_result", plan_id, order_id, None,
+                    "receipt_evidence_changed", False, "unchanged",
+                )
+            await db.execute(
+                "UPDATE sent_transactions SET state = 'confirmed', error_message = NULL WHERE id = ?",
+                (tx_id,),
+            )
+            if advance_schedule:
+                schedule_now = int(schedule_anchor if schedule_anchor is not None else time.time())
+                new_next_run = schedule_now + (int(interval_hours or 24) * 3600)
+                await db.execute(
+                    "UPDATE dca_plans SET next_run = ?, missed_count = 0 WHERE id = ?",
+                    (new_next_run, plan_id),
+                )
+                schedule_effect = "advanced"
+            await commit_fn(db)
+        return ReconciliationResult(
+            "confirmed", plan_id, order_id, "confirmed",
+            "transfer_confirmed", should_notify, schedule_effect,
+        )
+
+    cleared = await mark_order_failed(
+        plan_id, order_id, "Transfer tx reverted on-chain",
+        proven_transfer_failure_hash=tx_hash,
+        expected_receipt_evidence=evidence,
+        commit_fn=commit_fn,
+    )
+    return ReconciliationResult(
+        "failed" if cleared else "manual_review", plan_id, order_id,
+        "failed" if cleared else tx_state,
+        "chain_status_failed" if cleared else "active_gate_retained",
+        should_notify if cleared else False, "unchanged",
+    )
+
+
+async def observe_persisted_transfer_receipt(plan_id: int, order_id: str) -> ReconciliationResult:
+    """Observe only quiescent, persisted transfers; never send or change the schedule."""
+    async with open_db() as db:
+        evidence = await _read_receipt_evidence(db, plan_id, order_id)
+        network_key = evidence[2] if evidence else None
+        if evidence and not network_key:
+            async with db.execute(
+                "SELECT from_asset FROM dca_plans WHERE id = ?", (plan_id,)
+            ) as cur:
+                plan = await cur.fetchone()
+            network_key = plan[0] if plan else None
+    if not evidence or evidence[1] not in RECEIPT_OBSERVATION_STATES:
+        return ReconciliationResult(
+            "receipt_noop", plan_id, order_id, evidence[1] if evidence else None,
+            "receipt_state_ineligible", False, "unchanged",
+        )
+    _, state, _, transfer_hash, transfer_raw, *_ = evidence
+    try:
+        action, tx_hash, _ = resolve_persisted_erc20_transaction(
+            None, transfer_hash, None, transfer_raw
+        )
+    except (TypeError, ValueError):
+        action, tx_hash = None, None
+    if action != "transfer" or not tx_hash:
+        return ReconciliationResult(
+            "receipt_noop", plan_id, order_id, state,
+            "persisted_transfer_missing_or_invalid", False, "unchanged",
+        )
+    status = await get_transfer_tx_status(network_key, tx_hash)
+    if status not in {"confirmed", "failed"}:
+        return ReconciliationResult(
+            "in_progress", plan_id, order_id, state,
+            "chain_status_pending", False, "unchanged",
+        )
+    return await _apply_transfer_receipt(
+        plan_id=plan_id, order_id=order_id, evidence=evidence,
+        tx_hash=tx_hash, tx_status=status, commit_fn=_commit_scheduler_transaction,
+    )
+
+
+async def reconcile_pending_transfer_receipts() -> None:
+    """Periodic evidence scan independent of plan activity, deletion, or due time."""
+    async with open_db() as db:
+        async with db.execute(
+            "SELECT plan_id, order_id FROM sent_transactions "
+            "WHERE plan_id IS NOT NULL AND state IN ('tx_pending', 'blocked') "
+            "AND (NULLIF(transfer_tx_hash, '') IS NOT NULL "
+            "OR NULLIF(transfer_raw_tx, '') IS NOT NULL) ORDER BY id"
+        ) as cur:
+            rows = await cur.fetchall()
+    for plan_id, order_id in rows:
+        try:
+            result = await observe_persisted_transfer_receipt(plan_id, order_id)
+            if result.outcome in {"confirmed", "failed"}:
+                logger.info("Transfer receipt reconciled: plan_id=%s order_id=%s outcome=%s",
+                            plan_id, order_id, result.outcome)
+        except Exception:
+            logger.exception("Transfer receipt reconciliation failed: plan_id=%s order_id=%s",
+                             plan_id, order_id)
+
+
 async def reconcile_existing_order(
     *,
     plan_id: int,
@@ -2600,6 +2741,10 @@ async def reconcile_existing_order(
     ) = tx_row
     network_key = tx_network_key or plan_network_key
     tx_state = str(tx_state or "")
+    if (trigger in {"manual", "scheduler"}
+            and tx_state in RECEIPT_OBSERVATION_STATES
+            and (transfer_tx_hash or transfer_raw_tx)):
+        return await observe_persisted_transfer_receipt(plan_id, order_id)
     if trigger in {"manual", "scheduler"} and tx_state in {
         "sending", "transfering", "tx_pending", "pending", "blocked"
     }:
@@ -2766,6 +2911,18 @@ async def reconcile_existing_order(
     if tx_state == "approve_confirmed" and action_name != "transfer":
         return await resume_from_persisted_intent()
 
+    async with open_db() as db:
+        receipt_evidence = await _read_receipt_evidence(db, plan_id, order_id)
+    if action_name == "transfer" and (
+        receipt_evidence is None
+        or receipt_evidence[:2] != (tx_id, tx_state)
+        or receipt_evidence[2] != tx_network_key
+        or receipt_evidence[3:5] != (transfer_tx_hash, transfer_raw_tx)
+    ):
+        return ReconciliationResult(
+            "stale_result", plan_id, order_id, None,
+            "receipt_evidence_changed", False, "unchanged",
+        )
     tx_status = await get_transfer_tx_status(network_key, tx_hash)
     if tx_status == "pending":
         if raw_tx:
@@ -2783,29 +2940,16 @@ async def reconcile_existing_order(
             "chain_status_pending", should_notify, "unchanged",
         )
 
-    if tx_status == "confirmed":
-        if action_name == "approve":
-            return await resume_from_persisted_intent()
-        schedule_effect = "unchanged"
-        async with open_db() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            await db.execute(
-                "UPDATE sent_transactions SET state = 'confirmed', error_message = NULL WHERE id = ?",
-                (tx_id,),
-            )
-            if trigger in {"scheduler", "startup_recovery"}:
-                schedule_now = int(schedule_anchor if schedule_anchor is not None else time.time())
-                new_next_run = schedule_now + (int(interval_hours or 24) * 3600)
-                await db.execute(
-                    "UPDATE dca_plans SET next_run = ?, missed_count = 0 WHERE id = ?",
-                    (new_next_run, plan_id),
-                )
-                schedule_effect = "advanced"
-            await commit_mutation(db)
-        return ReconciliationResult(
-            "confirmed", plan_id, order_id, "confirmed",
-            "transfer_confirmed", should_notify, schedule_effect,
+    if action_name == "transfer":
+        return await _apply_transfer_receipt(
+            plan_id=plan_id, order_id=order_id, evidence=receipt_evidence,
+            tx_hash=tx_hash, tx_status=tx_status, commit_fn=commit_mutation,
+            should_notify=should_notify,
+            advance_schedule=trigger in {"scheduler", "startup_recovery"},
+            schedule_anchor=schedule_anchor, interval_hours=interval_hours,
         )
+    if tx_status == "confirmed":
+        return await resume_from_persisted_intent()
 
     cleared = await mark_order_failed(
         plan_id,
@@ -5507,6 +5651,7 @@ async def dca_scheduler():
     while True:
         try:
             now = int(time.time())
+            await reconcile_pending_transfer_receipts()
             
             async with open_db() as db:
                 async with db.execute(

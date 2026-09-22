@@ -415,9 +415,10 @@ def test_confirmed_transfer_receipt_uses_persisted_hash(
         with sqlite3.connect(reconciliation_db) as db:
             assert db.execute("SELECT state FROM sent_transactions").fetchone()[0] == "confirmed"
     else:
-        assert result.outcome == "in_progress"
+        assert result.outcome == "confirmed"
+        assert result.schedule_effect == "unchanged"
         with sqlite3.connect(reconciliation_db) as db:
-            assert db.execute("SELECT state FROM sent_transactions").fetchone()[0] == "tx_pending"
+            assert db.execute("SELECT state FROM sent_transactions").fetchone()[0] == "confirmed"
 
 
 @pytest.mark.parametrize("trigger", ["manual", "scheduler", "startup_recovery"])
