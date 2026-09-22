@@ -430,6 +430,29 @@ def parse_persisted_plan_amount(amount_text: Any) -> Decimal:
     return Decimal(canonical)
 
 
+EXACT_AMOUNT_RECONFIRMATION_REASON = "exact_amount_reconfirmation_required"
+TERMINAL_SENT_TRANSACTION_STATES = frozenset(
+    {"sent", "confirmed", "failed", "expired"}
+)
+LIVE_PLAN_EXECUTION_STATES = frozenset(
+    {"awaiting_confirmation", "confirming", "claiming", "creating_order"}
+)
+
+
+def is_terminal_sent_transaction_state(state: Any) -> bool:
+    """Use the reconciliation lifecycle's terminal-state classification."""
+    return str(state or "") in TERMINAL_SENT_TRANSACTION_STATES
+
+
+async def _plan_has_unresolved_transaction_evidence(db, plan_id: int) -> bool:
+    async with db.execute(
+        "SELECT state FROM sent_transactions WHERE plan_id = ? ORDER BY id",
+        (plan_id,),
+    ) as cursor:
+        states = await cursor.fetchall()
+    return any(not is_terminal_sent_transaction_state(row[0]) for row in states)
+
+
 def parse_fixedfloat_decimal(value: Any, field_name: str) -> Decimal:
     """Parse an exact FixedFloat numeric response without accepting binary floats."""
     if isinstance(value, bool) or isinstance(value, float):
@@ -2515,7 +2538,7 @@ async def reconcile_existing_order(
             (plan_id, order_id),
         ) as cur:
             tx_row = await cur.fetchone()
-    if tx_row and str(tx_row[3] or "") in {"sent", "confirmed", "failed", "expired"}:
+    if tx_row and is_terminal_sent_transaction_state(tx_row[3]):
         terminal_state = str(tx_row[3] or "")
         return ReconciliationResult(
             "terminal_noop", plan_id, order_id, terminal_state,
@@ -3019,7 +3042,7 @@ async def cb_dca_confirm(callback: CallbackQuery):
     async with open_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         async with db.execute(
-            "SELECT from_asset, COALESCE(amount_text, amount), interval_hours, next_run, confirmation_message_id, confirmation_expires_at "
+            "SELECT from_asset, amount, amount_text, interval_hours, next_run, confirmation_message_id, confirmation_expires_at "
             "FROM dca_plans WHERE id = ? AND user_id = ? AND execution_state = 'awaiting_confirmation' "
             "AND confirmation_scheduled_at = ? AND active_order_id IS NULL AND active = 1 AND deleted = 0",
             (plan_id, user_id, scheduled_at),
@@ -3029,7 +3052,15 @@ async def cb_dca_confirm(callback: CallbackQuery):
             await db.rollback()
             await callback.answer("Этот запрос уже обработан.")
             return
-        from_asset, amount, interval_hours, next_run, message_id, expires_at = row
+        from_asset, _legacy_amount, amount_text, interval_hours, next_run, message_id, expires_at = row
+        if amount_text is None:
+            await db.rollback()
+            await callback.answer(
+                "Точная сумма legacy-плана не подтверждена. Используй /status и /reconfirm.",
+                show_alert=True,
+            )
+            return
+        amount = amount_text
         if expires_at and int(expires_at) <= now:
             await db.rollback()
             await expire_dca_confirmation(plan_id, now)
@@ -5404,6 +5435,67 @@ async def ensure_wal_mode() -> None:
 # DCA SCHEDULER - автоматическое выполнение планов
 # ============================================================================
 
+
+async def _auto_pause_legacy_plan_for_reconfirmation(
+    plan_id: int, user_id: int
+) -> bool:
+    """Durably pause one evidence-free legacy plan before notifying its user."""
+
+    async with open_db() as db:
+        try:
+            begin_cancellation = await _execute_sqlite_control_statement_to_completion(
+                db, "BEGIN IMMEDIATE;", check_pending_cancellation=True
+            )
+            if begin_cancellation is not None:
+                raise begin_cancellation
+
+            async with db.execute(
+                "SELECT amount_text, active, deleted, execution_state, active_order_id "
+                "FROM dca_plans WHERE id = ? AND user_id = ?",
+                (plan_id, user_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+
+            safe_to_pause = bool(
+                row
+                and row[0] is None
+                and int(row[1] or 0) == 1
+                and int(row[2] or 0) == 0
+                and str(row[3] or "scheduled") in {"scheduled", "skipped", "expired"}
+                and row[4] is None
+                and not await _plan_has_unresolved_transaction_evidence(db, plan_id)
+            )
+            if not safe_to_pause:
+                rollback_cancellation = await _execute_sqlite_control_statement_to_completion(
+                    db, "ROLLBACK;"
+                )
+                if rollback_cancellation is not None:
+                    raise rollback_cancellation
+                return False
+
+            cursor = await db.execute(
+                "UPDATE dca_plans SET active = 0, skip_reason = ? "
+                "WHERE id = ? AND user_id = ? AND active = 1 AND deleted = 0 "
+                "AND amount_text IS NULL AND active_order_id IS NULL "
+                "AND execution_state IN ('scheduled', 'skipped', 'expired')",
+                (EXACT_AMOUNT_RECONFIRMATION_REASON, plan_id, user_id),
+            )
+            if cursor.rowcount != 1:
+                rollback_cancellation = await _execute_sqlite_control_statement_to_completion(
+                    db, "ROLLBACK;"
+                )
+                if rollback_cancellation is not None:
+                    raise rollback_cancellation
+                return False
+
+            await _commit_scheduler_transaction(db)
+            return True
+        except BaseException as error:
+            if db.in_transaction:
+                await _rollback_scheduler_transaction_after_error(db, error)
+            raise
+
+
 async def dca_scheduler():
     """
     Фоновая задача для автоматического выполнения DCA планов.
@@ -5629,10 +5721,38 @@ async def dca_scheduler():
                                     if fallback_result == "completed":
                                         continue
                         if amount_text is None:
-                            logger.warning(
-                                "Skip DCA plan_id=%s: exact plan amount requires user reconfirmation",
-                                plan_id,
+                            paused = await _auto_pause_legacy_plan_for_reconfirmation(
+                                plan_id, user_id
                             )
+                            if paused:
+                                logger.warning(
+                                    "Paused DCA plan_id=%s: exact plan amount requires user reconfirmation",
+                                    plan_id,
+                                )
+                                reconfirm_command = (
+                                    f"/reconfirm_{plan_number} EXACT_AMOUNT"
+                                    if plan_number is not None
+                                    else "/status"
+                                )
+                                try:
+                                    await bot.send_message(
+                                        int(user_id),
+                                        "⚠️ DCA-план приостановлен: в legacy-записи "
+                                        "не была сохранена точная десятичная сумма.\n\n"
+                                        f"Старое значение {format_amount(legacy_amount)} USDT "
+                                        "показано только для справки и не считается "
+                                        "подтверждённой суммой.\n\n"
+                                        "Введи точную сумму вручную:\n"
+                                        f"{reconfirm_command}\n\n"
+                                        "Покупка не выполнялась.",
+                                    )
+                                except Exception as notification_error:
+                                    logger.warning(
+                                        "Failed to notify user %s about legacy plan %s pause: %s",
+                                        user_id,
+                                        plan_id,
+                                        notification_error,
+                                    )
                             continue
                         try:
                             parse_persisted_plan_amount(amount_text)
@@ -6599,9 +6719,15 @@ async def cmd_execute(message: Message):
     try:
         amount = parse_persisted_plan_amount(amount_text)
     except (TypeError, ValueError):
+        reconfirm_hint = (
+            f"/reconfirm_{plan_number} EXACT_AMOUNT"
+            if plan_number is not None
+            else "/status"
+        )
         await message.answer(
             "⚠️ Сумма этого legacy-плана не имеет подтверждённого точного значения. "
-            "Создай план заново через /setdca; новый FixedFloat ордер не создаётся."
+            f"Введи её вручную: {reconfirm_hint}. "
+            "Новый FixedFloat ордер не создаётся."
         )
         return
 
@@ -6703,8 +6829,14 @@ async def cmd_execute(message: Message):
                 await message.answer(text, parse_mode="HTML", **kwargs)
 
         if execution.outcome == "legacy_amount_unverified":
+            reconfirm_hint = (
+                f"/reconfirm_{plan_number} EXACT_AMOUNT"
+                if plan_number is not None
+                else "/status"
+            )
             await message.answer(
-                "⚠️ Сумма этого legacy-плана требует подтверждения через новый /setdca. "
+                "⚠️ Сумма этого legacy-плана требует ручного подтверждения. "
+                f"Используй: {reconfirm_hint}. "
                 "FixedFloat ордер не создан."
             )
             return
@@ -6892,6 +7024,239 @@ async def cmd_execute(message: Message):
         else:
             await message.answer(f"❌ Ошибка при создании ордера:\n{escape_html(e)}")
 
+@dataclass(frozen=True)
+class PlanReconfirmationResult:
+    outcome: str
+    plan_id: int
+    amount_text: Optional[str] = None
+    auto_resumed: bool = False
+
+
+async def _reconfirm_legacy_plan(
+    *,
+    plan_id: int,
+    user_id: int,
+    expected_network: str,
+    canonical_amount: str,
+    reconfirmed_at: int,
+) -> PlanReconfirmationResult:
+    """Persist user-supplied exact text without deriving it from legacy REAL."""
+
+    async with open_db() as db:
+        try:
+            begin_cancellation = await _execute_sqlite_control_statement_to_completion(
+                db, "BEGIN IMMEDIATE;", check_pending_cancellation=True
+            )
+            if begin_cancellation is not None:
+                raise begin_cancellation
+
+            async def unchanged(outcome: str) -> PlanReconfirmationResult:
+                rollback_cancellation = await _execute_sqlite_control_statement_to_completion(
+                    db, "ROLLBACK;"
+                )
+                if rollback_cancellation is not None:
+                    raise rollback_cancellation
+                return PlanReconfirmationResult(outcome, plan_id)
+
+            async with db.execute(
+                "SELECT from_asset, amount_text, interval_hours, next_run, active, deleted, "
+                "execution_state, skip_reason, active_order_id "
+                "FROM dca_plans WHERE id = ? AND user_id = ?",
+                (plan_id, user_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row or int(row[5] or 0) != 0:
+                return await unchanged("plan_unavailable")
+
+            (
+                network_key,
+                persisted_amount_text,
+                interval_hours,
+                next_run,
+                active,
+                _deleted,
+                execution_state,
+                skip_reason,
+                active_order_id,
+            ) = row
+            if persisted_amount_text is not None:
+                return await unchanged("already_exact")
+            if str(network_key) != str(expected_network):
+                return await unchanged("plan_changed")
+            if active_order_id is not None:
+                return await unchanged("active_order")
+            normalized_execution_state = str(execution_state or "scheduled")
+            if (
+                normalized_execution_state in LIVE_PLAN_EXECUTION_STATES
+                or normalized_execution_state not in {"scheduled", "skipped", "expired"}
+            ):
+                return await unchanged("live_execution")
+            if await _plan_has_unresolved_transaction_evidence(db, plan_id):
+                return await unchanged("unresolved_transaction")
+
+            async with db.execute(
+                "SELECT id FROM dca_plans WHERE user_id = ? AND from_asset = ? "
+                "AND amount_text = ? AND interval_hours = ? AND deleted = 0 AND id != ? "
+                "ORDER BY id LIMIT 1",
+                (
+                    user_id,
+                    network_key,
+                    canonical_amount,
+                    interval_hours,
+                    plan_id,
+                ),
+            ) as cursor:
+                duplicate = await cursor.fetchone()
+            if duplicate:
+                return await unchanged("duplicate")
+
+            auto_paused = (
+                int(active or 0) == 0
+                and str(skip_reason or "") == EXACT_AMOUNT_RECONFIRMATION_REASON
+            )
+            if auto_paused:
+                try:
+                    interval_seconds = max(1, int(interval_hours) * 3600)
+                except (TypeError, ValueError):
+                    return await unchanged("invalid_interval")
+                cursor = await db.execute(
+                    "UPDATE dca_plans SET amount = ?, amount_text = ?, active = 1, "
+                    "next_run = ?, skip_reason = NULL "
+                    "WHERE id = ? AND user_id = ? AND deleted = 0 "
+                    "AND amount_text IS NULL AND active = 0 AND skip_reason = ? "
+                    "AND active_order_id IS NULL "
+                    "AND execution_state IN ('scheduled', 'skipped', 'expired')",
+                    (
+                        canonical_amount,
+                        canonical_amount,
+                        int(reconfirmed_at) + interval_seconds,
+                        plan_id,
+                        user_id,
+                        EXACT_AMOUNT_RECONFIRMATION_REASON,
+                    ),
+                )
+            else:
+                cursor = await db.execute(
+                    "UPDATE dca_plans SET amount = ?, amount_text = ? "
+                    "WHERE id = ? AND user_id = ? AND deleted = 0 "
+                    "AND amount_text IS NULL AND active_order_id IS NULL "
+                    "AND execution_state IN ('scheduled', 'skipped', 'expired')",
+                    (canonical_amount, canonical_amount, plan_id, user_id),
+                )
+            if cursor.rowcount != 1:
+                return await unchanged("stale_plan")
+
+            await _commit_scheduler_transaction(db)
+            return PlanReconfirmationResult(
+                "reconfirmed", plan_id, canonical_amount, auto_paused
+            )
+        except BaseException as error:
+            if db.in_transaction:
+                await _rollback_scheduler_transaction_after_error(db, error)
+            raise
+
+
+@dp.message(
+    lambda message: message.text
+    and re.fullmatch(r"/reconfirm(?:_\d+)?(?:\s+.*)?", message.text.strip())
+)
+async def cmd_reconfirm(message: Message):
+    """Confirm a legacy plan amount using newly entered exact decimal text."""
+
+    user_id = int(message.from_user.id)
+    parts = message.text.strip().split()
+    command = parts[0]
+    if "_" not in command or len(parts) != 2:
+        await message.answer(
+            "Используй: /reconfirm_НОМЕР ТОЧНАЯ_СУММА\n"
+            "Пример: /reconfirm_1 25.50"
+        )
+        return
+    try:
+        display_index = int(command.split("_", 1)[1])
+    except (TypeError, ValueError):
+        await message.answer("Некорректный номер плана. Проверь /status.")
+        return
+    plan_id = await resolve_display_plan_id(message, display_index)
+    if plan_id is None:
+        return
+
+    async with open_db() as db:
+        async with db.execute(
+            "SELECT from_asset, amount, amount_text, deleted FROM dca_plans "
+            "WHERE id = ? AND user_id = ?",
+            (plan_id, user_id),
+        ) as cursor:
+            plan = await cursor.fetchone()
+    if not plan or int(plan[3] or 0) != 0:
+        await message.answer("❌ План не найден или удалён.")
+        return
+    network_key, legacy_amount, persisted_amount_text, _deleted = plan
+    if persisted_amount_text is not None:
+        await message.answer("✅ У этого плана точная сумма уже подтверждена.")
+        return
+
+    try:
+        canonical_amount = canonicalize_plan_amount(parts[1])
+        exact_amount = Decimal(canonical_amount)
+        if exact_amount < PLAN_AMOUNT_MIN or exact_amount > PLAN_AMOUNT_MAX:
+            raise ValueError("сумма вне допустимого диапазона")
+    except (TypeError, ValueError) as error:
+        await message.answer(f"❌ Некорректная точная сумма: {escape_html(error)}")
+        return
+
+    try:
+        limits = await get_fixedfloat_limits(str(network_key))
+        min_limit = limits["min"]
+        effective_max = min(limits["max"], PLAN_AMOUNT_MAX)
+    except Exception as error:
+        await message.answer(
+            "❌ Не удалось безопасно проверить лимиты FixedFloat: "
+            f"{escape_html(error)}"
+        )
+        return
+    if exact_amount < min_limit or exact_amount > effective_max:
+        await message.answer(
+            f"❌ Сумма должна быть от {escape_html(min_limit)} "
+            f"до {escape_html(effective_max)} USDT. План не изменён."
+        )
+        return
+
+    reconfirmed_at = int(time.time())
+    result = await _reconfirm_legacy_plan(
+        plan_id=plan_id,
+        user_id=user_id,
+        expected_network=str(network_key),
+        canonical_amount=canonical_amount,
+        reconfirmed_at=reconfirmed_at,
+    )
+    if result.outcome == "reconfirmed":
+        schedule_text = (
+            "План возобновлён; следующий запуск начнёт новый интервал."
+            if result.auto_resumed
+            else "Текущие настройки активности и расписания сохранены."
+        )
+        await message.answer(
+            f"✅ Точная сумма плана #{display_index}: {canonical_amount} USDT.\n"
+            f"Старое REAL-значение {format_amount(legacy_amount)} USDT "
+            f"использовалось только как справка.\n{schedule_text}"
+        )
+        return
+
+    reason_messages = {
+        "already_exact": "Точная сумма уже подтверждена.",
+        "duplicate": "Уже существует неудалённый план с такой же точной суммой, сетью и интервалом.",
+        "active_order": "У плана есть активный ордер. Сначала заверши его проверку.",
+        "live_execution": "План сейчас выполняется или ожидает подтверждения.",
+        "unresolved_transaction": "У плана есть незавершённое транзакционное свидетельство. Сначала нужна recovery-проверка.",
+    }
+    await message.answer(
+        "⚠️ " + reason_messages.get(
+            result.outcome, "План изменился; проверь /status и повтори позже."
+        )
+    )
+
+
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
     """
@@ -6902,7 +7267,7 @@ async def cmd_status(message: Message):
     
     async with open_db() as db:
         async with db.execute(
-            "SELECT id, from_asset, COALESCE(amount_text, amount), interval_hours, btc_address, next_run, active, "
+            "SELECT id, from_asset, amount, amount_text, interval_hours, btc_address, next_run, active, "
             "active_order_id, active_order_token, active_order_address, active_order_amount, active_order_expires, "
             "execution_state, confirmation_expires_at "
             "FROM dca_plans WHERE user_id = ? AND deleted = 0 ORDER BY id", 
@@ -6943,7 +7308,7 @@ async def cmd_status(message: Message):
     
     # Экранные индексы существуют только в mapping последнего /status.
     for index, plan in enumerate(plans, start=1):
-        plan_id, from_asset, amount, interval_hours, btc_address, next_run, active, \
+        plan_id, from_asset, legacy_amount, amount_text, interval_hours, btc_address, next_run, active, \
         order_id, order_token, order_address, order_amount, order_expires, execution_state, confirmation_expires_at = plan
         _user_plan_mapping[user_id][index] = int(plan_id)
         
@@ -6952,7 +7317,13 @@ async def cmd_status(message: Message):
         
         btc_display = format_btc_recipient_copyable(btc_address)
         network_label = get_network_label(from_asset) or from_asset
-        amount_compact = f"{format_amount(float(amount))} USDT / {interval_hours}ч"
+        if amount_text is None:
+            amount_compact = (
+                f"{format_amount(legacy_amount)} USDT / {interval_hours}ч "
+                "(legacy-справка; точная сумма не подтверждена)"
+            )
+        else:
+            amount_compact = f"{escape_html(amount_text)} USDT / {interval_hours}ч"
         if active and execution_state == "awaiting_confirmation":
             schedule_line = "⏳ Ожидает подтверждения"
             if confirmation_expires_at:
@@ -6969,6 +7340,11 @@ async def cmd_status(message: Message):
             f"📥 Получатель BTC:\n{btc_display}\n"
             f"{schedule_line}\n"
         )
+        if amount_text is None:
+            status_text += (
+                f"✍️ Подтверди точную сумму: "
+                f"/reconfirm_{index} EXACT_AMOUNT\n"
+            )
         
         # Проверяем есть ли активный ордер (и не истёк ли он)
         if active and order_id and order_expires:
@@ -7068,15 +7444,19 @@ async def cmd_pause(message: Message):
 
             # Приостанавливаем по ID
             await db.execute(
-                "UPDATE dca_plans SET active = 0 WHERE id = ? AND user_id = ? AND deleted = 0",
-                (plan_id, user_id)
+                "UPDATE dca_plans SET active = 0, skip_reason = "
+                "CASE WHEN skip_reason = ? THEN NULL ELSE skip_reason END "
+                "WHERE id = ? AND user_id = ? AND deleted = 0",
+                (EXACT_AMOUNT_RECONFIRMATION_REASON, plan_id, user_id)
             )
             msg = f"⏸ План #{plan_number} приостановлен"
         else:
             # Приостанавливаем все планы пользователя (только не удаленные)
             await db.execute(
-                "UPDATE dca_plans SET active = 0 WHERE user_id = ? AND deleted = 0",
-                (user_id,)
+                "UPDATE dca_plans SET active = 0, skip_reason = "
+                "CASE WHEN skip_reason = ? THEN NULL ELSE skip_reason END "
+                "WHERE user_id = ? AND deleted = 0",
+                (EXACT_AMOUNT_RECONFIRMATION_REASON, user_id)
             )
             msg = "⏸ Все DCA планы приостановлены"
         
@@ -7123,7 +7503,8 @@ async def cmd_resume(message: Message):
     async with open_db() as db:
         if plan_id:
             async with db.execute(
-                "SELECT id FROM dca_plans WHERE id = ? AND user_id = ? AND deleted = 0",
+                "SELECT id, amount_text FROM dca_plans "
+                "WHERE id = ? AND user_id = ? AND deleted = 0",
                 (plan_id, user_id)
             ) as cur:
                 plan_row = await cur.fetchone()
@@ -7131,22 +7512,42 @@ async def cmd_resume(message: Message):
             if not plan_row:
                 await message.answer(f"❌ План не найден.\n\n{build_status_hint()}")
                 return
+            if plan_row[1] is None:
+                await message.answer(
+                    "⚠️ Этот legacy-план нельзя возобновить, пока не "
+                    "подтверждена точная сумма.\n"
+                    f"Используй: /reconfirm_{display_index} EXACT_AMOUNT"
+                )
+                return
 
             plan_number = await get_plan_display_number(user_id, plan_id)
 
             # Возобновляем по ID
             await db.execute(
-                "UPDATE dca_plans SET active = 1 WHERE id = ? AND user_id = ? AND deleted = 0",
+                "UPDATE dca_plans SET active = 1 WHERE id = ? AND user_id = ? "
+                "AND deleted = 0 AND amount_text IS NOT NULL",
                 (plan_id, user_id)
             )
             msg = f"▶️ План #{plan_number} возобновлён"
         else:
-            # Возобновляем все планы пользователя (только не удаленные)
+            async with db.execute(
+                "SELECT COUNT(*) FROM dca_plans WHERE user_id = ? AND deleted = 0 "
+                "AND amount_text IS NULL",
+                (user_id,),
+            ) as cur:
+                exactless_count = int((await cur.fetchone())[0])
+            # Exact-less legacy plans remain paused until explicit reconfirmation.
             await db.execute(
-                "UPDATE dca_plans SET active = 1 WHERE user_id = ? AND deleted = 0",
+                "UPDATE dca_plans SET active = 1 WHERE user_id = ? AND deleted = 0 "
+                "AND amount_text IS NOT NULL",
                 (user_id,)
             )
-            msg = "▶️ Все DCA планы возобновлены"
+            msg = "▶️ Все планы с подтверждённой точной суммой возобновлены"
+            if exactless_count:
+                msg += (
+                    f"\n⚠️ Legacy-планов пропущено: {exactless_count}. "
+                    "Подтверди их точную сумму через /status."
+                )
         
         await db.commit()
     _user_plan_mapping.pop(user_id, None)
