@@ -6,8 +6,9 @@ Handles all checks and direct transfers.
 import asyncio
 import logging
 import re
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 from web3 import Web3
 from web3.exceptions import TimeExhausted, TransactionNotFound
 from networks import get_network_config, get_blockchair_url
@@ -28,6 +29,14 @@ from erc20 import (
 from wallet import load_keystore, decrypt_private_key
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class DefinitiveTransferRevert:
+    """Receipt status=0 observed for this transfer hash; not a generic send error."""
+
+    tx_hash: str
+
 
 NATIVE_RESERVE_NUMERATOR = 9
 NATIVE_RESERVE_DENOMINATOR = 5
@@ -80,7 +89,7 @@ async def auto_send_usdt(
     amount_units: Optional[int] = None,
     token_decimals: Optional[int] = None,
     persist_payment_intent=None,
-) -> Tuple[bool, Optional[str], Optional[str], str]:
+) -> Union[Tuple[bool, Optional[str], Optional[str], str], DefinitiveTransferRevert]:
     """
     Automatically send USDT to FixedFloat deposit address.
     
@@ -102,7 +111,8 @@ async def auto_send_usdt(
         dry_run: If True, don't broadcast transactions
     
     Returns:
-        Tuple of (success, approve_tx_hash, transfer_tx_hash, error_message)
+        DefinitiveTransferRevert only for receipt status=0; otherwise
+        tuple of (success, approve_tx_hash, transfer_tx_hash, error_message).
         - success: True if transfer succeeded
         - approve_tx_hash: Always None for new direct transfers
         - transfer_tx_hash: Transaction hash for transfer
@@ -364,6 +374,9 @@ async def auto_send_usdt(
                 except Exception as receipt_err:
                     logger.warning(f"Transfer tx status unknown, keeping pending: {transfer_tx_hash}, err={receipt_err}")
                     return (False, approve_tx_hash, transfer_tx_hash, f"TX_PENDING:{transfer_tx_hash}")
+                if receipt.status == 0:
+                    logger.error("Transfer receipt reverted: %s", transfer_tx_hash)
+                    return DefinitiveTransferRevert(transfer_tx_hash)
                 if receipt.status != 1:
                     logger.error(f"✗ Transfer transaction failed: {transfer_tx_hash}")
                     return (False, approve_tx_hash, transfer_tx_hash, "Transfer transaction failed")

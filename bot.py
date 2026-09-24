@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, Union
 
 MIN_PYTHON_VERSION = (3, 9)
 if sys.version_info < MIN_PYTHON_VERSION:
@@ -64,7 +64,7 @@ from wallet import (
     save_password_to_keyring, load_password_from_keyring,
     delete_password_from_keyring, keystore_exists, KEYSTORE_DIR
 )
-from auto_send import auto_send_usdt
+from auto_send import auto_send_usdt, DefinitiveTransferRevert
 from erc20 import (
     PreparedTransactionConflict,
     TransactionBroadcastUncertain,
@@ -2276,11 +2276,21 @@ async def mark_order_failed(
     proven_approve_failure_hash: Optional[str] = None,
     proven_pre_broadcast: bool = False,
     expected_receipt_evidence: Optional[tuple] = None,
+    expected_active_order: Optional[tuple] = None,
     commit_fn: Optional[Callable[[Any], Awaitable[None]]] = None,
 ) -> bool:
     """Mark order as failed and clear active marker."""
     async with open_db() as db:
         await db.execute("BEGIN IMMEDIATE")
+        if expected_active_order is not None:
+            async with db.execute(
+                "SELECT active_order_id, active_order_token FROM dca_plans WHERE id = ?",
+                (plan_id,),
+            ) as cur:
+                active_order = await cur.fetchone()
+            if active_order != expected_active_order:
+                await db.rollback()
+                return False
         if expected_receipt_evidence is not None and not await _receipt_evidence_is_current(
             db, plan_id, order_id, expected_receipt_evidence
         ):
@@ -2378,10 +2388,11 @@ async def resume_transfer_after_approve(
     order_expires: Optional[int] = None,
     scheduled_time: Optional[int] = None,
     interval_hours: Optional[int] = None,
-) -> tuple[str, Optional[str], Optional[str], str]:
+) -> Union[tuple[str, Optional[str], Optional[str], str], DefinitiveTransferRevert]:
     """
     Continue flow after approve confirmation by attempting transfer step immediately.
-    Returns: (state, approve_tx_hash, transfer_tx_hash, error_message)
+    Returns a DefinitiveTransferRevert for a new reverted transfer receipt,
+    otherwise (state, approve_tx_hash, transfer_tx_hash, error_message).
     """
     if is_order_expired(order_expires):
         logger.warning(
@@ -2398,7 +2409,7 @@ async def resume_transfer_after_approve(
     if not wallet_password:
         return ("failed", existing_approve_tx, None, "Wallet password not available for transfer after approve")
 
-    success, approve_tx, transfer_tx, error_msg = await auto_send_usdt(
+    send_result = await auto_send_usdt(
         network_key=network_key,
         user_id=user_id,
         wallet_password=wallet_password,
@@ -2412,6 +2423,9 @@ async def resume_transfer_after_approve(
         token_decimals=token_decimals,
         persist_payment_intent=make_payment_intent_persister(plan_id, order_id),
     )
+    if isinstance(send_result, DefinitiveTransferRevert):
+        return send_result
+    success, approve_tx, transfer_tx, error_msg = send_result
     if approve_tx or transfer_tx:
         _balances_cache.clear()
     final_approve_tx = approve_tx or existing_approve_tx
@@ -2506,6 +2520,7 @@ async def _receipt_evidence_is_current(db, plan_id, order_id, expected) -> bool:
 async def _apply_transfer_receipt(
     *, plan_id, order_id, evidence, tx_hash, tx_status, commit_fn,
     should_notify=False, advance_schedule=False, schedule_anchor=None, interval_hours=None,
+    expected_active_order=None,
 ) -> ReconciliationResult:
     """Apply a definitive receipt using recovery semantics and a transaction-local guard."""
     if tx_status not in {"confirmed", "failed"}:
@@ -2543,6 +2558,7 @@ async def _apply_transfer_receipt(
         plan_id, order_id, "Transfer tx reverted on-chain",
         proven_transfer_failure_hash=tx_hash,
         expected_receipt_evidence=evidence,
+        expected_active_order=expected_active_order,
         commit_fn=commit_fn,
     )
     return ReconciliationResult(
@@ -2550,6 +2566,28 @@ async def _apply_transfer_receipt(
         "failed" if cleared else tx_state,
         "chain_status_failed" if cleared else "active_gate_retained",
         should_notify if cleared else False, "unchanged",
+    )
+
+
+async def apply_new_transfer_revert(
+    plan_id: int, order_id: str, order_token: Optional[str],
+    revert: DefinitiveTransferRevert, *, commit_fn, should_notify: bool = False,
+) -> ReconciliationResult:
+    """Finish only a new definitive revert; terminal history is never reopened."""
+    _balances_cache.clear()
+    async with open_db() as db:
+        evidence = await _read_receipt_evidence(db, plan_id, order_id)
+    if not evidence or evidence[1] not in {
+        "sending", "transfering", "approve_confirmed", "tx_pending", "pending", "blocked"
+    }:
+        return ReconciliationResult(
+            "stale_result", plan_id, order_id, evidence[1] if evidence else None,
+            "receipt_evidence_changed", False, "unchanged",
+        )
+    return await _apply_transfer_receipt(
+        plan_id=plan_id, order_id=order_id, evidence=evidence,
+        tx_hash=revert.tx_hash, tx_status="failed", commit_fn=commit_fn,
+        expected_active_order=(order_id, order_token), should_notify=should_notify,
     )
 
 
@@ -2863,7 +2901,7 @@ async def reconcile_existing_order(
                 "persisted_hash_missing", should_notify, "unchanged",
             )
 
-        resume_state, resume_approve_tx, resume_transfer_tx, resume_error = (
+        resume_result = (
             await resume_transfer_after_approve(
                 network_key=network_key,
                 user_id=int(tx_user_id or authoritative_user_id),
@@ -2880,6 +2918,12 @@ async def reconcile_existing_order(
                 interval_hours=interval_hours,
             )
         )
+        if isinstance(resume_result, DefinitiveTransferRevert):
+            return await apply_new_transfer_revert(
+                plan_id, order_id, _active_order_token, resume_result,
+                commit_fn=commit_mutation, should_notify=should_notify,
+            )
+        resume_state, resume_approve_tx, resume_transfer_tx, resume_error = resume_result
         schedule_effect = await persist_resume_result(
             resume_state, resume_approve_tx, resume_transfer_tx, resume_error
         )
@@ -6208,7 +6252,7 @@ async def execute_new_order(
             )
 
         try:
-            success, approve_tx, transfer_tx, error_msg = await auto_send_usdt(
+            send_result = await auto_send_usdt(
                 network_key=from_asset,
                 user_id=user_id,
                 wallet_password=wallet_password,
@@ -6227,6 +6271,23 @@ async def execute_new_order(
                 tx_state="transfering",
                 error_message=str(exc),
             )
+        if isinstance(send_result, DefinitiveTransferRevert):
+            reconciliation = await apply_new_transfer_revert(
+                plan_id, order_id, order_token, send_result,
+                commit_fn=_commit_scheduler_transaction, should_notify=True,
+            )
+            cleared = reconciliation.outcome == "failed"
+            return result(
+                "failed" if cleared else "revert_not_applied",
+                "transfer_reverted" if cleared else "definitive_revert_gate_retained",
+                tx_state=reconciliation.tx_state,
+                transfer_tx_hash=send_result.tx_hash,
+                active_gate_retained=not cleared,
+                should_notify=reconciliation.should_notify,
+                error_message=("Transfer tx reverted on-chain" if cleared
+                               else "Definitive revert requires manual review; gate retained"),
+            )
+        success, approve_tx, transfer_tx, error_msg = send_result
         if approve_tx or transfer_tx:
             _balances_cache.clear()
 
@@ -7050,7 +7111,7 @@ async def cmd_execute(message: Message):
                 manual_send_blocked=True,
             )
             return
-        if execution.outcome == "transfer_claim_contended":
+        if execution.outcome in {"transfer_claim_contended", "revert_not_applied"}:
             return
         if execution.outcome == "manual_payment_required":
             await update_order_progress_message(
