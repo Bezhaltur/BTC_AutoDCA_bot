@@ -1,0 +1,49 @@
+name: Agent implementation task
+description: Scoped development task for a supervised Codex implementation
+title: "[Agent] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: "This template defines work for an agent; it does not itself launch one. Never paste secrets or live wallet data."
+  - type: textarea
+    id: objective
+    attributes:
+      label: Objective
+      description: One clearly defined outcome
+      placeholder: "Describe the required outcome"
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Observable behavior and regression tests
+      placeholder: "- [ ] Criterion 1\n- [ ] Criterion 2"
+    validations:
+      required: true
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: Scope and exclusions
+      description: Allowed files/behavior and explicitly excluded changes
+    validations:
+      required: true
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Risk category
+      options:
+        - Documentation / CI only
+        - Non-financial code
+        - Financial transaction or recovery path
+        - Deployment / infrastructure
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and verification requirements
+      description: Required tests, crash/retry scenarios, reviewer evidence and rollback plan
+    validations:
+      required: true
