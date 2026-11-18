@@ -1,0 +1,151 @@
+name: Keyless synthetic pilot
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: Synthetic route (tampered must fail)
+        required: true
+        type: choice
+        options:
+          - approve
+          - correct-once
+          - tampered
+
+permissions: {}
+
+env:
+  PILOT_SCENARIO: ${{ inputs.scenario }}
+
+jobs:
+  coder:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      evidence: ${{ steps.pilot.outputs.evidence }}
+    steps:
+      - name: Check dispatch before checkout
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REPOSITORY" = Bezhaltur/BTC_AutoDCA_bot
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0 # Check the fixed baseline is an ancestor.
+          sparse-checkout-cone-mode: false
+          sparse-checkout: /.github/scripts/keyless_pilot.py
+      - id: pilot
+        env:
+          PILOT_NEEDS: '{}'
+        run: python3 -I -B .github/scripts/keyless_pilot.py coder
+
+  reviewer:
+    needs: [coder]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      evidence: ${{ steps.pilot.outputs.evidence }}
+    steps:
+      - name: Check dispatch before checkout
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REPOSITORY" = Bezhaltur/BTC_AutoDCA_bot
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: /.github/scripts/keyless_pilot.py
+      - id: pilot
+        env:
+          PILOT_NEEDS: ${{ toJSON(needs) }}
+        run: python3 -I -B .github/scripts/keyless_pilot.py reviewer
+
+  correct:
+    needs: [coder, reviewer]
+    if: ${{ success() && inputs.scenario == 'correct-once' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      evidence: ${{ steps.pilot.outputs.evidence }}
+    steps:
+      - name: Check dispatch before checkout
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REPOSITORY" = Bezhaltur/BTC_AutoDCA_bot
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: /.github/scripts/keyless_pilot.py
+      - id: pilot
+        env:
+          PILOT_NEEDS: ${{ toJSON(needs) }}
+        run: python3 -I -B .github/scripts/keyless_pilot.py correct
+
+  re_review:
+    needs: [coder, reviewer, correct]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      evidence: ${{ steps.pilot.outputs.evidence }}
+    steps:
+      - name: Check dispatch before checkout
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REPOSITORY" = Bezhaltur/BTC_AutoDCA_bot
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: /.github/scripts/keyless_pilot.py
+      - id: pilot
+        env:
+          PILOT_NEEDS: ${{ toJSON(needs) }}
+        run: python3 -I -B .github/scripts/keyless_pilot.py re_review
+
+  verify:
+    needs: [coder, reviewer, correct, re_review]
+    # A dependency failure still requires evidence evaluation. GitHub handles run cancellation.
+    # Accept only a successful verify AND the same run/attempt's terminal completed/success.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check dispatch before checkout
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REPOSITORY" = Bezhaltur/BTC_AutoDCA_bot
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: /.github/scripts/keyless_pilot.py
+      - id: pilot
+        env:
+          PILOT_NEEDS: ${{ toJSON(needs) }}
+        run: python3 -I -B .github/scripts/keyless_pilot.py verify
